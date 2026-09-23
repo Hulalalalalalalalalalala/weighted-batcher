@@ -8,7 +8,13 @@ import math
 import numbers
 import random
 
-__all__ = ["Sampler", "render_metrics", "parse_metrics"]
+__all__ = [
+    "Sampler",
+    "render_metrics",
+    "parse_metrics",
+    "record_metrics",
+    "recover_metrics",
+]
 
 
 class Sampler:
@@ -125,3 +131,8 @@ def parse_metrics(line):
     if not isinstance(data, dict):
         raise ValueError("metrics line must be a JSON object at the top level")
     return data
+
+
+# Imported last: persistence builds on the render/parse primitives above, so
+# importing it here keeps the dependency acyclic.
+from .persistence import record_metrics, recover_metrics  # noqa: E402
