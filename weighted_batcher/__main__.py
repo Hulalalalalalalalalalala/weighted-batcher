@@ -1,12 +1,28 @@
-"""Module entry point: ``python3 -m weighted_batcher --selftest``."""
+"""Module entry point.
+
+    python3 -m weighted_batcher --selftest
+    python3 -m weighted_batcher record FILE METRICS_JSON
+    python3 -m weighted_batcher recover FILE
+"""
 
 from __future__ import annotations
 
 import sys
 
-from . import Sampler, parse_metrics, render_metrics
+from . import (
+    Sampler,
+    append_metrics,
+    parse_metrics,
+    recover_metrics,
+    render_metrics,
+)
 
-_USAGE = "usage: python3 -m weighted_batcher --selftest"
+_USAGE = (
+    "usage:\n"
+    "  python3 -m weighted_batcher --selftest\n"
+    "  python3 -m weighted_batcher record FILE METRICS_JSON\n"
+    "  python3 -m weighted_batcher recover FILE"
+)
 
 
 def _selftest():
@@ -71,14 +87,36 @@ def _selftest():
         raise AssertionError("expected ValueError for Infinity literal")
 
 
+def _record(path, line):
+    append_metrics(path, line)
+    return 0
+
+
+def _recover(path):
+    # One canonical JSON line per recovered record, exit 0 afterwards.
+    for metrics in recover_metrics(path):
+        sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
-    if args != ["--selftest"]:
-        print(_USAGE, file=sys.stderr)
-        return 2
-    _selftest()
-    print("selftest ok")
-    return 0
+    if args == ["--selftest"]:
+        _selftest()
+        print("selftest ok")
+        return 0
+    if args and args[0] == "record":
+        if len(args) != 3:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _record(args[1], args[2])
+    if args and args[0] == "recover":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _recover(args[1])
+    print(_USAGE, file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

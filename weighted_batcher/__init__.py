@@ -8,7 +8,13 @@ import math
 import numbers
 import random
 
-__all__ = ["Sampler", "render_metrics", "parse_metrics"]
+__all__ = [
+    "Sampler",
+    "render_metrics",
+    "parse_metrics",
+    "append_metrics",
+    "recover_metrics",
+]
 
 
 class Sampler:
@@ -125,3 +131,6 @@ def parse_metrics(line):
     if not isinstance(data, dict):
         raise ValueError("metrics line must be a JSON object at the top level")
     return data
+
+
+from .persistence import append_metrics, recover_metrics  # noqa: E402
