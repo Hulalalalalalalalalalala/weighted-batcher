@@ -5,6 +5,8 @@
     python3 -m weighted_batcher recover FILE
     python3 -m weighted_batcher rotate FILE
     python3 -m weighted_batcher stream FILE
+    python3 -m weighted_batcher compact FILE
+    python3 -m weighted_batcher resume FILE [POSITION]
 """
 
 from __future__ import annotations
@@ -14,10 +16,12 @@ import sys
 from . import (
     Sampler,
     append_metrics,
+    compact_metrics,
     iter_metrics,
     parse_metrics,
     recover_metrics,
     render_metrics,
+    resume_metrics,
     rotate_metrics,
 )
 
@@ -27,7 +31,9 @@ _USAGE = (
     "  python3 -m weighted_batcher record FILE METRICS_JSON\n"
     "  python3 -m weighted_batcher recover FILE\n"
     "  python3 -m weighted_batcher rotate FILE\n"
-    "  python3 -m weighted_batcher stream FILE"
+    "  python3 -m weighted_batcher stream FILE\n"
+    "  python3 -m weighted_batcher compact FILE\n"
+    "  python3 -m weighted_batcher resume FILE [POSITION]"
 )
 
 
@@ -134,6 +140,18 @@ def _stream(path):
     return 0
 
 
+def _compact(path):
+    compact_metrics(path)
+    return 0
+
+
+def _resume(path, position):
+    # The tail from POSITION onwards prints one JSON object per line.
+    for metrics in resume_metrics(path, position):
+        sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
 def _dispatch(handler, path):
     # rotate/stream failures are reported cleanly and end with status 1.
     try:
@@ -169,6 +187,25 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(_stream, args[1])
+    if args and args[0] == "compact":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(_compact, args[1])
+    if args and args[0] == "resume":
+        if len(args) not in (2, 3):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        position = 0
+        if len(args) == 3:
+            try:
+                position = int(args[2])
+            except ValueError:
+                # A position that does not parse as an integer is a
+                # usage error, not a runtime failure.
+                print(_USAGE, file=sys.stderr)
+                return 2
+        return _dispatch(lambda path: _resume(path, position), args[1])
     print(_USAGE, file=sys.stderr)
     return 2
 

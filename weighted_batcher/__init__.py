@@ -16,6 +16,8 @@ __all__ = [
     "recover_metrics",
     "rotate_metrics",
     "iter_metrics",
+    "compact_metrics",
+    "resume_metrics",
 ]
 
 
@@ -146,7 +148,9 @@ def parse_metrics(line):
 
 from .persistence import (  # noqa: E402
     append_metrics,
+    compact_metrics,
     iter_metrics,
     recover_metrics,
+    resume_metrics,
     rotate_metrics,
 )
