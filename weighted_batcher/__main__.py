@@ -8,6 +8,9 @@
     python3 -m weighted_batcher compact FILE
     python3 -m weighted_batcher resume FILE [POSITION]
     python3 -m weighted_batcher prune FILE QUOTA
+    python3 -m weighted_batcher snapshot FILE
+    python3 -m weighted_batcher release FILE HANDLE
+    python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]
 """
 
 from __future__ import annotations
@@ -22,9 +25,12 @@ from . import (
     parse_metrics,
     prune_metrics,
     recover_metrics,
+    release_metrics,
     render_metrics,
     resume_metrics,
+    resume_snapshot_metrics,
     rotate_metrics,
+    snapshot_metrics,
 )
 
 _USAGE = (
@@ -36,7 +42,10 @@ _USAGE = (
     "  python3 -m weighted_batcher stream FILE\n"
     "  python3 -m weighted_batcher compact FILE\n"
     "  python3 -m weighted_batcher resume FILE [POSITION]\n"
-    "  python3 -m weighted_batcher prune FILE QUOTA"
+    "  python3 -m weighted_batcher prune FILE QUOTA\n"
+    "  python3 -m weighted_batcher snapshot FILE\n"
+    "  python3 -m weighted_batcher release FILE HANDLE\n"
+    "  python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]"
 )
 
 
@@ -161,6 +170,27 @@ def _resume(path, position):
     return 0
 
 
+def _snapshot(path):
+    # The opaque handle is the whole snapshot result; print it alone on
+    # stdout so callers can persist it.
+    handle = snapshot_metrics(path)
+    print(handle)
+    return 0
+
+
+def _release(path, handle):
+    release_metrics(path, handle)
+    return 0
+
+
+def _snap_resume(path, handle, position):
+    # Re-read a fixed snapshot from a write-order position exactly like
+    # the ordinary resume stream.
+    for metrics in resume_snapshot_metrics(path, handle, position):
+        sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
 def _dispatch(handler, path):
     # rotate/stream failures are reported cleanly and end with status 1.
     try:
@@ -223,6 +253,30 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(lambda path: _prune(path, quota), args[1])
+    if args and args[0] == "snapshot":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(_snapshot, args[1])
+    if args and args[0] == "release":
+        if len(args) != 3:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda path: _release(path, args[2]), args[1])
+    if args and args[0] == "snap-resume":
+        if len(args) not in (3, 4):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        position = 0
+        if len(args) == 4:
+            try:
+                position = int(args[3])
+            except ValueError:
+                print(_USAGE, file=sys.stderr)
+                return 2
+        return _dispatch(
+            lambda path: _snap_resume(path, args[2], position), args[1]
+        )
     print(_USAGE, file=sys.stderr)
     return 2
 

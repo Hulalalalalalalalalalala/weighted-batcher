@@ -19,6 +19,9 @@ __all__ = [
     "compact_metrics",
     "resume_metrics",
     "prune_metrics",
+    "snapshot_metrics",
+    "resume_snapshot_metrics",
+    "release_metrics",
 ]
 
 
@@ -153,6 +156,9 @@ from .persistence import (  # noqa: E402
     iter_metrics,
     prune_metrics,
     recover_metrics,
+    release_metrics,
     resume_metrics,
+    resume_snapshot_metrics,
     rotate_metrics,
+    snapshot_metrics,
 )

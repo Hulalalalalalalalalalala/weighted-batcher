@@ -23,6 +23,9 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher compact FILE
     python3 -m weighted_batcher resume FILE [POSITION]
     python3 -m weighted_batcher prune FILE QUOTA
+    python3 -m weighted_batcher snapshot FILE
+    python3 -m weighted_batcher release FILE HANDLE
+    python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -36,7 +39,15 @@ across appends, rotations, compactions and pruning. `prune` retains at most
 record. Pruned records keep their write-order positions, so a `POSITION`
 inside or at the prune point reads from the oldest surviving record, and
 only a position past the total record count (pruned included) is out of
-range. `rotate`, `stream`, `compact`, `resume` and `prune` exit 1 on
+range. `snapshot` fixes the current complete record sequence and prints one
+opaque, persistable handle on stdout; `snap-resume` re-reads that fixed
+sequence from `POSITION` (same write-order positions as `resume`,
+including records pruned later, default 0), and `release` invalidates the
+handle and drops its private copy. None of the three changes the segment
+set, and appends, rotations, compactions and prunes never alter a
+snapshot; `snap-resume` at the snapshot's creation-time record total is
+empty and only past it is out of range. `rotate`, `stream`, `compact`,
+`resume`, `prune`, `snapshot`, `release` and `snap-resume` exit 1 on
 failure; wrong argument counts and a `POSITION` or `QUOTA` that is not an
 integer print usage on stderr and exit 2.
 
@@ -122,6 +133,44 @@ integer print usage on stderr and exit 2.
   missing, `IsADirectoryError` for a directory, and `OSError` for a
   non-string path or a locking/write failure. Old segment sets with no
   prune marker need no migration; the first prune starts at zero pruned.
+- `weighted_batcher.snapshot_metrics(path) -> str` fixes the complete
+  record sequence of that instant — every record the set currently holds
+  in its current order and bytes, with original newlines, `-0.0`,
+  oversized counters and key order untouched — and returns an opaque
+  persistable handle string. Appends, rotations, compactions and later
+  prunes never change that sequence, several snapshots are independent,
+  and one snapshot can be read repeatedly with identical results. While
+  the snapshot is alive, a prune that would evict one of its records
+  copies the evicted bytes into the snapshot's private sidecar first, so
+  a fixed record either stays in the segment set or moves to that copy
+  and never silently disappears; a quota-zero prune and active snapshots
+  therefore coexist with one definite result. A crash mid-creation leaves
+  only an unpublished staging file that names no readable handle and is
+  swept by the next write. Raises `FileNotFoundError` if the log is
+  missing, `IsADirectoryError` for a directory, and `OSError` for a
+  non-string path or a locking/write failure, leaving no half metadata
+  behind. Old segment sets need no migration.
+- `weighted_batcher.resume_snapshot_metrics(path, handle, position=0)`
+  streams the snapshot's fixed records from write-order `position`, the
+  same ordinals `resume_metrics` uses: records pruned before or after the
+  snapshot keep theirs, a position in a pruned region reads from the
+  oldest record the snapshot still offers, position equal to the
+  creation-time total is empty, and only past that total is out of range.
+  Records stream line by line in creation-time bytes; a member a
+  concurrent prune evicts never raises `FileNotFoundError` (the walk
+  re-resolves), and compaction rewriting members leaves the snapshot
+  reading its original bytes. Raises `FileNotFoundError` if the log is
+  missing, `IsADirectoryError` for a directory, `OSError` for a non-string
+  path, `TypeError` if `handle` is not a string or `position` is not an
+  integer (booleans do not count), and `ValueError` for a negative or
+  out-of-range position or a handle that is forged, belongs to another
+  segment set, was never committed or has been released.
+- `weighted_batcher.release_metrics(path, handle)` invalidates the handle
+  and removes its private copy; reading or releasing it again raises
+  `ValueError`. Other snapshots and the segment set are untouched. Raises
+  the same path errors as `snapshot_metrics`, `TypeError` for a non-string
+  handle and `ValueError` for a forged, foreign, never-committed or
+  already-released handle.
 
 ## Tests
 

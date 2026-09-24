@@ -30,6 +30,15 @@ resumes the same write-order walk at an integer read position; the
 position needs no translation across appends, rotations, compactions,
 pruning or crash cleanup.
 
+:func:`snapshot_metrics` fixes the complete record sequence of one
+instant and returns an opaque persistable handle.  The snapshot never
+changes afterwards: while it is alive, a prune that evicts one of its
+records first copies the evicted bytes into a private sidecar, so a
+fixed record is either still in the segment set or already in that
+copy.  :func:`resume_snapshot_metrics` re-reads the fixed slice any
+number of times with the same write-order positions, and
+:func:`release_metrics` drops the handle and its copy.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -37,8 +46,12 @@ longer raise ``PermissionError`` there.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import json
 import os
+import secrets
 
 from . import parse_metrics, render_metrics
 
@@ -55,6 +68,9 @@ __all__ = [
     "compact_metrics",
     "resume_metrics",
     "prune_metrics",
+    "snapshot_metrics",
+    "resume_snapshot_metrics",
+    "release_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -69,6 +85,13 @@ _PRUNE_SUFFIX = ".prune"
 _TRIM_SUFFIX = ".trim"
 _PRUNE_TMP_SUFFIX = ".prune.tmp"
 _TRIM_TMP_SUFFIX = ".trim.tmp"
+# Directory holding one private sidecar pair per snapshot: ``<id>.json``
+# is the published (or half-published) snapshot metadata and ``<id>.log``
+# its private copy of records evicted while the snapshot is alive.
+_SNAP_DIR_SUFFIX = ".snapd"
+_SNAP_META_SUFFIX = ".json"
+_SNAP_COPY_SUFFIX = ".log"
+_SNAP_TMP_SUFFIX = ".tmp"
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -458,6 +481,77 @@ def _parse_file(path, label):
             ) from exc
 
 
+def _iter_raw_fd(fd):
+    """Yield each complete record line's raw bytes with newline, from an fd.
+
+    The fd-based twin of :func:`_iter_raw_records`: snapshot reads hold the
+    member descriptor open themselves so a member a concurrent prune
+    evicts can be detected by inode before a single byte is consumed.
+    """
+    pending = b""
+    while True:
+        chunk = os.read(fd, _READ_CHUNK)
+        if not chunk:
+            break
+        pending += chunk
+        *complete, pending = pending.split(b"\n")
+        for raw in complete:
+            if raw and raw != b"\r":
+                yield raw + b"\n"
+
+
+def _parse_raw_fd(fd, label):
+    """Parse complete raw lines from an open fd through the metrics parser."""
+    lineno = 0
+    for raw in _iter_raw_fd(fd):
+        lineno += 1
+        try:
+            yield parse_metrics(raw.decode("utf-8"))
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid metrics in {label} at line {lineno}: {exc}"
+            ) from exc
+
+
+def _resolve_member_ids(path):
+    """Resolve members with identity captured in one marker-consistent world.
+
+    Returns ``(ids, pruned, marker)``.  Each id is
+    ``(member, dev, inode, size)``.  The member list and pruned count
+    come from one marker-consistent resolution; the identity stats are
+    then bracketed by another pair of marker observations, so a prune
+    (the only operation that rewrites the marker) committing between
+    the listing and a stat invalidates the attempt.  Callers open every
+    member, compare descriptor identities and sizes against the captured
+    ones, and re-observe the marker: a commit landing in any of those
+    gaps is caught before the first record is yielded.
+    """
+    before = _marker_observation(path)
+    for _ in range(1000):
+        members, pruned, after_listing = _resolve_once(path, before)
+        if after_listing != before:
+            before = after_listing
+            continue
+        ids = []
+        try:
+            for member in members:
+                stat = os.stat(member)
+                ids.append((member, stat.st_dev, stat.st_ino, stat.st_size))
+        except FileNotFoundError:
+            before = _marker_observation(path)
+            continue
+        after_stats = _marker_observation(path)
+        if after_stats == before:
+            return ids, pruned, before
+        before = after_stats
+    members, pruned = _resolve_members(path)
+    return (
+        [(member, None, None, None) for member in members],
+        pruned,
+        before,
+    )
+
+
 def iter_metrics(path):
     """Yield metric records across the segments and the current log.
 
@@ -591,6 +685,292 @@ def _finish_pending(path):
     """Settle any half-finished compaction or prune before a new mutation."""
     _finish_staged_compact(path)
     _finish_staged_prune(path)
+    _cleanup_snapshot_sidecars(path)
+
+
+# ---------------------------------------------------------------------------
+# Consistency snapshots
+#
+# A snapshot fixes the complete record sequence of one creation instant:
+# records with write-order ordinals in ``[start, end)`` exactly as the bytes
+# were then on disk.  Nothing written afterwards ever enters that window.
+#
+# While a snapshot is alive every prune that evicts one of its records first
+# rebuilds a private copy of the evicted bytes at
+# ``path.snapd/<id>.log``; the private copy is staged at
+# ``<id>.log.tmp`` and atomically replaced before the prune plan is
+# published, so a reader that observes the committed prune always finds a
+# copy that is complete up to the committed pruned ordinal.  Records not
+# yet evicted stay in the segment set itself.  Reads are lock-free: one
+# :func:`_resolve_members` observation supplies both the surviving member
+# list and the pruned ordinal the private copy must cover.
+#
+# Metadata at ``path.snapd/<id>.json`` appears atomically, so a crashed
+# creation (only a ``.tmp`` left) names no readable handle; later writes
+# sweep such orphans transparently.
+# ---------------------------------------------------------------------------
+
+_SNAP_ID_LEN = 32
+_SNAP_HEX = frozenset("0123456789abcdef")
+
+
+def _snapshot_dir(path):
+    """The directory holding private snapshot sidecars for ``path``."""
+    return path + _SNAP_DIR_SUFFIX
+
+
+def _valid_snapshot_id(sid):
+    """Snapshot ids are 32 lowercase hex characters, so never escape the
+    sidecar directory via crafted handles."""
+    return (
+        isinstance(sid, str)
+        and len(sid) == _SNAP_ID_LEN
+        and all(ch in _SNAP_HEX for ch in sid)
+    )
+
+
+def _snapshot_meta_path(path, sid):
+    return os.path.join(_snapshot_dir(path), sid + _SNAP_META_SUFFIX)
+
+
+def _snapshot_copy_path(path, sid):
+    return os.path.join(_snapshot_dir(path), sid + _SNAP_COPY_SUFFIX)
+
+
+def _read_whole_file(path):
+    """Read a small sidecar file completely."""
+    fd = os.open(path, os.O_RDONLY)
+    raw = b""
+    try:
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    return raw
+
+
+def _load_snapshot_meta(path, sid):
+    """Return the published snapshot metadata dict, or ``None`` if absent.
+
+    A published metadata file is always complete (it is renamed into place
+    atomically); an externally damaged file reads like no snapshot -- the
+    handle it named can no longer be authenticated.
+    """
+    try:
+        raw = _read_whole_file(_snapshot_meta_path(path, sid))
+    except FileNotFoundError:
+        return None
+    try:
+        meta = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    if meta.get("id") != sid or not isinstance(meta.get("key"), str):
+        return None
+    start = meta.get("start")
+    end = meta.get("end")
+    if (isinstance(start, bool) or isinstance(end, bool)
+            or not isinstance(start, int) or not isinstance(end, int)
+            or start < 0 or end < start):
+        return None
+    if not isinstance(meta.get("path"), str):
+        return None
+    return meta
+
+
+def _cleanup_snapshot_sidecars(path):
+    """Reclaim snapshot files no published metadata names.
+
+    Runs under the writer lock as part of :func:`_finish_pending`, so the
+    private copy a released snapshot left behind and every ``.tmp`` a
+    crashed create or copy rebuild dropped are swept by the next append,
+    rotation, compaction, prune, snapshot or release.  A live snapshot
+    keeps exactly its metadata and one private copy; the empty sidecar
+    directory is removed as well.
+    """
+    snapd = _snapshot_dir(path)
+    try:
+        names = os.listdir(snapd)
+    except FileNotFoundError:
+        return
+    live = set()
+    for name in names:
+        stem = name[:-len(_SNAP_META_SUFFIX)]
+        if (len(name) == _SNAP_ID_LEN + len(_SNAP_META_SUFFIX)
+                and name.endswith(_SNAP_META_SUFFIX)
+                and _valid_snapshot_id(stem)):
+            live.add(stem)
+    suffixes = (
+        _SNAP_COPY_SUFFIX + _SNAP_TMP_SUFFIX,
+        _SNAP_META_SUFFIX + _SNAP_TMP_SUFFIX,
+        _SNAP_COPY_SUFFIX,
+    )
+    for name in names:
+        # Touch only files of our own ``<32-hex-id><suffix>`` shape;
+        # anything else a user dropped in the directory is left alone.
+        stem = None
+        for suffix in suffixes:
+            if (len(name) == _SNAP_ID_LEN + len(suffix)
+                    and name.endswith(suffix)):
+                stem = name[:_SNAP_ID_LEN]
+                break
+        if stem is None or not _valid_snapshot_id(stem):
+            continue
+        if name.endswith(_SNAP_COPY_SUFFIX) and stem in live:
+            # A live snapshot's complete copy stays.
+            continue
+        _unlink_if_exists(os.path.join(snapd, name))
+    try:
+        os.rmdir(snapd)
+    except OSError:
+        pass
+
+
+def _encode_snapshot_handle(path, sid, key):
+    """Build the opaque, persistable handle string for a snapshot."""
+    payload = json.dumps(
+        {"v": 1, "p": os.path.abspath(path), "id": sid, "k": key},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    token = base64.urlsafe_b64encode(payload).decode("ascii")
+    return token.rstrip("=")
+
+
+def _decode_snapshot_handle(handle):
+    """Decode an opaque handle into its payload dict.
+
+    Raises :class:`TypeError` for a non-string and :class:`ValueError`
+    for anything that is not a handle this module could have produced.
+    """
+    if not isinstance(handle, str):
+        raise TypeError(
+            f"snapshot handle must be a string, got {type(handle).__name__}"
+        )
+    try:
+        padded = handle.encode("ascii")
+        padded += b"=" * ((4 - len(padded) % 4) % 4)
+        raw = base64.b64decode(
+            padded, altchars=b"-_", validate=True
+        )
+        data = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid snapshot handle") from exc
+    if not isinstance(data, dict):
+        raise ValueError("invalid snapshot handle")
+    sid = data.get("id")
+    key = data.get("k")
+    bound = data.get("p")
+    if not _valid_snapshot_id(sid) or not isinstance(key, str) \
+            or not isinstance(bound, str):
+        raise ValueError("invalid snapshot handle")
+    return data
+
+
+def _authenticate_snapshot(path, payload):
+    """Resolve and authenticate a decoded handle against ``path``.
+
+    Returns the snapshot metadata.  Raises :class:`ValueError` when the
+    handle belongs to another log, is forged, names a crashed/never
+    committed creation, or has already been released.
+    """
+    bound = payload["p"]
+    if bound != os.path.abspath(path):
+        raise ValueError("snapshot handle belongs to a different metrics log")
+    meta = _load_snapshot_meta(path, payload["id"])
+    if meta is None:
+        raise ValueError("snapshot handle is unknown or already released")
+    if not hmac.compare_digest(meta["key"], payload["k"]):
+        raise ValueError("snapshot handle is invalid")
+    if meta["path"] != bound:
+        raise ValueError("snapshot handle belongs to a different metrics log")
+    return meta
+
+
+def _stage_snapshot_copies(path, members, old_pruned, new_pruned):
+    """Stage private copies for records a prune is about to evict.
+
+    A single raw walk over the pre-prune ``members`` fans every evicted
+    record out to each still-alive snapshot whose fixed window contains
+    it.  A copy is rebuilt at ``<id>.log.tmp`` -- the marker-consistent
+    prefix of the previous copy first (a crash after an earlier staging
+    rename may have left that copy slightly AHEAD of the still-old
+    marker, so only the first ``old_pruned - start`` records carry over),
+    then the newly evicted range -- flushed, closed and atomically
+    renamed over ``<id>.log``.  This happens before the prune plan is
+    published, which is the invariant snapshot reads rely on: a reader
+    that can observe the new pruned ordinal always finds a copy that
+    covers it.  A crash during staging leaves only a ``.tmp`` beside the
+    previous complete copy; it joins no read and the next write sweeps
+    it and the rebuild simply repeats.
+    """
+    snapd = _snapshot_dir(path)
+    try:
+        names = os.listdir(snapd)
+    except FileNotFoundError:
+        return
+    pinning = []
+    tmp_paths = []
+    try:
+        for name in names:
+            if not (len(name) == _SNAP_ID_LEN + len(_SNAP_META_SUFFIX)
+                    and name.endswith(_SNAP_META_SUFFIX)):
+                continue
+            sid = name[:-len(_SNAP_META_SUFFIX)]
+            if not _valid_snapshot_id(sid):
+                continue
+            meta = _load_snapshot_meta(path, sid)
+            if meta is None:
+                continue
+            start, end = meta["start"], meta["end"]
+            need = max(start, old_pruned)
+            upto = min(end, new_pruned)
+            if upto <= need:
+                continue
+            copy_path = _snapshot_copy_path(path, sid)
+            tmp_path = copy_path + _SNAP_TMP_SUFFIX
+            tmp_paths.append(tmp_path)
+            out = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+            prefix_limit = max(0, min(old_pruned, end) - start)
+            if prefix_limit and os.path.exists(copy_path):
+                # Carry only the marker-consistent prefix of the previous
+                # copy (a crash may have left it one prune ahead); the
+                # walk below appends exactly the newly evicted range.
+                carried = 0
+                for raw in _iter_raw_records(copy_path):
+                    if carried >= prefix_limit:
+                        break
+                    _write_bytes(out, raw)
+                    carried += 1
+            pinning.append((need, upto, out))
+        if not pinning:
+            return
+        ordinal = old_pruned
+        for member in members:
+            for raw in _iter_raw_records(member):
+                for need, upto, out in pinning:
+                    if need <= ordinal < upto:
+                        _write_bytes(out, raw)
+                ordinal += 1
+        for _need, _upto, out in pinning:
+            os.fsync(out)
+            os.close(out)
+    except BaseException:
+        for _need, _upto, out in pinning:
+            try:
+                os.close(out)
+            except OSError:
+                pass
+        for tmp_path in tmp_paths:
+            _unlink_if_exists(tmp_path)
+        raise
+    # Published only after every descriptor is closed, so the rename
+    # also succeeds on Windows.
+    for tmp_path in tmp_paths:
+        os.replace(tmp_path, tmp_path[:-len(_SNAP_TMP_SUFFIX)])
 
 
 def rotate_metrics(path):
@@ -879,7 +1259,13 @@ def prune_metrics(path, quota):
             _member_label(name, path) for name in members[:boundary_index]
         ]
 
-        pruned = _read_prune_state(path)[0] + drop
+        old_pruned = _read_prune_state(path)[0]
+        pruned = old_pruned + drop
+        # Before the prune commits, pin every evicted record that a live
+        # snapshot still fixes into that snapshot's private copy.  Once
+        # the plan below is published the members may vanish, but the
+        # copy already covers every ordinal up to the new pruned count.
+        _stage_snapshot_copies(path, members, old_pruned, pruned)
         if skip:
             _stage_trim(path, boundary, skip)
             target = _member_label(boundary, path)
@@ -966,3 +1352,326 @@ def resume_metrics(path, position=0):
             )
 
     return _generate()
+
+
+def _validate_log_path(path):
+    """The shared path type/shape check every public entry uses."""
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+
+def snapshot_metrics(path):
+    """Fix the current complete record sequence and return a handle.
+
+    The snapshot captures the write-order ordinals
+    ``[pruned, pruned + surviving)`` of exactly this instant: every
+    complete record the segment set holds now, in its current order and
+    bytes (original newlines, ``-0.0``, oversized counters and key order
+    all untouched).  Appends, rotations, compactions and later prunes
+    never alter that sequence, and several snapshots are mutually
+    independent.
+
+    The returned string is an opaque, persistable handle: it binds the
+    snapshot to this log (an absolute path) and carries a random key, so
+    a forged handle or one produced for another segment set is rejected.
+    Pass it to :func:`resume_snapshot_metrics` any number of times -- the
+    result is always the creation-time slice -- and to
+    :func:`release_metrics` when done.
+
+    While the snapshot is alive, a prune that evicts one of its records
+    copies the evicted bytes into the snapshot's private sidecar first,
+    so a fixed record is either still in the segment set or already in
+    the private copy, never silently dropped.  A crash mid-creation
+    leaves only an unpublished staging file; it names no readable handle
+    and the next write sweeps it.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking or writing the
+            snapshot metadata fails; a failed attempt leaves no partial
+            metadata behind.
+    """
+    _validate_log_path(path)
+
+    fd = _mutation_lock(path, create=False)
+    try:
+        _finish_pending(path)
+        fd = _relock_after_settle(fd, path, create=False)
+
+        members, pruned = _resolve_members(path)
+        if not members:
+            raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+        count = 0
+        for member in members:
+            count += sum(1 for _ in _iter_raw_records(member))
+
+        sid = secrets.token_hex(_SNAP_ID_LEN // 2)
+        key = secrets.token_urlsafe(24)
+        meta = {
+            "id": sid,
+            "key": key,
+            "path": os.path.abspath(path),
+            "start": pruned,
+            "end": pruned + count,
+        }
+        snapd = _snapshot_dir(path)
+        os.makedirs(snapd, exist_ok=True)
+        meta_path = _snapshot_meta_path(path, sid)
+        tmp_path = meta_path + _SNAP_TMP_SUFFIX
+        try:
+            out = os.open(
+                tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666
+            )
+            try:
+                _write_bytes(
+                    out,
+                    json.dumps(meta, separators=(",", ":")).encode("utf-8"),
+                )
+                os.fsync(out)
+            finally:
+                os.close(out)
+            os.replace(tmp_path, meta_path)
+        except BaseException:
+            _unlink_if_exists(tmp_path)
+            raise
+        return _encode_snapshot_handle(path, sid, key)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def release_metrics(path, handle):
+    """Release a snapshot handle and drop its private copy.
+
+    Afterwards the handle reads no longer: reading it or releasing it
+    again raises :class:`ValueError`.  Other snapshots and the segment
+    set itself are untouched; any staging file a crashed creation or
+    prune left behind is swept as part of the call.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string or locking fails.
+        TypeError: ``handle`` is not a string.
+        ValueError: the handle is forged, belongs to another log, was
+            never committed or has already been released.
+    """
+    _validate_log_path(path)
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    payload = _decode_snapshot_handle(handle)
+    if payload["p"] != os.path.abspath(path):
+        raise ValueError("snapshot handle belongs to a different metrics log")
+
+    fd = _mutation_lock(path, create=False)
+    try:
+        _finish_pending(path)
+        fd = _relock_after_settle(fd, path, create=False)
+        meta = _authenticate_snapshot(path, payload)
+        _unlink_if_exists(_snapshot_meta_path(path, meta["id"]))
+        _unlink_if_exists(_snapshot_copy_path(path, meta["id"]))
+        _cleanup_snapshot_sidecars(path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _acquire_shared_lock(path):
+    """Take the readers' shared side of the mutation lock, or fall back.
+
+    Snapshot reads hold :data:`fcntl.LOCK_SH` on the live log for the
+    whole walk: appends, rotations, compactions, prunes, snapshot
+    creation and release all hold ``LOCK_EX`` on that same file, so once
+    the shared lock is granted none of them can rename a segment out
+    from under the walk or truncate the live log in place (compaction's
+    same-inode truncate is the one change marker gating cannot see).  A
+    rotation recreates the live log while the writer's lock is held, so
+    after waiting the descriptor is re-checked against the path exactly
+    like :func:`_open_locked`.
+
+    Returns ``None`` on a platform without :mod:`fcntl`, or when the
+    live log is momentarily missing (a crashed rotation's narrow
+    window): then no same-inode mutator can run either -- every writer
+    requires the live log to take its lock -- so the lock-free identity
+    gating in :func:`_iter_snapshot` is sufficient.
+    """
+    if fcntl is None:
+        return None
+    for _ in range(1000):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        except OSError:
+            os.close(fd)
+            raise
+        if _same_inode(fd, path):
+            return fd
+        os.close(fd)
+    return None
+
+
+def _iter_snapshot(path, meta, position):
+    """Yield the fixed snapshot records at or after write ordinal ``position``.
+
+    Lock-free and crash-consistent the same way reads of the live set
+    are.  The private copy holds a prefix of the snapshot's own
+    ordinals, rebuilt and atomically renamed *before* the prune plan it
+    belongs to is published; the resolved surviving members hold the
+    rest, anchored by the pruned ordinal observed in the same
+    marker-consistent resolution.  The two ranges therefore meet at the
+    observed pruned ordinal; they can only overlap when a crash left a
+    rebuilt copy one prune ahead of a still-old marker, in which case the
+    overlap is read from the copy exactly once.
+
+    Every descriptor -- the copy and each resolved member -- is opened
+    and (for members) identity-checked against the resolution *before*
+    the first record leaves this generator, so an eviction or replace a
+    concurrent prune causes a silent re-resolve rather than a
+    :class:`FileNotFoundError`, and a re-resolution can never duplicate a
+    record the caller has already received.  A descriptor held open
+    across the prune that unlinks it still reads the same whole bytes.
+    """
+    start = meta["start"]
+    end = meta["end"]
+    copy_path = _snapshot_copy_path(path, meta["id"])
+    cutoff = max(start, position)
+
+    # Held for the whole walk (see _acquire_shared_lock): while it is
+    # held every mutator blocks, so the marker/identity gates never go
+    # stale on a locked platform.  It may be absent only where locking
+    # is unavailable or the live log is in rotation's missing window.
+    lock_fd = _acquire_shared_lock(path)
+    try:
+        for _ in range(1000):
+            # One marker-consistent observation anchors the member ordinals.
+            ids, pruned_now, marker = _resolve_member_ids(path)
+
+            copy_fd = None
+            member_fds = []
+            try:
+                if os.path.exists(copy_path):
+                    try:
+                        copy_fd = os.open(copy_path, os.O_RDONLY)
+                    except FileNotFoundError:
+                        continue
+                stale = False
+                for member, dev, ino, size in ids:
+                    try:
+                        member_fd = os.open(member, os.O_RDONLY)
+                    except FileNotFoundError:
+                        stale = True
+                        break
+                    stat = os.fstat(member_fd)
+                    if dev is not None and (
+                        stat.st_dev,
+                        stat.st_ino,
+                        stat.st_size,
+                    ) != (dev, ino, size):
+                        os.close(member_fd)
+                        stale = True
+                        break
+                    member_fds.append((member, member_fd))
+                if stale:
+                    continue
+                # Belt and braces for the lock-less paths: a prune
+                # committing between the identity stats and the last
+                # open changed the marker; retry before yielding.
+                if _marker_observation(path) != marker:
+                    continue
+
+                # All inputs are pinned open and identity-consistent; a
+                # later commit only unlinks inodes we already hold.
+                ordinal = start
+                if copy_fd is not None:
+                    for record in _parse_raw_fd(copy_fd, copy_path):
+                        if ordinal >= end:
+                            break
+                        if ordinal >= cutoff:
+                            yield record
+                        ordinal += 1
+                copy_upto = ordinal
+                if copy_upto < min(pruned_now, end):
+                    # Defensive: the staged-before-published ordering
+                    # makes a short copy unobservable; retry rather than
+                    # invent bytes.
+                    continue
+
+                seen = 0
+                for member, member_fd in member_fds:
+                    for record in _parse_raw_fd(member_fd, member):
+                        ordinal = pruned_now + seen
+                        seen += 1
+                        if ordinal < copy_upto or ordinal < cutoff:
+                            continue
+                        if ordinal >= end:
+                            break
+                        yield record
+            finally:
+                if copy_fd is not None:
+                    try:
+                        os.close(copy_fd)
+                    except OSError:
+                        pass
+                for _member, member_fd in member_fds:
+                    try:
+                        os.close(member_fd)
+                    except OSError:
+                        pass
+            return
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def resume_snapshot_metrics(path, handle, position=0):
+    """Stream records of a snapshot from write-order position ``position``.
+
+    Positions are the same write-order ordinals :func:`resume_metrics`
+    uses, counted across the whole log's history: records pruned before
+    or after the snapshot was taken keep theirs.  A position that lands
+    in a region the snapshot's pruned prefix or the set's own pruned
+    prefix once occupied starts at the oldest record the snapshot still
+    offers, and a position equal to the snapshot's creation-time record
+    total yields nothing.  Only a position past that total is out of
+    range.  Repeated calls -- including after appends, rotations,
+    compactions, quota-zero prunes and other snapshots' release -- yield
+    exactly the creation-time slice, byte for byte.
+
+    Raises:
+        FileNotFoundError: the log no longer exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        TypeError: ``handle`` is not a string, or ``position`` is not an
+            integer (booleans do not count).
+        ValueError: ``position`` is negative or past the creation-time
+            total, or the handle is forged, belongs to another log, was
+            never committed or has already been released.
+    """
+    _validate_log_path(path)
+    # Eager path and existence checks first, matching iter_metrics and
+    # resume_metrics; argument/handle errors are reported afterwards.
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError(
+            f"read position must be an integer, got {type(position).__name__}"
+        )
+    if position < 0:
+        raise ValueError("read position must not be negative")
+    payload = _decode_snapshot_handle(handle)
+    meta = _authenticate_snapshot(path, payload)
+    if position > meta["end"]:
+        raise ValueError(
+            f"read position {position} exceeds the snapshot record total "
+            f"of {meta['end']}"
+        )
+
+    return _iter_snapshot(path, meta, position)
