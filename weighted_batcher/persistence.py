@@ -22,10 +22,16 @@ are copied byte for byte, still newline terminated, without re-rendering.
 The merge lands first in a staging file at ``path.compact``; only after it
 is fully on disk does cleanup begin.
 
+:func:`prune_metrics` enforces a record-count retention quota by evicting
+whole records from the oldest end.  The segment set remembers how many
+records were evicted in a ``path.pruned`` counter sidecar, so read
+positions -- ordinal numbers in write order -- never shift: evicted
+records keep occupying their original positions.
+
 :func:`resume_metrics` resumes the same write-order walk at an integer
-read position counting records already read from the start; the position
-needs no translation across appends, rotations, compactions or crash
-cleanup.
+read position counting records already read from the start, evicted
+records included; the position needs no translation across appends,
+rotations, compactions, pruning or crash cleanup.
 """
 
 from __future__ import annotations
@@ -46,12 +52,22 @@ __all__ = [
     "iter_metrics",
     "compact_metrics",
     "resume_metrics",
+    "prune_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
 # Suffix of the staging file compaction writes before cleanup begins; it
 # only ever names a whole, fully-fsynced segment that has been published.
 _COMPACT_SUFFIX = ".compact"
+# Suffix of the sidecar remembering how many records have been pruned.
+_PRUNED_SUFFIX = ".pruned"
+# Suffix pattern of a published prune marker: ``path.prune.<t|e>.<n>.<c>``.
+_PRUNE_MARKER_SUFFIX = ".prune."
+# Marker kinds: ``t`` truncates one segment at record index ``n`` (the
+# marker carries the new cumulative pruned count); ``e`` evicts every
+# segment through ``n``.
+_MARKER_TRUNCATE = "t"
+_MARKER_EVICT = "e"
 
 
 def _segment_numbers(path):
@@ -80,6 +96,136 @@ def _segment_numbers(path):
 def _staging_path(path):
     """The compaction staging file path (``path.compact``)."""
     return path + _COMPACT_SUFFIX
+
+
+def _pruned_path(path):
+    """The sidecar path remembering the cumulative pruned-record count."""
+    return path + _PRUNED_SUFFIX
+
+
+def _read_pruned(path):
+    """Return the cumulative number of pruned records recorded on disk.
+
+    The sidecar holds one base-ten integer written atomically by
+    :func:`prune_metrics`; an absent sidecar -- every segment set that was
+    never pruned, including all pre-pruning sets -- reads back as zero.
+    """
+    sidecar = _pruned_path(path)
+    try:
+        fd = os.open(sidecar, os.O_RDONLY)
+    except FileNotFoundError:
+        return 0
+    try:
+        data = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    return int(data.decode("utf-8").strip())
+
+
+def _write_pruned(path, count):
+    """Atomically replace the pruned-record sidecar with ``count``."""
+    sidecar = _pruned_path(path)
+    tmp = sidecar + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        payload = str(count).encode("ascii")
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, sidecar)
+
+
+def _find_prune_marker(path):
+    """Find a published prune marker left by an interrupted prune.
+
+    Returns ``(kind, segment_number, count, marker_path)`` or ``None``.
+    Segment number ``0`` names the current log; the sidecar and private
+    temporary files never match the marker pattern.
+    """
+    directory = os.path.dirname(path)
+    prefix = os.path.basename(path) + _PRUNE_MARKER_SUFFIX
+    try:
+        names = os.listdir(directory or ".")
+    except FileNotFoundError:
+        return None
+    matches = []
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        parts = name[len(prefix):].split(".")
+        if len(parts) != 3:
+            continue
+        kind, number, count = parts
+        if kind not in (_MARKER_TRUNCATE, _MARKER_EVICT):
+            continue
+        if not (number.isascii() and number.isdigit()):
+            continue
+        if not (count.isascii() and count.isdigit()):
+            continue
+        matches.append((name, kind, int(number), int(count)))
+    if not matches:
+        return None
+    # A prune publishes exactly one marker; several names can only be a
+    # leftover of an impossible state, so resolve deterministically.
+    name, kind, number, count = sorted(matches)[0]
+    if directory:
+        marker_path = os.path.join(directory, name)
+    else:
+        marker_path = name
+    return kind, number, count, marker_path
+
+
+def _finish_prune_marker(path):
+    """Finish an interrupted prune whose marker is still published.
+
+    Called with the live-log lock held by any mutating operation, mirroring
+    :func:`_finish_staged_compact`.  The marker alone names the new world
+    until cleanup completes:
+
+    * a truncate marker's own bytes are the surviving tail of the cut
+      segment; lower numbered segments are removed, the new pruned count
+      is persisted, and the marker is atomically renamed onto the cut
+      segment (or onto the live log for segment number zero);
+    * an evict marker removes every numbered segment through its number,
+      persists the new count, and removes itself; the live log survives.
+
+    The sidecar is written before the marker disappears, so a crash at any
+    point leaves readers resolving either through the marker or through an
+    already-updated sidecar -- never with the old count over the new files.
+    """
+    marker = _find_prune_marker(path)
+    if marker is None:
+        return
+    kind, number, count, marker_path = marker
+    if kind == _MARKER_TRUNCATE:
+        for other in sorted(_segment_numbers(path)):
+            if number == 0 or other < number:
+                # Number zero names the live log, the newest member, so
+                # every numbered segment is older and goes away.
+                os.unlink(f"{path}.{other}")
+        _write_pruned(path, count)
+        target = path if number == 0 else f"{path}.{number}"
+        os.replace(marker_path, target)
+    else:
+        for other in sorted(_segment_numbers(path)):
+            if other <= number:
+                os.unlink(f"{path}.{other}")
+        if not _segment_members(path):
+            # Every record is gone (a rotation-crashed world may have no
+            # live log): keep an empty file at the path so the committed
+            # empty set reads back as empty rather than as a missing log.
+            _truncate_live_log(path)
+        _write_pruned(path, count)
+        os.unlink(marker_path)
 
 
 def _same_inode(fd, path):
@@ -167,7 +313,15 @@ def rotate_metrics(path):
 
     fd = _open_locked(path, create=False)
     try:
+        if fcntl is None:
+            # Windows refuses to rename onto a path while one of our
+            # descriptors is still open against it; this descriptor only
+            # carries the POSIX lock, which does not exist here, so drop
+            # it before any finish-rename or the sealing rename below.
+            os.close(fd)
+            fd = None
         _finish_staged_compact(path)
+        _finish_prune_marker(path)
         used = _segment_numbers(path)
         number = (max(used) + 1) if used else 1
         segment = f"{path}.{number}"
@@ -184,7 +338,8 @@ def rotate_metrics(path):
         )
         os.close(new_fd)
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
 
 
 def append_metrics(path, line):
@@ -218,7 +373,26 @@ def append_metrics(path, line):
 
     fd = _open_locked(path, create=True)
     try:
+        stale = False
+        if fcntl is None:
+            # No lock is carried on this platform; drop the descriptor
+            # before pending cleanup, which may rename onto the live path
+            # (Windows rejects replacing an open path), then reopen.
+            os.close(fd)
+            fd = None
         _finish_staged_compact(path)
+        marker = _find_prune_marker(path)
+        if marker is not None:
+            stale = marker[0] == _MARKER_TRUNCATE and marker[1] == 0
+        _finish_prune_marker(path)
+        if fd is None or stale:
+            # Either Windows cleanup above or a truncate marker finishing
+            # onto the live log left this descriptor pointing at a stale
+            # (now unlinked) inode; reopen so the record reaches the live
+            # log rather than an orphaned file.
+            if fd is not None:
+                os.close(fd)
+            fd = _open_locked(path, create=True)
         # One line per write loop on an O_APPEND descriptor: the kernel
         # appends each write atomically, so concurrent processes do not
         # tear or interleave records.
@@ -227,7 +401,8 @@ def append_metrics(path, line):
             written = os.write(fd, view)
             view = view[written:]
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
 
 
 def _segment_members(path):
@@ -247,7 +422,7 @@ def _segment_members(path):
 
 
 def _resolve_members(path):
-    """Pick the member files to read, honouring a published staging file.
+    """Pick the member files to read, honouring published staging state.
 
     A compaction publishes ``path.compact`` with a single atomic rename
     of a fully written and flushed file, so the name only ever holds a
@@ -257,10 +432,37 @@ def _resolve_members(path):
     A crash earlier, while the merge is still being written, leaves the
     half-written private temp file instead; that never carries this name
     and so neither joins recovery nor affects reads.
+
+    A prune likewise publishes a marker naming the world after eviction:
+    a ``t`` marker's own bytes replace the cut segment (lower numbered
+    segments are already excluded) and an ``e`` marker excludes every
+    numbered segment through its number.  Either way the files still
+    awaiting cleanup are hidden, so a reader landing mid-cleanup or after
+    a crash already sees exactly the surviving records.
     """
     staging = _staging_path(path)
     if os.path.exists(staging):
         return [staging]
+    marker = _find_prune_marker(path)
+    if marker is not None:
+        kind, number, _count, marker_path = marker
+        numbers = sorted(_segment_numbers(path))
+        if kind == _MARKER_TRUNCATE:
+            if number == 0:
+                # The marker replaces the live log; every numbered
+                # segment is older and awaits unlinking.
+                return [marker_path]
+            members = [marker_path]
+            members += [f"{path}.{n}" for n in numbers if n > number]
+            if os.path.exists(path):
+                members.append(path)
+            return members
+        members = [f"{path}.{n}" for n in numbers if n > number]
+        if number != 0 and os.path.exists(path):
+            # A marker cutting at the live log excludes that log until
+            # cleanup has emptied it; its old bytes are still evicted.
+            members.append(path)
+        return members
     return _segment_members(path)
 
 
@@ -341,6 +543,13 @@ def iter_metrics(path):
 
     members = _resolve_members(path)
     if not members:
+        if _find_prune_marker(path) is not None:
+            # A total eviction is published while its cleanup has not yet
+            # recreated an empty live log: the committed set reads empty.
+            def _generate():
+                yield from ()
+
+            return _generate()
         raise FileNotFoundError(f"no metrics log or segments at {path!r}")
 
     def _generate():
@@ -467,9 +676,17 @@ def compact_metrics(path):
 
     fd = _open_locked(path, create=False)
     try:
+        if fcntl is None:
+            # The descriptor only carries the POSIX lock; drop it before
+            # the cleanup renames replace segment paths (Windows rejects
+            # replacing an open path) and reopen nothing here -- the merge
+            # opens its own descriptors.
+            os.close(fd)
+            fd = None
         # A previous compaction may have staged its segment and died
         # before cleanup; settle that world before merging again.
         _finish_staged_compact(path)
+        _finish_prune_marker(path)
 
         staging = _staging_path(path)
         tmp = staging + ".tmp"
@@ -502,22 +719,202 @@ def compact_metrics(path):
             raise
         _finish_staged_compact(path)
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+
+
+def prune_metrics(path, quota):
+    """Enforce a retention ``quota`` by evicting records oldest first.
+
+    ``quota`` is the greatest number of records the segment set keeps;
+    records are dropped whole, in write order, and a record is never split
+    in two.  A quota of zero evicts every record; a quota at or above the
+    current record total evicts nothing.  Empty segments and segments
+    holding only a torn tail consume no quota.  Only the one segment the
+    cut lands inside is rewritten -- with its surviving complete records
+    copied byte for byte, blank lines and torn tails dropped -- while
+    every wholly evicted segment is simply deleted, so the work grows with
+    the amount evicted, not with the segment set.
+
+    Evicted records keep occupying their original write-order positions:
+    the cumulative number of evicted records is remembered in a
+    ``path.pruned`` sidecar and a read position is always an ordinal in
+    write order.  See :func:`resume_metrics`.
+
+    The eviction first lands in a private temporary file and is then
+    published under a single marker name (``path.prune.<kind>.<n>.<c>``)
+    with one atomic rename, so the name only ever names a complete
+    boundary: a crash before publication leaves the segment set exactly as
+    it was, and a crash afterwards leaves a fully evicted-to-boundary set
+    whose cleanup the next append, rotation, compaction or prune finishes
+    transparently.  An unfinished compaction is settled first.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking or writing fails.
+        TypeError: ``quota`` is not an integer (booleans do not count).
+        ValueError: ``quota`` is negative.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if isinstance(quota, bool) or not isinstance(quota, int):
+        raise TypeError(
+            f"retention quota must be an integer, got {type(quota).__name__}"
+        )
+    if quota < 0:
+        raise ValueError("retention quota must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    fd = _open_locked(path, create=False)
+    try:
+        if fcntl is None:
+            # No lock is carried on this platform; release the live-log
+            # descriptor before cleanup replaces or truncates named paths
+            # (Windows rejects replacing an open file).
+            os.close(fd)
+            fd = None
+        _finish_staged_compact(path)
+        _finish_prune_marker(path)
+
+        members = _segment_members(path)
+        if not members:
+            raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+        pruned = _read_pruned(path)
+
+        # Locate the cut from the newest end by reserving the newest
+        # ``quota`` records as survivors: wholly evicted older segments are
+        # never opened, and only the one segment the cut lands in is ever
+        # rewritten.  ``cut`` is the oldest member that still keeps a
+        # surviving record; ``survivors`` is how many of its records keep.
+        need = quota
+        cut = None
+        survivors = 0
+        boundary = False
+        for index in range(len(members) - 1, -1, -1):
+            count = sum(1 for _ in _iter_raw_records(members[index]))
+            if count == need:
+                if need == 0:
+                    # An empty member at the surviving end carries no
+                    # record; step past it toward the records below.
+                    continue
+                if index == 0:
+                    # The quota equals the whole record total: nothing to
+                    # evict.  (Older empty members above were skipped via
+                    # the ``evicted == 0`` check below regardless.)
+                    cut = None
+                    break
+                # The cut lands on a member boundary: this member wholly
+                # survives and every older member is evicted.
+                cut = index
+                survivors = count
+                boundary = True
+                break
+            if count > need:
+                cut = index
+                survivors = need
+                break
+            need -= count
+        if cut is None:
+            return
+
+        # Records older than the cut segment are evicted whole; count them
+        # only to keep the cumulative sidecar exact -- that walk scales
+        # with the evicted amount, never with the survivors.
+        cut_member = members[cut]
+        cut_count = sum(1 for _ in _iter_raw_records(cut_member))
+        evicted = 0
+        for index in range(cut):
+            evicted += sum(1 for _ in _iter_raw_records(members[index]))
+        evicted += cut_count - survivors
+        if evicted == 0:
+            # Quota already met (e.g. equals the total with empty members
+            # between records); no file changes at all.
+            return
+        new_pruned = pruned + evicted
+
+        if boundary:
+            # members[cut] wholly survives; the member just older than it
+            # is the newest fully evicted one (always a numbered segment).
+            evicted_member = members[cut - 1]
+            cut_number = int(evicted_member[len(path) + 1:])
+            kind = _MARKER_EVICT
+        elif survivors == 0:
+            # The cut member itself loses every record.  The live log is
+            # emptied via a truncate marker; a numbered segment and all
+            # older ones are deleted wholesale, never rewritten empty.
+            if cut_member == path:
+                cut_number = 0
+                kind = _MARKER_TRUNCATE
+            else:
+                cut_number = int(cut_member[len(path) + 1:])
+                kind = _MARKER_EVICT
+        elif cut_member == path:
+            # A partial cut in the live log replaces it with the marker's
+            # own bytes, so the path never disappears.
+            cut_number = 0
+            kind = _MARKER_TRUNCATE
+        else:
+            cut_number = int(cut_member[len(path) + 1:])
+            kind = _MARKER_TRUNCATE
+        marker = (
+            f"{path}{_PRUNE_MARKER_SUFFIX}{kind}.{cut_number}.{new_pruned}"
+        )
+        tmp = marker + ".tmp"
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            if kind == _MARKER_TRUNCATE:
+                # Copy only the newest ``survivors`` complete records of
+                # the cut segment; torn tails and blank lines never move.
+                drop_within = cut_count - survivors
+                record_index = 0
+                for raw in _iter_raw_records(cut_member):
+                    record_index += 1
+                    if record_index <= drop_within:
+                        continue
+                    view = memoryview(raw)
+                    while view:
+                        written = os.write(out, view)
+                        view = view[written:]
+            os.fsync(out)
+        finally:
+            os.close(out)
+        try:
+            # Atomic publication: from this instant reads resolve through
+            # the marker to exactly the surviving record sequence.
+            os.replace(tmp, marker)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+        _finish_prune_marker(path)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def resume_metrics(path, position=0):
     """Stream records starting at integer read position ``position``.
 
-    ``position`` counts records already read from the start of the
-    segment set in write order, exactly the records :func:`iter_metrics`
-    yields; omitting it (or passing 0) reads from the beginning.  The
-    position needs no conversion across appends, rotations, compactions
-    or crash-driven compaction cleanup -- it only ever counts records --
-    and stays valid as long as it does not exceed the current record
-    total, at which point the result is an empty stream.  Exactly like
-    :func:`iter_metrics`, reading is line by line and takes time linear
-    in the skipped-and-yielded prefix without materialising the segment
-    set; an overrun is reported once the end is reached.
+    ``position`` is the record ordinal in write order, counting records
+    already read from the start of the segment set -- records since pruned
+    away included, since pruned records keep their original ordinals and
+    the segment set remembers how many were evicted.  Omitting it (or
+    passing 0) reads from the oldest surviving record.  A position inside
+    the pruned prefix, or exactly at the prune boundary, likewise starts
+    at the oldest surviving record.  The position needs no conversion
+    across appends, rotations, compactions, pruning or crash cleanup.  It
+    is only out of range when it exceeds the record total *including*
+    evicted records; a position equal to the total yields an empty stream.
+
+    Exactly like :func:`iter_metrics`, reading is line by line and takes
+    time linear in the skipped-and-yielded prefix without materialising
+    the segment set; an overrun is reported once the end is reached.  At
+    any instant -- before or after pruning -- the result equals the
+    matching slice of a fresh recovery from the start.
 
     Path-level problems are reported when this function is called; line
     content problems and an out-of-range position are reported lazily
@@ -542,16 +939,25 @@ def resume_metrics(path, position=0):
         raise ValueError("read position must not be negative")
 
     def _generate():
-        remaining = position
+        # The sidecar only reaches its new value during marker cleanup, so
+        # while a marker is published its own carried count is authoritative.
+        marker = _find_prune_marker(path)
+        pruned = marker[2] if marker is not None else _read_pruned(path)
+        # Translate the write-order ordinal into a physical offset among
+        # the surviving records; a position in the pruned prefix starts at
+        # the oldest survivor rather than overshooting it.
+        skip = max(position - pruned, 0)
+        physical = 0
         for record in records:
-            if remaining:
-                remaining -= 1
+            physical += 1
+            if skip:
+                skip -= 1
                 continue
             yield record
-        if remaining:
+        if position > pruned + physical:
             raise ValueError(
                 f"read position {position} exceeds the record total of "
-                f"{position - remaining}"
+                f"{pruned + physical}"
             )
 
     return _generate()

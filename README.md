@@ -22,6 +22,7 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher stream FILE
     python3 -m weighted_batcher compact FILE
     python3 -m weighted_batcher resume FILE [POSITION]
+    python3 -m weighted_batcher prune FILE QUOTA
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -33,6 +34,14 @@ from the start in write order, default 0) onward; the position stays valid
 across appends, rotations and compactions. `rotate`, `stream`, `compact` and
 `resume` exit 1 on failure; wrong argument counts and a `POSITION` that is
 not an integer print usage on stderr and exit 2.
+`prune` enforces retention `QUOTA`, the greatest number of records kept:
+whole records are evicted oldest first (a record is never split), `QUOTA` 0
+removes every record, and a quota at or above the surviving record count
+changes nothing. Evicted records keep their write-order positions, so a
+saved resume position stays valid; a position inside the evicted prefix
+starts at the oldest surviving record. `prune` exits 0 on success, 1 on
+failure, and 2 with usage on stderr for a non-integer `QUOTA` or the wrong
+argument count.
 
 ## Public interface
 
@@ -87,15 +96,37 @@ not an integer print usage on stderr and exit 2.
   compaction transparently finishes an interrupted cleanup. Raises
   `FileNotFoundError` if the log is missing, `IsADirectoryError` for a
   directory, and `OSError` for a non-string path or a locking/write failure.
+- `weighted_batcher.prune_metrics(path, quota) -> None` enforces a retention
+  quota by evicting whole records from the oldest end; `quota` is the
+  greatest number of records kept, `0` evicts every record, and a quota at
+  or above the surviving record count evicts nothing. Empty segments and
+  torn-tail-only segments consume no quota, the cut lands between records
+  (a record is never split, however long its line), wholly evicted segments
+  are deleted, and only the one segment the cut lands in is rewritten with
+  the surviving complete records copied byte for byte, so original
+  newlines, `-0.0`, oversized counters and key order are preserved. The
+  cumulative number of evicted records is remembered in a `path.pruned`
+  sidecar, so evicted records keep their original write-order positions.
+  Eviction is atomically published via a prune marker: a crash before
+  publication leaves the set untouched, a crash afterwards leaves it
+  evicted to a complete boundary, and the next append, rotation, compaction
+  or prune finishes the cleanup; an unfinished compaction is settled first.
+  Raises `FileNotFoundError` if the log is missing, `IsADirectoryError` for
+  a directory, `OSError` for a non-string path or a locking/write failure,
+  `TypeError` if `quota` is not an integer (booleans do not count), and
+  `ValueError` for a negative quota.
 - `weighted_batcher.resume_metrics(path, position=0)` streams records from
-  `position` onward, where `position` is the number of records already read
-  from the start of the segment set in write order. The position needs no
-  conversion across appends, rotations, compactions or crash cleanup, and is
-  only out of range when it exceeds the record total. Reading stays line by
-  line and linear, never materialising the segment set. Raises `TypeError`
-  if `position` is not an integer (booleans do not count), `ValueError` for
-  a negative or out-of-range position (the latter while iterating), with the
-  same path and line-level errors as `iter_metrics`.
+  `position` onward, where `position` is the record ordinal in write order
+  counting records from the start -- records since pruned away included.
+  A position inside the pruned prefix (or exactly at the prune boundary)
+  starts at the oldest surviving record; only a position past the record
+  total including evicted records is out of range, and a position equal to
+  the total yields an empty stream. The position needs no conversion across
+  appends, rotations, compactions, pruning or crash cleanup. Reading stays
+  line by line and linear, never materialising the segment set. Raises
+  `TypeError` if `position` is not an integer (booleans do not count),
+  `ValueError` for a negative or out-of-range position (the latter while
+  iterating), with the same path and line-level errors as `iter_metrics`.
 
 ## Tests
 
