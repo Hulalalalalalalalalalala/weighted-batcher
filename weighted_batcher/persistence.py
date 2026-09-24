@@ -40,6 +40,18 @@ read position with the same ordinal rules as :func:`resume_metrics`, and
 left behind by a crash before its handle was registered is not readable
 and is removed transparently by the next write.
 
+:func:`snapshot_diff_metrics` reconciles two snapshots as the old and new
+sides of one write-order sequence: records are aligned by their write
+order ordinal (the pruned prefix each snapshot was taken after, plus its
+index inside the snapshot), and each aligned pair whose bytes differ is a
+``changed`` difference, an old-only ordinal is ``missing`` and a
+new-only ordinal is ``added``.  Differences are produced one JSON line at
+a time straight from the two private copies, which are read
+interleavingly without being loaded whole and without taking the writer
+lock.  :func:`resume_snapshot_delta_metrics` is the cursor form of
+:func:`resume_snapshot_metrics`: it streams the pinned records a cursor
+position has not consumed yet, from the private copy alone.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -68,6 +80,8 @@ __all__ = [
     "snapshot_metrics",
     "release_metrics",
     "resume_snapshot_metrics",
+    "snapshot_diff_metrics",
+    "resume_snapshot_delta_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -1249,6 +1263,242 @@ def resume_snapshot_metrics(path, handle, position=0):
             raise ValueError(
                 f"read position {position} exceeds the snapshotted record "
                 f"total of {pruned + seen}"
+            )
+
+    return _generate()
+
+
+def _require_position(position):
+    """Validate a write-order read position the way every resume API does."""
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError(
+            f"read position must be an integer, got {type(position).__name__}"
+        )
+    if position < 0:
+        raise ValueError("read position must not be negative")
+
+
+def _require_handle(handle, order):
+    """Validate one snapshot argument of a two-handle entry point."""
+    if not isinstance(handle, str):
+        raise TypeError(
+            f"{order} snapshot handle must be a string, got "
+            f"{type(handle).__name__}"
+        )
+
+
+def _resolve_snapshot_handle(path, handle, members_exist):
+    """Pin a validated handle to its private copy and creation metadata.
+
+    Returns ``(copy_path, pruned, total)``.  The registry is the sole
+    authority on whether a handle is live for this segment set, so a
+    forged handle, one minted for another ``path`` or one already
+    released is all the same :class:`ValueError`.  The copy itself is
+    not opened here: registered copies are whole by construction, and
+    opening them only when streaming starts means neither reconciling
+    nor delta reads ever take -- or fail to take -- the writer lock.
+    """
+    if not members_exist:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    entry = _read_snapshot_registry(path).get(handle)
+    if entry is None:
+        raise ValueError(
+            f"unknown or already released snapshot handle: {handle!r}"
+        )
+    return (
+        path + _SNAP_COPY_SUFFIX + handle,
+        int(entry["pruned"]),
+        int(entry["total"]),
+    )
+
+
+def _iter_pinned_raw(copy_path, pruned):
+    """Yield ``(ordinal, lineno, raw)`` pairs from one snapshot copy.
+
+    Ordinal is the record's write-order position: the pruned prefix the
+    snapshot was taken after plus its zero-based index inside the copy.
+    The copy is streamed one line at a time exactly like a segment read,
+    so neither snapshot slice is loaded whole during reconciliation.
+    """
+    index = 0
+    for lineno, raw in _iter_lines(copy_path):
+        if not raw or raw == b"\r":
+            continue
+        yield pruned + index, lineno, raw
+        index += 1
+
+
+def _decode_pinned(raw, copy_path, lineno):
+    """Parse one pinned record line, naming the copy on bad content."""
+    try:
+        return parse_metrics(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid metrics in {copy_path} at line {lineno}: {exc}"
+        ) from exc
+
+
+def snapshot_diff_metrics(path, old_handle, new_handle):
+    """Reconcile two snapshots record by record in write order.
+
+    ``old_handle`` is the older side (the snapshot created first) and
+    ``new_handle`` the newer side; either ordering works mechanically,
+    but which side is which decides whether a record is reported as
+    ``added`` or ``missing``.  Both handles must belong to the segment
+    set at ``path``.
+
+    Records align by their write-order ordinal -- the pruned prefix the
+    snapshot was taken after plus the record's index in the pinned
+    sequence -- so ordinals stay comparable across snapshots however the
+    segment set was appended to, rotated, compacted or pruned between
+    the two creation points.  Each aligned pair whose pinned bytes
+    differ is one ``changed`` difference, an ordinal only the old side
+    holds is ``missing`` and one only the new side holds is ``added``;
+    a record identical on both sides produces nothing.  Post-creation
+    appends, rotations, compactions and prunes change neither snapshot,
+    so the result is stable however the segment set mutates afterwards.
+
+    Differences are produced lazily as one JSON string per difference,
+    each a compact object on a single newline-terminated line with keys
+    in the order ``kind``, ``position`` and then ``old`` and/or
+    ``new``: ``added`` carries ``new`` only, ``missing`` carries
+    ``old`` only, ``changed`` carries both, and ``position`` is the
+    aligned write-order ordinal.  The two private copies are streamed
+    interleavingly, line by line, without being read whole and without
+    taking the writer lock, so upstream writes proceed while
+    reconciliation runs and a locking problem can never be reported
+    here.  Re-evaluating the same pair of handles yields the same
+    lines, and separate reconciliations are independent.
+
+    Path and handle problems are reported when this function is called;
+    line content problems are reported lazily while iterating.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        TypeError: ``old_handle`` or ``new_handle`` is not a string.
+        ValueError: either handle is forged, belongs to another segment
+            set or was released (raised on call), or a pinned complete
+            line is not a metrics JSON object (raised while iterating).
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _require_handle(old_handle, "old")
+    _require_handle(new_handle, "new")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    members, _pruned = _resolve_members(path)
+    old_copy, old_pruned, _old_total = _resolve_snapshot_handle(
+        path, old_handle, bool(members)
+    )
+    new_copy, new_pruned, _new_total = _resolve_snapshot_handle(
+        path, new_handle, bool(members)
+    )
+
+    def _generate():
+        old_iter = iter(_iter_pinned_raw(old_copy, old_pruned))
+        new_iter = iter(_iter_pinned_raw(new_copy, new_pruned))
+        old = next(old_iter, None)
+        new = next(new_iter, None)
+        while old is not None or new is not None:
+            if new is None or (old is not None and old[0] < new[0]):
+                ordinal, lineno, raw = old
+                entry = {
+                    "kind": "missing",
+                    "position": ordinal,
+                    "old": _decode_pinned(raw, old_copy, lineno),
+                }
+                old = next(old_iter, None)
+            elif old is None or new[0] < old[0]:
+                ordinal, lineno, raw = new
+                entry = {
+                    "kind": "added",
+                    "position": ordinal,
+                    "new": _decode_pinned(raw, new_copy, lineno),
+                }
+                new = next(new_iter, None)
+            else:
+                ordinal = old[0]
+                if old[2] != new[2]:
+                    entry = {
+                        "kind": "changed",
+                        "position": ordinal,
+                        "old": _decode_pinned(old[2], old_copy, old[1]),
+                        "new": _decode_pinned(new[2], new_copy, new[1]),
+                    }
+                else:
+                    entry = None
+                old = next(old_iter, None)
+                new = next(new_iter, None)
+            if entry is not None:
+                yield json.dumps(
+                    entry, separators=(",", ":"), ensure_ascii=False
+                ) + "\n"
+
+    return _generate()
+
+
+def resume_snapshot_delta_metrics(path, handle, position=0):
+    """Stream a snapshot's not-yet-read records from a delta cursor.
+
+    This is the cursor counterpart of
+    :func:`resume_snapshot_metrics`: it pins the snapshot's current
+    record boundary -- the one fixed at creation -- and yields the
+    pinned records at write-order ordinals at or after ``position``
+    that the cursor has not consumed yet.  Everything is read from the
+    handle's private copy, so appends, rotations, compactions and
+    prunes happening upstream change neither the boundary nor the
+    sequence, reading never waits on or contends for the writer lock,
+    and a locking failure can never be reported.  The same handle
+    resumed from the same position always yields the same records, even
+    while the segment set is being written.
+
+    ``position`` uses write-order ordinals exactly like
+    :func:`resume_metrics`: a position inside the pruned prefix the
+    snapshot was taken after starts at the oldest pinned record, equal
+    to the creation-time record total the stream is empty, and only a
+    position past that total (pruned records included) is out of range
+    and reported while iterating.
+
+    Path, handle and cursor problems are reported when this function is
+    called; line content problems and an out-of-range cursor are
+    reported lazily while iterating.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        TypeError: ``handle`` is not a string, or ``position`` is not an
+            integer (booleans do not count).
+        ValueError: ``handle`` is forged, belongs to another segment set
+            or was released; ``position`` is negative or past the
+            snapshot's record total (the latter raised while iterating);
+            or a pinned complete line is not a metrics JSON object.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _require_handle(handle, "snapshot")
+    _require_position(position)
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    members, _pruned = _resolve_members(path)
+    copy_path, pruned, total = _resolve_snapshot_handle(
+        path, handle, bool(members)
+    )
+
+    def _generate():
+        seen = 0
+        for _ordinal, lineno, raw in _iter_pinned_raw(copy_path, pruned):
+            if pruned + seen >= position:
+                yield _decode_pinned(raw, copy_path, lineno)
+            seen += 1
+        if position > total:
+            raise ValueError(
+                f"read position {position} exceeds the snapshotted record "
+                f"total of {total}"
             )
 
     return _generate()

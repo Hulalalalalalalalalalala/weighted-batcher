@@ -11,6 +11,8 @@
     python3 -m weighted_batcher snapshot FILE
     python3 -m weighted_batcher release FILE HANDLE
     python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]
+    python3 -m weighted_batcher snap-diff FILE OLD_HANDLE NEW_HANDLE
+    python3 -m weighted_batcher snap-cursor FILE HANDLE [POSITION]
 """
 
 from __future__ import annotations
@@ -28,8 +30,10 @@ from . import (
     release_metrics,
     render_metrics,
     resume_metrics,
+    resume_snapshot_delta_metrics,
     resume_snapshot_metrics,
     rotate_metrics,
+    snapshot_diff_metrics,
     snapshot_metrics,
 )
 
@@ -45,7 +49,9 @@ _USAGE = (
     "  python3 -m weighted_batcher prune FILE QUOTA\n"
     "  python3 -m weighted_batcher snapshot FILE\n"
     "  python3 -m weighted_batcher release FILE HANDLE\n"
-    "  python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]"
+    "  python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]\n"
+    "  python3 -m weighted_batcher snap-diff FILE OLD_HANDLE NEW_HANDLE\n"
+    "  python3 -m weighted_batcher snap-cursor FILE HANDLE [POSITION]"
 )
 
 
@@ -189,6 +195,22 @@ def _snap_resume(path, handle, position):
     return 0
 
 
+def _snap_diff(path, old_handle, new_handle):
+    # Each difference is already one newline-terminated JSON line; copy
+    # it through verbatim so pinned bytes such as -0.0 are not rendered
+    # as metric records.
+    for line in snapshot_diff_metrics(path, old_handle, new_handle):
+        sys.stdout.write(line)
+    return 0
+
+
+def _snap_cursor(path, handle, position):
+    # Stream the pinned records the delta cursor has not consumed yet.
+    for metrics in resume_snapshot_delta_metrics(path, handle, position):
+        sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
 def _dispatch(handler, path):
     # rotate/stream failures are reported cleanly and end with status 1.
     try:
@@ -274,6 +296,27 @@ def main(argv=None):
                 return 2
         return _dispatch(
             lambda path: _snap_resume(path, args[2], position), args[1]
+        )
+    if args and args[0] == "snap-diff":
+        if len(args) != 4:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda path: _snap_diff(path, args[2], args[3]), args[1]
+        )
+    if args and args[0] == "snap-cursor":
+        if len(args) not in (3, 4):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        position = 0
+        if len(args) == 4:
+            try:
+                position = int(args[3])
+            except ValueError:
+                print(_USAGE, file=sys.stderr)
+                return 2
+        return _dispatch(
+            lambda path: _snap_cursor(path, args[2], position), args[1]
         )
     print(_USAGE, file=sys.stderr)
     return 2
