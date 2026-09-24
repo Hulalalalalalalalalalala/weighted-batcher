@@ -30,6 +30,16 @@ resumes the same write-order walk at an integer read position; the
 position needs no translation across appends, rotations, compactions,
 pruning or crash cleanup.
 
+:func:`snapshot_metrics` pins the complete record sequence at creation
+time into a snapshot-private copy (``path.snap.<handle>``) and records the
+handle in the snapshot registry (``path.snapshots``), so later appends,
+rotations, compactions and prunes never change what the snapshot reads.
+:func:`resume_snapshot_metrics` streams a snapshot from a write-order
+read position with the same ordinal rules as :func:`resume_metrics`, and
+:func:`release_metrics` retires a handle and its private copy.  A copy
+left behind by a crash before its handle was registered is not readable
+and is removed transparently by the next write.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -55,6 +65,9 @@ __all__ = [
     "compact_metrics",
     "resume_metrics",
     "prune_metrics",
+    "snapshot_metrics",
+    "release_metrics",
+    "resume_snapshot_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -69,6 +82,14 @@ _PRUNE_SUFFIX = ".prune"
 _TRIM_SUFFIX = ".trim"
 _PRUNE_TMP_SUFFIX = ".prune.tmp"
 _TRIM_TMP_SUFFIX = ".trim.tmp"
+# Snapshot state.  ``path.snapshots`` is the registry of live handles, a
+# JSON object mapping each handle to ``{"pruned": ..., "total": ...}`` as
+# of creation; ``path.snap.<handle>`` is that snapshot's private copy of
+# the complete record sequence, so pinned records survive any later
+# compaction or prune of the segment set itself.
+_REGISTRY_SUFFIX = ".snapshots"
+_REGISTRY_TMP_SUFFIX = ".snapshots.tmp"
+_SNAP_COPY_SUFFIX = ".snap."
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -274,6 +295,65 @@ def _replace_marker(path, text):
     finally:
         os.close(fd)
     os.replace(tmp, path + _PRUNE_SUFFIX)
+
+
+def _read_snapshot_registry(path):
+    """Return the live snapshot handles mapped to their metadata.
+
+    The registry is a JSON object ``{handle: {"pruned": n, "total": n}}``
+    published atomically, so a read never observes a half-written one; a
+    missing registry simply means no snapshots exist.
+    """
+    try:
+        fd = os.open(path + _REGISTRY_SUFFIX, os.O_RDONLY)
+    except FileNotFoundError:
+        return {}
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    return json.loads(raw.decode("utf-8"))
+
+
+def _write_snapshot_registry(path, registry):
+    """Atomically publish the snapshot registry and fsync it."""
+    tmp = path + _REGISTRY_TMP_SUFFIX
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        payload = json.dumps(registry, separators=(",", ":"))
+        _write_bytes(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path + _REGISTRY_SUFFIX)
+
+
+def _finish_snapshot_orphans(path):
+    """Remove snapshot copies no registered handle refers to.
+
+    A crash between staging a snapshot's private copy and publishing its
+    handle leaves the copy unnamed by the registry; such a half-finished
+    handle never participates in reads, and its copy is deleted here by
+    the next write.  Copies of live handles are always kept, so a prune
+    (even with quota zero) or a compaction never makes a pinned record
+    silently disappear.
+    """
+    directory = os.path.dirname(path) or "."
+    prefix = os.path.basename(path) + _SNAP_COPY_SUFFIX
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    live = {prefix + handle for handle in _read_snapshot_registry(path)}
+    for name in names:
+        if name.startswith(prefix) and name not in live:
+            _unlink_if_exists(os.path.join(directory, name))
+    _unlink_if_exists(path + _REGISTRY_TMP_SUFFIX)
 
 
 def _finish_staged_prune(path):
@@ -588,9 +668,10 @@ def _finish_staged_compact(path):
 
 
 def _finish_pending(path):
-    """Settle any half-finished compaction or prune before a new mutation."""
+    """Settle any half-finished compaction, prune or snapshot before a mutation."""
     _finish_staged_compact(path)
     _finish_staged_prune(path)
+    _finish_snapshot_orphans(path)
 
 
 def rotate_metrics(path):
@@ -963,6 +1044,211 @@ def resume_metrics(path, position=0):
             raise ValueError(
                 f"read position {position} exceeds the record total of "
                 f"{pruned + seen}"
+            )
+
+    return _generate()
+
+
+def snapshot_metrics(path):
+    """Pin the current record sequence and return a persistable handle.
+
+    The complete record sequence as of this call -- every surviving
+    record in write order -- is copied byte for byte into a
+    snapshot-private file ``path.snap.<handle>``, and the handle is
+    registered in ``path.snapshots`` together with the pruned-record
+    count and the record total (pruned records included) at creation.
+    From then on no append, rotation, compaction or prune changes what
+    the snapshot reads: the pinned records live in the private copy, so
+    they survive even a quota-zero prune of the segment set, and a
+    compaction that rewrites members leaves the creation-time bytes
+    untouched.  Records move with their original newlines and are never
+    re-rendered, so ``-0.0``, oversized counters and key order are
+    preserved exactly.
+
+    The copy is staged under a temporary name, fsynced and atomically
+    renamed before the handle is registered, and registering the handle
+    is the commit point: a crash earlier leaves an unnamed copy that no
+    read can reach and that the next write removes transparently, so a
+    half-finished handle never participates in reads.  Snapshot creation
+    is serialised with appends, rotations, compactions and prunes by the
+    live-log lock, and an unfinished compaction or prune is settled
+    first, so every record belongs to exactly one side of the snapshot
+    point.  Snapshots are independent of each other, and old segment
+    sets with no registry need no migration.
+
+    The returned handle is a plain string: persist it and pass it back
+    to :func:`resume_snapshot_metrics` and :func:`release_metrics`.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking or writing the
+            snapshot copy fails.  A failed write removes the private
+            temporary file and leaves the segment set and registry
+            untouched.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    fd = _mutation_lock(path, create=False)
+    try:
+        _finish_pending(path)
+        fd = _relock_after_settle(fd, path, create=False)
+
+        registry = _read_snapshot_registry(path)
+        while True:
+            handle = os.urandom(8).hex()
+            if handle not in registry:
+                break
+        copy_path = path + _SNAP_COPY_SUFFIX + handle
+        tmp = copy_path + ".tmp"
+        count = 0
+        try:
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+            try:
+                for member in _segment_members(path):
+                    for raw in _iter_raw_records(member):
+                        _write_bytes(out, raw)
+                        count += 1
+                os.fsync(out)
+            finally:
+                # Closed before the rename: on Windows an open file
+                # cannot be renamed.
+                os.close(out)
+            os.rename(tmp, copy_path)
+        except BaseException:
+            # Nothing reached the copy name: the private temp is the
+            # only file touched and the registry is not yet updated.
+            _unlink_if_exists(tmp)
+            raise
+        pruned = _read_prune_state(path)[0]
+        # Publishing the handle is the commit point; the copy it names
+        # is already whole on disk.
+        registry[handle] = {"pruned": pruned, "total": pruned + count}
+        _write_snapshot_registry(path, registry)
+        return handle
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def release_metrics(path, handle):
+    """Release a snapshot handle and delete its private record copy.
+
+    Afterwards the handle is unknown to the segment set: reading it
+    through :func:`resume_snapshot_metrics` or releasing it again raises
+    :class:`ValueError`.  The registry update is the commit point and
+    the copy is unlinked only after it, so a crash never leaves a
+    registered handle without its copy; an orphaned copy left by a
+    crash is removed by the next write.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        TypeError: ``handle`` is not a string.
+        ValueError: ``handle`` is forged, belongs to another segment
+            set, or was already released.
+        OSError: ``path`` is not a string, or locking or writing the
+            registry fails.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(handle, str):
+        raise TypeError(
+            f"snapshot handle must be a string, got {type(handle).__name__}"
+        )
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    fd = _mutation_lock(path, create=False)
+    try:
+        _finish_pending(path)
+        registry = _read_snapshot_registry(path)
+        if handle not in registry:
+            raise ValueError(
+                f"unknown or already released snapshot handle: {handle!r}"
+            )
+        del registry[handle]
+        _write_snapshot_registry(path, registry)
+        _unlink_if_exists(path + _SNAP_COPY_SUFFIX + handle)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def resume_snapshot_metrics(path, handle, position=0):
+    """Stream a snapshot's records starting at read position ``position``.
+
+    The stream is exactly the record sequence :func:`snapshot_metrics`
+    pinned for ``handle``, however the segment set has changed since:
+    appends, rotations, compactions and prunes after creation are
+    invisible to it, and repeated reads of the same handle always yield
+    the creation-time slice, byte for byte.
+
+    ``position`` uses the same write-order ordinals as
+    :func:`resume_metrics`: records pruned before the snapshot was taken
+    still occupy their ordinals, so a position inside that pruned region
+    starts at the oldest record the snapshot holds.  The position is out
+    of range only when it exceeds the record total at creation (pruned
+    records included); equal to the total the stream is empty.
+
+    Reading is line by line from the snapshot's private copy and never
+    touches the segment-set members, so a member pruned or compacted
+    away concurrently cannot raise :class:`FileNotFoundError` here.
+
+    Path-level and handle problems are reported when this function is
+    called; line content problems and an out-of-range position are
+    reported lazily while iterating.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        TypeError: ``handle`` is not a string, or ``position`` is not an
+            integer (booleans do not count).
+        ValueError: ``handle`` is forged, belongs to another segment set
+            or was released; ``position`` is negative or past the
+            snapshot's record total (the latter raised while iterating);
+            or a complete line is not a metrics JSON object.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(handle, str):
+        raise TypeError(
+            f"snapshot handle must be a string, got {type(handle).__name__}"
+        )
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError(
+            f"read position must be an integer, got {type(position).__name__}"
+        )
+    if position < 0:
+        raise ValueError("read position must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+
+    entry = _read_snapshot_registry(path).get(handle)
+    if entry is None:
+        raise ValueError(
+            f"unknown or already released snapshot handle: {handle!r}"
+        )
+    pruned = int(entry["pruned"])
+    copy_path = path + _SNAP_COPY_SUFFIX + handle
+
+    def _generate():
+        seen = 0
+        for record in _parse_file(copy_path, copy_path):
+            if pruned + seen >= position:
+                yield record
+            seen += 1
+        if position > pruned + seen:
+            raise ValueError(
+                f"read position {position} exceeds the snapshotted record "
+                f"total of {pruned + seen}"
             )
 
     return _generate()

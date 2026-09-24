@@ -23,6 +23,9 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher compact FILE
     python3 -m weighted_batcher resume FILE [POSITION]
     python3 -m weighted_batcher prune FILE QUOTA
+    python3 -m weighted_batcher snapshot FILE
+    python3 -m weighted_batcher release FILE HANDLE
+    python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -36,7 +39,11 @@ across appends, rotations, compactions and pruning. `prune` retains at most
 record. Pruned records keep their write-order positions, so a `POSITION`
 inside or at the prune point reads from the oldest surviving record, and
 only a position past the total record count (pruned included) is out of
-range. `rotate`, `stream`, `compact`, `resume` and `prune` exit 1 on
+range. `snapshot` pins the complete record sequence at creation time and
+prints a persistable handle; `snap-resume` streams the pinned sequence
+from `POSITION` (same ordinal rules as `resume`, default 0), and
+`release` retires the handle. `rotate`, `stream`, `compact`, `resume`,
+`prune`, `snapshot`, `release` and `snap-resume` exit 1 on
 failure; wrong argument counts and a `POSITION` or `QUOTA` that is not an
 integer print usage on stderr and exit 2.
 
@@ -122,6 +129,42 @@ integer print usage on stderr and exit 2.
   missing, `IsADirectoryError` for a directory, and `OSError` for a
   non-string path or a locking/write failure. Old segment sets with no
   prune marker need no migration; the first prune starts at zero pruned.
+- `weighted_batcher.snapshot_metrics(path) -> str` pins the complete
+  record sequence as of the call and returns a persistable snapshot
+  handle. The pinned records are copied byte for byte into a
+  snapshot-private file, so no later append, rotation, compaction or
+  prune changes what the snapshot reads — the records survive even a
+  quota-0 prune, and a compaction rewriting the segment members leaves
+  the creation-time bytes (original newlines, `-0.0`, oversized
+  counters, key order) untouched. Snapshots are independent of each
+  other. A crash mid-creation leaves no usable handle behind, and the
+  orphaned copy is removed transparently by the next write. Raises
+  `FileNotFoundError` if the log is missing, `IsADirectoryError` for a
+  directory, and `OSError` for a non-string path or a locking/write
+  failure.
+- `weighted_batcher.release_metrics(path, handle) -> None` releases a
+  snapshot handle and deletes its private copy. Reading or releasing the
+  handle afterwards raises `ValueError`, as does a forged handle or one
+  belonging to another segment set. Raises `TypeError` if `handle` is
+  not a string, `FileNotFoundError` if the log is missing,
+  `IsADirectoryError` for a directory, and `OSError` for a non-string
+  path or a locking/write failure.
+- `weighted_batcher.resume_snapshot_metrics(path, handle, position=0)`
+  streams the records pinned for `handle` from `position` onward, with
+  the same write-order ordinals as `resume_metrics`: records pruned
+  before the snapshot still occupy their ordinals, a position inside
+  that pruned region starts at the oldest record the snapshot holds, and
+  only a position past the creation-time record total (pruned included)
+  is out of range — equal to the total the stream is empty. Repeated
+  reads of the same handle always yield the creation-time slice, and
+  reading never touches the segment-set members, so a member pruned or
+  compacted away concurrently raises no `FileNotFoundError`. Raises
+  `TypeError` if `handle` is not a string or `position` is not an
+  integer (booleans do not count), `ValueError` for a forged, foreign or
+  released handle and for a negative or out-of-range position (the
+  latter while iterating), `FileNotFoundError` when neither the log nor
+  any segment exists, `IsADirectoryError` for a directory, and `OSError`
+  for a non-string path.
 
 ## Tests
 
