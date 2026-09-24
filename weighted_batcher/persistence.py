@@ -40,6 +40,19 @@ read position with the same ordinal rules as :func:`resume_metrics`, and
 left behind by a crash before its handle was registered is not readable
 and is removed transparently by the next write.
 
+:func:`snapshot_diff_metrics` reconciles two snapshots of one segment set
+in write order -- the handle created first is the old side -- reporting
+each extra record as ``added``, each vanished one as ``missing`` and each
+byte-for-byte changed one as ``changed``, one JSON line per difference.
+:func:`resume_snapshot_delta_metrics` pins the live record boundary the
+way :func:`snapshot_metrics` pins a snapshot (a brief lock to settle and
+capture the members, then a lock-free copy) and streams the records past
+a read position that the holder of an older snapshot handle has not read
+yet.  A reconciliation is fully lock free, and an incremental pull holds
+the write lock only for the constant-sized boundary pin -- never while
+its records are produced -- so appends, rotations, compactions and
+prunes proceed normally while either read runs.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -49,6 +62,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 
 from . import parse_metrics, render_metrics
 
@@ -68,6 +82,8 @@ __all__ = [
     "snapshot_metrics",
     "release_metrics",
     "resume_snapshot_metrics",
+    "snapshot_diff_metrics",
+    "resume_snapshot_delta_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -353,6 +369,13 @@ def _finish_snapshot_orphans(path):
     for name in names:
         if name.startswith(prefix) and name not in live:
             _unlink_if_exists(os.path.join(directory, name))
+    # An incremental-pull copy is anonymous from birth on Linux; only the
+    # named-temp fallback on an O_TMPFILE-less filesystem can leave a
+    # file behind if the process died in the create-to-unlink window.
+    cursor_prefix = os.path.basename(path) + ".cursor."
+    for name in names:
+        if name.startswith(cursor_prefix):
+            _unlink_if_exists(os.path.join(directory, name))
     _unlink_if_exists(path + _REGISTRY_TMP_SUFFIX)
 
 
@@ -523,9 +546,9 @@ def _iter_lines(path, chunksize=_READ_CHUNK):
         os.close(fd)
 
 
-def _parse_file(path, label):
-    """Stream one segment or the current log through the metrics parser."""
-    for lineno, raw in _iter_lines(path):
+def _parse_lined(lines, label):
+    """Parse ``(line_number, raw_bytes)`` complete lines into metrics."""
+    for lineno, raw in lines:
         if not raw or raw == b"\r":
             # A bare newline or a CRLF blank line carries no record.
             continue
@@ -536,6 +559,11 @@ def _parse_file(path, label):
             raise ValueError(
                 f"invalid metrics in {label} at line {lineno}: {exc}"
             ) from exc
+
+
+def _parse_file(path, label):
+    """Stream one segment or the current log through the metrics parser."""
+    yield from _parse_lined(_iter_lines(path), label)
 
 
 def iter_metrics(path):
@@ -599,17 +627,16 @@ def recover_metrics(path):
     return list(iter_metrics(path))
 
 
-def _iter_raw_records(path, chunksize=_READ_CHUNK):
+def _iter_raw_file_records(copy_path, chunksize=_READ_CHUNK):
     """Yield each complete record line's raw bytes with its newline.
 
     The chunked walk mirrors :func:`_iter_lines`, but lines are never
     parsed or re-rendered: blank lines are skipped exactly as on read,
     the torn unterminated tail is dropped, and every other complete line
     comes back verbatim with ``\\n`` reattached, so byte-level content
-    such as ``-0.0``, huge counters and key ordering survives compaction
-    and pruning untouched.
+    such as ``-0.0``, huge counters and key ordering survives untouched.
     """
-    fd = os.open(path, os.O_RDONLY)
+    fd = os.open(copy_path, os.O_RDONLY)
     pending = b""
     try:
         while True:
@@ -623,6 +650,16 @@ def _iter_raw_records(path, chunksize=_READ_CHUNK):
                     yield raw + b"\n"
     finally:
         os.close(fd)
+
+
+def _iter_raw_records(path, chunksize=_READ_CHUNK):
+    """Yield each complete record line's raw bytes with its newline.
+
+    Delegates to :func:`_iter_raw_file_records`; records are copied byte
+    for byte exactly as on a fresh read, so compaction and pruning move
+    original newlines, ``-0.0``, huge counters and key ordering untouched.
+    """
+    yield from _iter_raw_file_records(path, chunksize)
 
 
 def _truncate_live_log(path):
@@ -1250,5 +1287,467 @@ def resume_snapshot_metrics(path, handle, position=0):
                 f"read position {position} exceeds the snapshotted record "
                 f"total of {pruned + seen}"
             )
+
+    return _generate()
+
+
+def _snapshot_entry(path, handle):
+    """Validate ``handle`` against the registry and return its metadata.
+
+    Mirrors the handle checks of :func:`resume_snapshot_metrics`: a
+    non-string handle is a :class:`TypeError`; a forged handle, one from
+    another segment set, or one already released is a
+    :class:`ValueError`.
+    """
+    if not isinstance(handle, str):
+        raise TypeError(
+            f"snapshot handle must be a string, got {type(handle).__name__}"
+        )
+    entry = _read_snapshot_registry(path).get(handle)
+    if entry is None:
+        raise ValueError(
+            f"unknown or already released snapshot handle: {handle!r}"
+        )
+    return entry
+
+
+class _LiveTruncated(RuntimeError):
+    """Internal signal: the live inode shrank while its bytes were copied."""
+
+
+def _capture_delta_members(path):
+    """Take the write lock, settle pending work, and open every member.
+
+    Returns ``(lock_fd, pruned, captured)``; each captured item is
+    ``(descriptor, size, is_live)`` in member order.  Ownership of the
+    lock and every descriptor passes to the caller; on failure every
+    descriptor opened here is closed and the lock released.
+    """
+    lock_fd = _open_locked(path, create=False)
+    captured = []
+    try:
+        _finish_pending(path)
+        lock_fd = _relock_after_settle(lock_fd, path, create=False)
+        members = _segment_members(path)
+        pruned = _read_prune_state(path)[0]
+        for member in members:
+            descriptor = os.open(member, os.O_RDONLY)
+            captured.append(
+                (descriptor, os.fstat(descriptor).st_size,
+                 member == path, member)
+            )
+        return lock_fd, pruned, captured
+    except BaseException:
+        for descriptor, _size, _is_live, _member in captured:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            # _relock_after_settle may already have closed this fd
+            # before failing to re-open the settled live log.
+            pass
+        raise
+
+
+def _pin_once(path, copy_under_lock):
+    """Build one boundary pin; raise :class:`_LiveTruncated` on a live race.
+
+    Numbered members are never truncated, so their open descriptors and
+    pinned sizes already pin the bytes.  The live member (always last)
+    alone is copied into an anonymous inode: unless
+    ``copy_under_lock`` is set, the write lock is released immediately
+    before that copy -- keeping writer blocking constant in the data
+    size -- and a compaction truncating the live inode during the copy
+    surfaces as a short read and asks for a locked retry.
+    """
+    lock_fd, pruned, captured = _capture_delta_members(path)
+    pins = []
+    try:
+        for descriptor, size, is_live, member in captured:
+            if is_live:
+                if not copy_under_lock:
+                    os.close(lock_fd)
+                    lock_fd = None
+                # _anonymous_copy always closes the live source
+                # descriptor, returning the anonymous one (or raising);
+                # the live member is last, so every numbered pin is
+                # already in ``pins`` and released there on failure.
+                descriptor = _anonymous_copy(
+                    descriptor, size, path,
+                    allow_short=not copy_under_lock,
+                )
+            pins.append((descriptor, size, member))
+        return pruned, pins
+    except BaseException:
+        _close_pins(pins)
+        # On a failure while the live copy is under way, the numbered
+        # descriptors already moved into ``pins`` (closed just above);
+        # the live descriptor was closed by _anonymous_copy.  Nothing
+        # else captured remains open.
+        raise
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _pin_numbered_only(members, pruned):
+    """Pin members when no live log exists (a rotation crashed mid-seal).
+
+    Numbered files are never truncated -- only renamed, unlinked or
+    replaced -- so an open descriptor keeps its pinned bytes without
+    any lock, matching the settled slice a lock-free recovery reads in
+    this state.
+    """
+    pins = []
+    for member in members:
+        descriptor = os.open(member, os.O_RDONLY)
+        pins.append((descriptor, os.fstat(descriptor).st_size, member))
+    return pruned, pins
+
+
+def _pin_live_delta(path):
+    """Fix this instant's record boundary for an incremental pull.
+
+    Returns ``(pruned, pins)``; each pin is ``(descriptor, size)`` with
+    ``descriptor`` a read-only cursor on the member's pinned bytes
+    (``None`` on a lock-less platform, where members are read by path
+    instead) and ``size`` the pinned byte length.
+
+    The write lock is held only while any half-finished mutation is
+    settled and each member is opened and sized -- constant time in the
+    data -- and the live log's bytes are copied after the lock is
+    released, so an upstream append, rotation, compaction or prune is
+    never blocked for long and proceeds normally for the whole
+    duration of the stream:
+
+    * a numbered segment is never truncated -- only renamed away by
+      rotation, unlinked by compaction or replaced by a prune trim -- so
+      an open descriptor keeps its pinned bytes readable through every
+      later mutation;
+    * the live log alone can be truncated in place (compaction empties
+      it), so its pinned bytes move into an anonymous descriptor,
+      unnamed from birth, that is immune to truncation and dies with the
+      generator; a crash leaves nothing behind for a later write to
+      clean up.  The copy normally runs lock free; in the rare event a
+      compaction truncates the inode during it, the pin is retried once
+      with the copy under the lock;
+    * every descriptor is bounded by the pinned byte length, so bytes
+      appended after the pin never enter the stream.
+
+    Settling runs while the lock is held, so a half-finished
+    compaction, prune or snapshot left by a crash is cleaned up
+    transparently exactly as by a write.  On platforms without
+    :mod:`fcntl` (Windows) no descriptor is held, matching the
+    lock-less tradeoffs the other readers make there.
+    """
+    members, pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    if fcntl is None:
+        return pruned, [(None, None, member) for member in members]
+    if not os.path.exists(path):
+        # A rotation crashed after sealing and before recreating the
+        # live log: only numbered members exist, none truncatable.
+        return _pin_numbered_only(members, pruned)
+    try:
+        return _pin_once(path, copy_under_lock=False)
+    except _LiveTruncated:
+        # A compaction raced the lock-free live copy; re-capture and
+        # copy with the lock held, which no compaction can interrupt.
+        return _pin_once(path, copy_under_lock=True)
+
+
+def _anonymous_copy(source, size, path, allow_short):
+    """Copy ``size`` bytes of ``source`` into a seeked anonymous file.
+
+    Always closes ``source``.  With ``allow_short``, a truncation of the
+    live inode during the copy -- a compaction racing the lock-free pin
+    -- makes the read end early and raises :class:`_LiveTruncated`;
+    otherwise (the locked retry) the copy is uninterrupted.
+    """
+    directory = os.path.dirname(path) or "."
+    tmp_fd = None
+    o_tmpfile = getattr(os, "O_TMPFILE", 0)
+    if o_tmpfile:
+        try:
+            tmp_fd = os.open(directory, os.O_RDWR | o_tmpfile, 0o666)
+        except OSError:
+            # Some filesystems reject O_TMPFILE; fall through to a named
+            # temp that is unlinked on the next line.
+            tmp_fd = None
+    if tmp_fd is None:
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=directory, prefix=os.path.basename(path) + ".cursor."
+        )
+        os.unlink(tmp_name)
+    try:
+        remaining = size
+        while remaining:
+            chunk = os.read(source, min(_READ_CHUNK, remaining))
+            if not chunk:
+                if allow_short:
+                    raise _LiveTruncated("live log truncated during pin")
+                break
+            _write_bytes(tmp_fd, chunk)
+            remaining -= len(chunk)
+        os.lseek(tmp_fd, 0, os.SEEK_SET)
+    except BaseException:
+        os.close(tmp_fd)
+        raise
+    finally:
+        os.close(source)
+    return tmp_fd
+
+
+def _close_pins(pins):
+    """Release every descriptor a delta boundary pin holds."""
+    for descriptor, _size, _member in pins:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _iter_fd_lines(descriptor, cap, chunksize=_READ_CHUNK):
+    """Yield ``(line_number, raw_bytes)`` from ``descriptor`` up to ``cap``.
+
+    The bounded counterpart of :func:`_iter_lines`: at most the pinned
+    byte length is read, so a record appended after the pin is never
+    produced, and the final unterminated tail at the pinned end is a
+    possible torn write and is never produced, exactly as on a normal
+    read.
+    """
+    remaining = cap
+    pending = b""
+    lineno = 0
+    while remaining > 0:
+        chunk = os.read(descriptor, min(chunksize, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        pending += chunk
+        *complete, pending = pending.split(b"\n")
+        for raw in complete:
+            lineno += 1
+            yield lineno, raw
+
+
+def snapshot_diff_metrics(path, old_handle, new_handle):
+    """Reconcile two snapshots in write order and yield the differences.
+
+    ``old_handle`` is the snapshot created first -- the old side -- and
+    ``new_handle`` the new side.  Both private copies are walked in
+    write-order ordinals side by side, one record at a time, so neither
+    snapshot is materialised: records only on the new side are
+    ``added``, records only on the old side ``missing``, and records
+    present on both but differing in their stored bytes ``changed``.
+    Equal ordinals stop once both sides are exhausted, so records
+    appended after either snapshot was taken never appear.
+
+    Each difference is one JSON object rendered on its own
+    newline-terminated line.  The keys come in the order ``kind``,
+    ``position``, ``old``, ``new``, with ``old``/``new`` present exactly
+    on the side the difference has (``added`` carries ``new``,
+    ``missing`` carries ``old``, ``changed`` both), and their content is
+    the record exactly as pinned: a snapshot stores every record in its
+    compact appended form, so parsing a pinned line and re-rendering it
+    reproduces its bytes -- original newlines aside, ``-0.0``, oversized
+    counters and key ordering are untouched.  Whether a shared ordinal is
+    ``changed`` is decided on the stored bytes themselves, so two lines
+    that differ only in key order are still a change.
+
+    The walk is fully lock free: snapshot copies are never members of the
+    live segment set, and each side is streamed line by line rather than
+    read whole, so reads neither take nor wait on the write lock and
+    never block an upstream append, rotation, compaction or prune.
+    Repeated reconciliation of the same handle pair always yields the
+    same lines, and different pairs never interfere.
+
+    Path- and handle-level problems are reported when this function is
+    called; a line that is not valid metrics JSON is reported lazily
+    while iterating.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        TypeError: either handle is not a string.
+        ValueError: either handle is forged, belongs to another segment
+            set or was released; or a complete line is not a metrics
+            JSON object (raised while iterating).
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    old_entry = _snapshot_entry(path, old_handle)
+    new_entry = _snapshot_entry(path, new_handle)
+
+    old_pruned = int(old_entry["pruned"])
+    new_pruned = int(new_entry["pruned"])
+    old_copy = path + _SNAP_COPY_SUFFIX + old_handle
+    new_copy = path + _SNAP_COPY_SUFFIX + new_handle
+
+    def _records(copy_path):
+        # The private copy is streamed line by line and each stored line
+        # is carried both as its raw bytes (which decide ``changed``) and
+        # as the parsed record (which fills ``old``/``new``), so no
+        # snapshot is ever read whole and no write lock is ever held.
+        for raw in _iter_raw_file_records(copy_path):
+            text = raw[:-1].decode("utf-8")
+            yield raw, parse_metrics(text)
+
+    def _line(kind, position, old, new):
+        difference = {"kind": kind, "position": position}
+        if old is not None:
+            difference["old"] = old[1]
+        if new is not None:
+            difference["new"] = new[1]
+        return json.dumps(
+            difference, ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def _generate():
+        # Keep one generator per side in lock step.  Both always point at
+        # the record with the next ordinal; advancing a side aligns it to
+        # the ordinal the other side is already sitting on.
+        old_records = _records(old_copy)
+        new_records = _records(new_copy)
+        old_ordinal = old_pruned
+        new_ordinal = new_pruned
+        old_record = next(old_records, None)
+        new_record = next(new_records, None)
+        while old_record is not None or new_record is not None:
+            if old_record is not None and (
+                new_record is None or old_ordinal < new_ordinal
+            ):
+                yield _line("missing", old_ordinal, old_record, None)
+                old_ordinal += 1
+                old_record = next(old_records, None)
+            elif new_record is not None and (
+                old_record is None or new_ordinal < old_ordinal
+            ):
+                yield _line("added", new_ordinal, None, new_record)
+                new_ordinal += 1
+                new_record = next(new_records, None)
+            else:
+                # Byte comparison of the pinned lines: key order, -0.0
+                # and oversized counters are part of the stored bytes.
+                if old_record[0] != new_record[0]:
+                    yield _line(
+                        "changed", old_ordinal, old_record, new_record
+                    )
+                old_ordinal += 1
+                new_ordinal += 1
+                old_record = next(old_records, None)
+                new_record = next(new_records, None)
+
+    return _generate()
+
+
+def resume_snapshot_delta_metrics(path, old_handle, position=0):
+    """Stream not-yet-read live records using an older snapshot handle.
+
+    The call fixes the present record boundary: under one short-lived
+    write lock it settles any half-finished mutation, captures every
+    member's bytes as independent read-only descriptors bounded by their
+    pinned lengths, and copies the live log into an anonymous descriptor
+    immune to the in-place truncation a later compaction performs.  The
+    lock is released again before this returns, so while records are
+    produced upstream appends, rotations, compactions and prunes proceed
+    normally: appended bytes sit past a pinned length and never leak in,
+    rotated or unlinked members stay readable through their captured
+    descriptors, the compacted live log survives in its anonymous copy,
+    and a prune leaves every pinned inode -- replaced or unlinked --
+    readable.  ``old_handle`` only identifies the reader (its forged,
+    foreign or released forms are rejected); the records come from the
+    pinned live boundary, not from that snapshot's private copy.
+
+    ``position`` uses the same write-order ordinals as
+    :func:`resume_metrics`.  Records at ordinals below it are skipped; a
+    position inside the pruned region starts at the oldest surviving
+    record; equal to the current total (pruned records included) the
+    stream is empty.  A position past that total is out of range and,
+    like :func:`resume_metrics`, raises :class:`ValueError` only once the
+    end is reached while iterating.
+
+    The pulled sequence matches a fresh from-the-start recovery of the
+    pinned instant, and neither append, rotation, compaction nor prune
+    after the pin changes it; repeated calls with the same arguments
+    yield the same records.  Streaming is line by line and never takes
+    the write lock, so a concurrent writer neither deadlocks against
+    the pull nor reports a spurious locking failure.
+
+    Path-, handle- and position-level problems are reported when this
+    function is called; line content problems and an out-of-range
+    position are reported lazily while iterating.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        TypeError: ``old_handle`` is not a string, or ``position`` is
+            not an integer (booleans do not count).
+        ValueError: ``old_handle`` is forged, belongs to another segment
+            set or was released; ``position`` is negative or past the
+            record total (the latter raised while iterating); or a
+            complete line is not a metrics JSON object.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(old_handle, str):
+        raise TypeError(
+            f"snapshot handle must be a string, got {type(old_handle).__name__}"
+        )
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError(
+            f"read position must be an integer, got {type(position).__name__}"
+        )
+    if position < 0:
+        raise ValueError("read position must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    # The boundary is fixed first, exactly as in resume_snapshot_metrics,
+    # so a missing log reports FileNotFoundError before the handle is
+    # consulted; the registry then rejects a forged, foreign or released
+    # handle without streaming.
+    pruned, pins = _pin_live_delta(path)
+    try:
+        _snapshot_entry(path, old_handle)
+    except BaseException:
+        # A forged, foreign or released handle rejects the pull without
+        # ever handing back a generator, so the boundary descriptors must
+        # be released here rather than waiting for iteration cleanup.
+        _close_pins(pins)
+        raise
+
+    def _generate():
+        seen = 0
+        try:
+            for descriptor, size, member in pins:
+                if descriptor is None:
+                    # Lock-less platform: members are read by path.
+                    records = _parse_file(member, member)
+                else:
+                    records = _parse_lined(
+                        _iter_fd_lines(descriptor, size), member
+                    )
+                for record in records:
+                    if pruned + seen >= position:
+                        yield record
+                    seen += 1
+            if position > pruned + seen:
+                raise ValueError(
+                    f"read position {position} exceeds the record total of "
+                    f"{pruned + seen}"
+                )
+        finally:
+            # Descriptors -- the anonymous live copy included -- die
+            # with the generator, whether it ran out or was closed early.
+            _close_pins(pins)
 
     return _generate()

@@ -22,6 +22,8 @@ __all__ = [
     "snapshot_metrics",
     "release_metrics",
     "resume_snapshot_metrics",
+    "snapshot_diff_metrics",
+    "resume_snapshot_delta_metrics",
 ]
 
 
@@ -158,7 +160,9 @@ from .persistence import (  # noqa: E402
     recover_metrics,
     release_metrics,
     resume_metrics,
+    resume_snapshot_delta_metrics,
     resume_snapshot_metrics,
     rotate_metrics,
+    snapshot_diff_metrics,
     snapshot_metrics,
 )
