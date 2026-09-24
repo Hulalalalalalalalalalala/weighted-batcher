@@ -18,6 +18,7 @@ __all__ = [
     "iter_metrics",
     "compact_metrics",
     "resume_metrics",
+    "prune_metrics",
 ]
 
 
@@ -150,6 +151,7 @@ from .persistence import (  # noqa: E402
     append_metrics,
     compact_metrics,
     iter_metrics,
+    prune_metrics,
     recover_metrics,
     resume_metrics,
     rotate_metrics,

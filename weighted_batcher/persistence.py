@@ -1,4 +1,4 @@
-"""Durable append-only metric log with rotation, compaction and resume.
+"""Durable append-only metric log with rotation, compaction, pruning and resume.
 
 Each metric occupies exactly one newline-terminated JSON line.  A record is
 appended with :func:`os.write` against a single ``O_APPEND`` file
@@ -22,19 +22,27 @@ are copied byte for byte, still newline terminated, without re-rendering.
 The merge lands first in a staging file at ``path.compact``; only after it
 is fully on disk does cleanup begin.
 
-:func:`resume_metrics` resumes the same write-order walk at an integer
-read position counting records already read from the start; the position
-needs no translation across appends, rotations, compactions or crash
-cleanup.
+:func:`prune_metrics` enforces a retention quota by dropping whole records
+from the oldest end.  Evicted records keep their write-order ordinal: the
+segment set remembers how many records have been pruned in ``path.prune``,
+and no operation renumbers surviving records.  :func:`resume_metrics`
+resumes the same write-order walk at an integer read position; the
+position needs no translation across appends, rotations, compactions,
+pruning or crash cleanup.
+
+Every data-file descriptor is released before a rename on platforms that
+cannot rename open files (Windows), so sealing, compaction and pruning no
+longer raise ``PermissionError`` there.
 """
 
 from __future__ import annotations
 
+import json
 import os
 
 from . import parse_metrics, render_metrics
 
-try:  # POSIX-only; the lock guards O_APPEND and serialises rotation.
+try:  # POSIX-only; the lock guards O_APPEND and serialises every mutation.
     import fcntl
 except ImportError:  # pragma: no cover - exercised on non-POSIX platforms
     fcntl = None
@@ -46,19 +54,32 @@ __all__ = [
     "iter_metrics",
     "compact_metrics",
     "resume_metrics",
+    "prune_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
 # Suffix of the staging file compaction writes before cleanup begins; it
 # only ever names a whole, fully-fsynced segment that has been published.
 _COMPACT_SUFFIX = ".compact"
+# Prune state.  Finalised content is the decimal count of pruned records;
+# mid-cleanup content is a JSON plan (see _finish_staged_prune).
+_PRUNE_SUFFIX = ".prune"
+# Published content of the one segment prune truncates, used while the
+# JSON prune plan is still finishing cleanup.
+_TRIM_SUFFIX = ".trim"
+_PRUNE_TMP_SUFFIX = ".prune.tmp"
+_TRIM_TMP_SUFFIX = ".trim.tmp"
+# Label of the live log inside a prune plan; numbered segments use their
+# segment number.  Labels keep the plan independent of how ``path`` was
+# spelled when the plan was written.
+_LIVE_LABEL = -1
 
 
 def _segment_numbers(path):
     """Return the already-used segment numbers for ``path`` as a set.
 
-    The ``path.compact`` staging file is never a numbered segment and is
-    deliberately invisible here.
+    Every non-numeric sidecar (``path.compact``, ``path.prune``,
+    ``path.trim`` and their temporaries) is deliberately invisible here.
     """
     directory = os.path.dirname(path)
     prefix = os.path.basename(path) + "."
@@ -70,8 +91,6 @@ def _segment_numbers(path):
     for name in names:
         if name.startswith(prefix):
             suffix = name[len(prefix):]
-            if suffix == "compact":
-                continue
             if suffix.isascii() and suffix.isdigit():
                 numbers.add(int(suffix))
     return numbers
@@ -80,6 +99,22 @@ def _segment_numbers(path):
 def _staging_path(path):
     """The compaction staging file path (``path.compact``)."""
     return path + _COMPACT_SUFFIX
+
+
+def _write_bytes(fd, payload):
+    """Write all of ``payload`` to ``fd``, retrying short writes."""
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _unlink_if_exists(path):
+    """Remove ``path``; a missing file is already the desired state."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def _same_inode(fd, path):
@@ -109,8 +144,13 @@ def _open_locked(path, create):
     rotations never pick the same segment number.
 
     ``create`` determines whether a missing log is created (append) or
-    reported (rotation).  A lock failure closes the descriptor and leaves
-    nothing written.
+    reported (rotation, compaction, pruning).  A lock failure closes the
+    descriptor and leaves nothing written.
+
+    On platforms without :mod:`fcntl` (Windows) there is no process lock;
+    the descriptor is returned unlocked, and callers that rename the
+    live path release every handle first -- Windows cannot rename an open
+    file.
     """
     def _open():
         if create:
@@ -138,130 +178,243 @@ def _open_locked(path, create):
     return fd
 
 
-def rotate_metrics(path):
-    """Seal the current log into a numbered segment and start a new one.
+def _mutation_lock(path, create):
+    """Lock the segment set for a mutation, or just prove the log exists.
 
-    The segment is named ``path.N`` with ``N`` one greater than the
-    greatest number already present (``path.1`` for the first rotation),
-    so a segment that was deleted from the outside never hands its number
-    back out; an empty log seals an empty segment.  Afterwards ``path``
-    exists again as an empty file ready for appending.  Every record
-    acknowledged by a write ends up either wholly in a segment or wholly
-    in the current log, never split across two.
-
-    A crash after the rename but before the live file is recreated still
-    leaves the sealed segment readable; the next appender recreates the
-    live log.
-
-    Raises:
-        FileNotFoundError: ``path`` does not exist.
-        IsADirectoryError: ``path`` is a directory.
-        OSError: ``path`` is not a string, locking fails, or another OS
-            error occurs while sealing.  Nothing is written when locking
-            fails.
+    Returns the live-log lock fd on POSIX (caller closes it) or ``None``
+    on platforms without :mod:`fcntl`, where the existence check has
+    already closed its descriptor and no rename may happen with a handle
+    still open.
     """
-    if not isinstance(path, str):
-        raise OSError(f"log path must be a string, got {type(path).__name__}")
-    if os.path.isdir(path):
-        raise IsADirectoryError(f"log path is a directory: {path!r}")
-
-    fd = _open_locked(path, create=False)
-    try:
-        _finish_staged_compact(path)
-        used = _segment_numbers(path)
-        number = (max(used) + 1) if used else 1
-        segment = f"{path}.{number}"
-        # The rename atomically publishes the sealed inode under its
-        # segment name; the lock we hold makes concurrent appenders reopen
-        # the path before writing.
-        os.rename(path, segment)
-        # Re-create an empty current log.  An appender racing the rename
-        # window may have created the path and landed a record there first;
-        # opening without O_TRUNC keeps that record in the current log,
-        # where it belongs.
-        new_fd = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666
-        )
-        os.close(new_fd)
-    finally:
+    fd = _open_locked(path, create)
+    if fcntl is None:
         os.close(fd)
+        return None
+    return fd
 
 
-def append_metrics(path, line):
-    """Validate one metric line and append it to the log at ``path``.
+def _relock_after_settle(fd, path, create):
+    """Re-lock the live log when settling swapped its inode.
 
-    The line must be a string holding a JSON object whose values are ints
-    or floats (booleans are rejected).  It is rendered canonically before
-    writing, so every call adds exactly one compact newline-terminated
-    record regardless of the input's spacing.
-
-    If another process rotates the log while this call waits for the lock,
-    the descriptor is re-opened against the freshly re-created file before
-    writing, so no record is directed into a sealed segment.
-
-    Raises:
-        OSError: ``line`` or ``path`` is not a string, the target cannot
-            be written, or locking the log fails.  Nothing is written when
-            locking fails.
-        ValueError: the line is not valid JSON, its top level is not an
-            object, or a value is NaN or Infinity.
-        TypeError: a metric value is neither an int nor a float.
+    Finishing a crashed quota-zero prune replaces the live file, so the
+    lock acquired before settling dangles on the replaced inode and the
+    new live log would otherwise be unlocked for the rest of the
+    operation.  Re-open and re-lock the settled path (the same
+    follow-rotation loop :func:`_open_locked` uses), returning the new
+    fd; ``None`` (a lock-less platform) is returned unchanged.
     """
-    if not isinstance(line, str):
-        raise OSError(
-            f"metrics line must be a string, got {type(line).__name__}"
-        )
-    if not isinstance(path, str):
-        raise OSError(f"log path must be a string, got {type(path).__name__}")
-    metrics = parse_metrics(line)
-    payload = render_metrics(metrics).encode("utf-8")
+    if fd is None:
+        return None
+    if _same_inode(fd, path):
+        return fd
+    os.close(fd)
+    return _open_locked(path, create)
 
-    fd = _open_locked(path, create=True)
-    try:
-        _finish_staged_compact(path)
-        # One line per write loop on an O_APPEND descriptor: the kernel
-        # appends each write atomically, so concurrent processes do not
-        # tear or interleave records.
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-    finally:
-        os.close(fd)
+
+def _member_label(name, path):
+    """Map a member path to its prune-plan label (number or live marker)."""
+    return _LIVE_LABEL if name == path else int(name[len(path) + 1:])
 
 
 def _segment_members(path):
     """Return the segment-set member file paths in read/write order.
 
     Numbered segments come first in ascending order, followed by the
-    current log when it exists.  The ``path.compact`` staging file is
-    never part of this list: while present it replaces the whole list
-    via :func:`_resolve_members`.
+    current log (which is always assumed to exist when this is called
+    inside a writer that has just opened it).  Sidecars never appear
+    here; the ``path.compact`` staging file replaces the whole list in
+    :func:`_resolve_members` while present.
     """
     members = [
         f"{path}.{number}" for number in sorted(_segment_numbers(path))
     ]
-    if os.path.exists(path):
-        members.append(path)
+    members.append(path)
     return members
 
 
-def _resolve_members(path):
-    """Pick the member files to read, honouring a published staging file.
+def _label_member(label, path):
+    """Map a prune-plan label back to its member file path."""
+    return path if label == _LIVE_LABEL else f"{path}.{label}"
 
-    A compaction publishes ``path.compact`` with a single atomic rename
-    of a fully written and flushed file, so the name only ever holds a
-    complete whole segment.  While it exists -- during cleanup or after a
-    crash interrupted cleanup -- it alone is the segment set, and the
-    record sequence it yields equals the pre-compaction one item by item.
-    A crash earlier, while the merge is still being written, leaves the
-    half-written private temp file instead; that never carries this name
-    and so neither joins recovery nor affects reads.
+
+def _read_prune_state(path):
+    """Return ``(pruned_count, plan)`` from the prune marker.
+
+    A finalised marker holds the decimal pruned-record count; a pending
+    one holds the JSON plan dict written by :func:`prune_metrics`, in
+    which case the count it carries is returned alongside the plan.  With
+    no marker the result is ``(0, None)``.
     """
+    try:
+        fd = os.open(path + _PRUNE_SUFFIX, os.O_RDONLY)
+    except FileNotFoundError:
+        return 0, None
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    data = json.loads(raw.decode("utf-8"))
+    if isinstance(data, dict):
+        return int(data["pruned"]), data
+    return int(data), None
+
+
+def _replace_marker(path, text):
+    """Atomically publish ``text`` as the prune marker and fsync it."""
+    tmp = path + _PRUNE_TMP_SUFFIX
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        _write_bytes(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path + _PRUNE_SUFFIX)
+
+
+def _finish_staged_prune(path):
+    """Finish prune cleanup when a prune plan is present.
+
+    Called with the writer lock held, by :func:`prune_metrics` itself and
+    by any append, rotation or compaction that finds a plan a crashed
+    prune left behind.  The plan is the commit point: the trimmed boundary
+    segment has already landed whole at ``path.trim``, so finishing is
+    pure filesystem cleanup -- delete the evicted members, publish the
+    trimmed boundary atomically, then finalise the marker to the pruned
+    count.  Lock-free readers reconcile a half-finished plan themselves in
+    :func:`_resolve_members`, so a crash at any point exposes either the
+    old segment set or the fully pruned one, never a mixture.
+    """
+    marker = path + _PRUNE_SUFFIX
+    if not os.path.exists(marker):
+        # A trim left by a crash before the plan was published names no
+        # committed state and is discarded.
+        _unlink_if_exists(path + _TRIM_SUFFIX)
+        _unlink_if_exists(path + _TRIM_TMP_SUFFIX)
+        return
+    _pruned, plan = _read_prune_state(path)
+    if plan is None:
+        # Finalised marker: only an unpublished trim could linger.
+        _unlink_if_exists(path + _TRIM_SUFFIX)
+        _unlink_if_exists(path + _TRIM_TMP_SUFFIX)
+        return
+    for label in plan.get("evict", ()):
+        _unlink_if_exists(_label_member(label, path))
+    target = plan.get("trim")
+    trim = path + _TRIM_SUFFIX
+    if target is not None and os.path.exists(trim):
+        # The plan is only published once trim holds a complete whole
+        # segment.  Replace (not unlink-then-rename) swaps the boundary
+        # atomically and creates the live log in the quota-zero case.
+        # No data-file handle is held open here on Windows; on POSIX the
+        # caller's lock fd is allowed to dangle on the replaced inode.
+        os.replace(trim, _label_member(target, path))
+    _replace_marker(path, str(int(plan["pruned"])))
+
+
+def _marker_observation(path):
+    """One immutable description of the prune marker.
+
+    Returns the marker text as bytes (``b""`` when absent).  Two equal
+    observations bracket a window in which no prune committed, so the
+    directory listing taken between them belongs to that marker's world.
+    """
+    try:
+        fd = os.open(path + _PRUNE_SUFFIX, os.O_RDONLY)
+    except FileNotFoundError:
+        return b""
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    return raw
+
+
+def _resolve_members(path):
+    """Pick the member files and pruned count to read.
+
+    Returns ``(members, pruned)``.  Numbered segments come first in
+    ascending order, followed by the current log when it exists; the
+    pruned count is the number of records already gone from the oldest
+    end.
+
+    Resolution is lock-free but crash- and commit-consistent: the prune
+    marker is read before and after the directory is listed and the pair
+    must match, otherwise a commit straddled the listing and the read
+    resolves again.  Pruning commits in the order plan publication,
+    filesystem cleanup, marker finalisation, so an unchanged marker
+    brackets a directory state that marker reconciles to exactly one
+    settled record sequence:
+
+    * A compaction's fully landed ``path.compact`` staging file, while
+      present, alone is the segment set.
+    * A pending prune plan: evicted members still on disk are ignored,
+      and while the trimmed boundary waits at ``path.trim`` it stands in
+      for the boundary member; once the boundary is published its staging
+      name is gone and the finished member is read directly.
+    """
+    members = pruned = None
+    before = _marker_observation(path)
+    for _ in range(1000):
+        members, pruned, after = _resolve_once(path, before)
+        if after == before:
+            return members, pruned
+        before = after
+    # Extremely contended: return the last self-consistent pair rather
+    # than loop forever; the data it reads is itself whole.
+    return members, pruned
+
+
+def _resolve_once(path, marker_raw):
+    """Resolve one directory state, returning it with the post-listing marker."""
+    if marker_raw:
+        data = json.loads(marker_raw.decode("utf-8"))
+        pruned, plan = (
+            (int(data["pruned"]), data) if isinstance(data, dict)
+            else (int(data), None)
+        )
+    else:
+        pruned, plan = 0, None
+
     staging = _staging_path(path)
     if os.path.exists(staging):
-        return [staging]
-    return _segment_members(path)
+        members = [staging]
+    elif plan is None:
+        members = [
+            f"{path}.{number}" for number in sorted(_segment_numbers(path))
+        ]
+        if os.path.exists(path):
+            members.append(path)
+    else:
+        evict = set(plan.get("evict", ()))
+        target = plan.get("trim")
+        trim = path + _TRIM_SUFFIX
+        use_trim = target is not None and os.path.exists(trim)
+        labels = sorted(_segment_numbers(path))
+        # Include the live log when it exists, and also when a quota-zero
+        # cleanup is an instant away from replacing it from its published
+        # trim, so the committed (empty) set never momentarily vanishes.
+        if os.path.exists(path) or (use_trim and target == _LIVE_LABEL):
+            labels.append(_LIVE_LABEL)
+        members = []
+        for label in labels:
+            if label in evict:
+                continue
+            if use_trim and label == target:
+                members.append(trim)
+            else:
+                members.append(_label_member(label, path))
+
+    return members, pruned, _marker_observation(path)
 
 
 def _iter_lines(path, chunksize=_READ_CHUNK):
@@ -316,7 +469,8 @@ def iter_metrics(path):
     When a compaction has staged its merged segment at ``path.compact``
     but has not finished cleanup, that staging file alone is read; a
     staging file left behind by a crashed compaction is ignored until
-    another append, rotation or compaction finishes it.
+    another append, rotation or compaction finishes it.  A pending prune
+    is reconciled the same way: only surviving records are yielded.
 
     A torn unterminated tail at the end of any file is silently discarded;
     a segment holding only a torn tail yields nothing.  Blank empty lines
@@ -339,7 +493,7 @@ def iter_metrics(path):
     if os.path.isdir(path):
         raise IsADirectoryError(f"log path is a directory: {path!r}")
 
-    members = _resolve_members(path)
+    members, _pruned = _resolve_members(path)
     if not members:
         raise FileNotFoundError(f"no metrics log or segments at {path!r}")
 
@@ -373,7 +527,7 @@ def _iter_raw_records(path, chunksize=_READ_CHUNK):
     the torn unterminated tail is dropped, and every other complete line
     comes back verbatim with ``\\n`` reattached, so byte-level content
     such as ``-0.0``, huge counters and key ordering survives compaction
-    untouched.
+    and pruning untouched.
     """
     fd = os.open(path, os.O_RDONLY)
     pending = b""
@@ -408,19 +562,21 @@ def _truncate_live_log(path):
 def _finish_staged_compact(path):
     """Finish compaction cleanup when a staging file is present.
 
-    Called with the live-log lock held, both at the end of
-    :func:`compact_metrics` and by any append, rotation or compaction
-    that finds a staging file left by a crashed cleanup.  The staging
-    file only ever holds a whole fully landed segment, so finishing is
-    pure filesystem cleanup.
+    Called with the writer lock held, both at the end of
+    :func:`compact_metrics` and by any append, rotation, compaction or
+    prune that finds a staging file left by a crashed cleanup.  The
+    staging file only ever holds a whole fully landed segment, so
+    finishing is pure filesystem cleanup.
 
     The staging file stays the sole authoritative member (see
     :func:`_resolve_members`) until the final step: old numbered
     segments are removed and the current log is emptied while reads
     still resolve to staging, and only then is staging renamed onto
-    ``path.1``.  The rename is atomic, so a crash at any point leaves
-    either staging alone or the finished set, and the readable record
-    sequence equals the pre-compaction one item by item throughout.
+    ``path.1``.  Every involved descriptor is closed first, so no handle
+    is held across the rename, which therefore also succeeds on Windows.
+    The rename is atomic, so a crash at any point leaves either staging
+    alone or the finished set, and the readable record sequence equals
+    the pre-compaction one item by item.
     """
     staging = _staging_path(path)
     if not os.path.exists(staging):
@@ -429,6 +585,120 @@ def _finish_staged_compact(path):
         os.unlink(f"{path}.{number}")
     _truncate_live_log(path)
     os.replace(staging, f"{path}.1")
+
+
+def _finish_pending(path):
+    """Settle any half-finished compaction or prune before a new mutation."""
+    _finish_staged_compact(path)
+    _finish_staged_prune(path)
+
+
+def rotate_metrics(path):
+    """Seal the current log into a numbered segment and start a new one.
+
+    The segment is named ``path.N`` with ``N`` one greater than the
+    greatest number already present (``path.1`` for the first rotation),
+    so a segment that was deleted from the outside never hands its number
+    back out; an empty log seals an empty segment.  Afterwards ``path``
+    exists again as an empty file ready for appending.  Every record
+    acknowledged by a write ends up either wholly in a segment or wholly
+    in the current log, never split across two.
+
+    A crash after the rename but before the live file is recreated still
+    leaves the sealed segment readable; the next appender recreates the
+    live log.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, locking fails, or another OS
+            error occurs while sealing.  Nothing is written when locking
+            fails.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    fd = _mutation_lock(path, create=False)
+    try:
+        _finish_pending(path)
+        fd = _relock_after_settle(fd, path, create=False)
+        used = _segment_numbers(path)
+        number = (max(used) + 1) if used else 1
+        segment = f"{path}.{number}"
+        # POSIX: the rename happens while the lock fd is held (an open
+        # file may be renamed); the lock makes appenders reopen the path
+        # before writing.  Windows has no fd in hand at all, so the
+        # PermissionError an open live log used to cause cannot happen.
+        os.rename(path, segment)
+        # Re-create an empty current log without O_TRUNC: an appender that
+        # won the unlocked rename window on a lock-less platform may have
+        # landed a record there first, and it belongs in the current log.
+        new_fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666
+        )
+        os.close(new_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def append_metrics(path, line):
+    """Validate one metric line and append it to the log at ``path``.
+
+    The line must be a string holding a JSON object whose values are ints
+    or floats (booleans are rejected).  It is rendered canonically before
+    writing, so every call adds exactly one compact newline-terminated
+    record regardless of the input's spacing.
+
+    If another process rotates, compacts or prunes the log while this
+    call waits for the lock, the descriptor is re-opened against the
+    settled live file before writing, so no record is misdirected.
+
+    Raises:
+        OSError: ``line`` or ``path`` is not a string, the target cannot
+            be written, or locking the log fails.  Nothing is written when
+            locking fails.
+        ValueError: the line is not valid JSON, its top level is not an
+            object, or a value is NaN or Infinity.
+        TypeError: a metric value is neither an int nor a float.
+    """
+    if not isinstance(line, str):
+        raise OSError(
+            f"metrics line must be a string, got {type(line).__name__}"
+        )
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    metrics = parse_metrics(line)
+    payload = render_metrics(metrics).encode("utf-8")
+
+    fd = _mutation_lock(path, create=True)
+    try:
+        _finish_pending(path)
+        if fd is None:
+            # Lock-less platform (Windows): the existence-proving handle is
+            # already closed and settling ran first, so open a fresh
+            # O_APPEND descriptor for the write and close it again, leaving
+            # no handle open across a later rename.
+            out = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666
+            )
+            try:
+                _write_bytes(out, payload)
+            finally:
+                os.close(out)
+        else:
+            # Settling may have replaced the live inode (a crashed
+            # quota-zero prune); lock the settled file before writing.
+            fd = _relock_after_settle(fd, path, create=True)
+            # One line per write loop on the locked O_APPEND descriptor:
+            # the kernel appends each write atomically, so concurrent
+            # processes do not tear or interleave records.
+            _write_bytes(fd, payload)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def compact_metrics(path):
@@ -445,13 +715,15 @@ def compact_metrics(path):
 
     The merge is first written to a private temporary file and only
     renamed onto ``path.compact`` after the whole file has landed and
-    been flushed, so that name always holds a complete whole segment:
-    a half-written file left by a crash never joins recovery and never
-    affects reads.  Once staged, recovery and streaming read only that
-    segment; cleanup publishes it as ``path.1``, removes the other
-    numbered segments and empties the current log.  An interrupted
-    cleanup is finished transparently by the next append, rotation or
-    compaction.
+    been flushed (its descriptor already closed, so the rename also
+    works on Windows), so that name always holds a complete whole
+    segment: a half-written file left by a crash never joins recovery
+    and never affects reads.  Once staged, recovery and streaming read
+    only that segment; cleanup publishes it as ``path.1``, removes the
+    other numbered segments and empties the current log.  An interrupted
+    cleanup is finished transparently by the next append, rotation,
+    compaction or prune.  The pruned-record count stored by earlier
+    prunes is left untouched.
 
     Raises:
         FileNotFoundError: ``path`` does not exist.
@@ -465,11 +737,13 @@ def compact_metrics(path):
     if os.path.isdir(path):
         raise IsADirectoryError(f"log path is a directory: {path!r}")
 
-    fd = _open_locked(path, create=False)
+    fd = _mutation_lock(path, create=False)
     try:
         # A previous compaction may have staged its segment and died
-        # before cleanup; settle that world before merging again.
-        _finish_staged_compact(path)
+        # before cleanup; settle that world before merging again.  So may
+        # a previous prune.
+        _finish_pending(path)
+        fd = _relock_after_settle(fd, path, create=False)
 
         staging = _staging_path(path)
         tmp = staging + ".tmp"
@@ -480,12 +754,11 @@ def compact_metrics(path):
             try:
                 for member in _segment_members(path):
                     for raw in _iter_raw_records(member):
-                        view = memoryview(raw)
-                        while view:
-                            written = os.write(out, view)
-                            view = view[written:]
+                        _write_bytes(out, raw)
                 os.fsync(out)
             finally:
+                # Closed before the rename: on Windows an open file cannot
+                # be renamed.
                 os.close(out)
 
             # Atomic publication: from this instant the whole merged
@@ -495,29 +768,159 @@ def compact_metrics(path):
             # Nothing reached the staging name: the private temp is the
             # only file touched, so removing it leaves the old segments
             # and current log exactly as they were.
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
+            _unlink_if_exists(tmp)
             raise
         _finish_staged_compact(path)
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+
+
+def _stage_trim(path, source, skip):
+    """Publish the surviving tail of one truncated member at ``path.trim``.
+
+    The first ``skip`` complete records of ``source`` are dropped; every
+    later complete record is copied byte for byte with its original
+    newline.  Blank lines and the torn unterminated tail are discarded,
+    matching a read of the truncated segment.  The private temp is fully
+    written and flushed and its descriptor closed before the atomic
+    rename, so ``path.trim`` only ever holds a complete whole segment and
+    the rename works on Windows.
+    """
+    tmp = path + _TRIM_TMP_SUFFIX
+    out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        seen = 0
+        for raw in _iter_raw_records(source):
+            if seen < skip:
+                seen += 1
+                continue
+            _write_bytes(out, raw)
+        os.fsync(out)
+    finally:
+        os.close(out)
+    os.rename(tmp, path + _TRIM_SUFFIX)
+
+
+def prune_metrics(path, quota):
+    """Retain at most ``quota`` records, dropping the oldest whole records.
+
+    ``quota`` is the maximum number of records kept in the segment set;
+    when it already holds no more than ``quota`` records nothing is
+    removed, and ``quota`` 0 drops every record.  Records are dropped in
+    write order from the oldest end, one complete line at a time -- a
+    record is never split.  Empty segments and segments holding only a
+    torn tail spend no quota and are removed with the prefix ahead of
+    them.  Surviving records move byte for byte: order, original
+    newlines, ``-0.0``, oversized counters and key order are unchanged,
+    and an overlong single line still counts as exactly one record.
+
+    Evicted records keep their write-order ordinals: the set remembers
+    the total number pruned, so read positions never shift (see
+    :func:`resume_metrics`).  Whole evicted segments are deleted; only
+    the single segment the cut lands inside is rewritten, via a
+    ``path.trim`` staging file and a JSON plan in ``path.prune``, so a
+    crash leaves either the old set or a set pruned to a complete record
+    boundary -- a half-finished trim never joins recovery.  Pruning is
+    serialised with appends, rotations and compactions by the live-log
+    lock, and an unfinished compaction is settled first; every accepted
+    record is therefore either kept or dropped, never lost or duplicated.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        TypeError: ``quota`` is not an integer (booleans do not count).
+        ValueError: ``quota`` is negative.
+        OSError: ``path`` is not a string, or locking or writing the
+            truncated segment fails.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if isinstance(quota, bool) or not isinstance(quota, int):
+        raise TypeError(
+            f"retention quota must be an integer, got {type(quota).__name__}"
+        )
+    if quota < 0:
+        raise ValueError("retention quota must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    fd = _mutation_lock(path, create=False)
+    try:
+        _finish_pending(path)
+        fd = _relock_after_settle(fd, path, create=False)
+
+        members = _segment_members(path)
+        # One streaming count pass (the same cheap line walk reads use)
+        # locates the cut; only the single boundary member is rewritten.
+        counts = [sum(1 for _ in _iter_raw_records(member))
+                  for member in members]
+        total = sum(counts)
+        if total <= quota:
+            return
+        drop = total - quota
+
+        index = 0
+        cumulative = 0
+        while index < len(members) and drop >= cumulative + counts[index]:
+            cumulative += counts[index]
+            index += 1
+        if index < len(members):
+            boundary_index = index
+            skip = drop - cumulative
+        else:
+            # Every record lies inside the dropped prefix.  The live log
+            # is the last member and always exists, so it is the boundary
+            # and is rewritten empty; everything before it is deleted.
+            boundary_index = len(members) - 1
+            skip = counts[-1]
+        boundary = members[boundary_index]
+        evict = [
+            _member_label(name, path) for name in members[:boundary_index]
+        ]
+
+        pruned = _read_prune_state(path)[0] + drop
+        if skip:
+            _stage_trim(path, boundary, skip)
+            target = _member_label(boundary, path)
+        else:
+            # The cut lands exactly on a member boundary: that member is
+            # already the oldest survivor and needs no rewrite.
+            target = None
+        # Publishing the plan is the commit point; from here on readers
+        # reconcile to the committed set even if cleanup is interrupted.
+        plan = json.dumps(
+            {"pruned": pruned, "evict": evict, "trim": target},
+            separators=(",", ":"),
+        )
+        _replace_marker(path, plan)
+        _finish_staged_prune(path)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def resume_metrics(path, position=0):
     """Stream records starting at integer read position ``position``.
 
-    ``position`` counts records already read from the start of the
-    segment set in write order, exactly the records :func:`iter_metrics`
-    yields; omitting it (or passing 0) reads from the beginning.  The
-    position needs no conversion across appends, rotations, compactions
-    or crash-driven compaction cleanup -- it only ever counts records --
-    and stays valid as long as it does not exceed the current record
-    total, at which point the result is an empty stream.  Exactly like
-    :func:`iter_metrics`, reading is line by line and takes time linear
-    in the skipped-and-yielded prefix without materialising the segment
-    set; an overrun is reported once the end is reached.
+    ``position`` counts records from the start of write order, exactly
+    the ordinals :func:`iter_metrics` walks with pruning applied:
+    records pruned from the oldest end keep their ordinals and the set
+    remembers how many are gone.  Streaming therefore starts at the
+    first surviving record whose ordinal is not less than ``position``;
+    a position inside the pruned prefix or equal to the prune point
+    starts at the oldest surviving record.  The position needs no
+    conversion across appends, rotations, compactions, prunes or crash
+    cleanup.
+
+    It is out of range only when ``position`` exceeds the record total,
+    which includes pruned records; equal to the total the stream is
+    simply empty.  At every moment the stream equals the corresponding
+    ordinal slice of a fresh from-the-start recovery (the member set and
+    the pruned count are resolved together in one call).  Exactly like
+    :func:`iter_metrics`, reading is line by line and linear without
+    materialising the segment set; an overrun is reported once the end
+    is reached.
 
     Path-level problems are reported when this function is called; line
     content problems and an out-of-range position are reported lazily
@@ -533,7 +936,15 @@ def resume_metrics(path, position=0):
             not a metrics JSON object.
     """
     # Eager path validation first, matching iter_metrics/recover_metrics.
-    records = iter_metrics(path)
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    # One resolution call supplies both the walk and the slice boundary,
+    # resolved in commit order, so they describe the same settled state.
+    members, pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
     if isinstance(position, bool) or not isinstance(position, int):
         raise TypeError(
             f"read position must be an integer, got {type(position).__name__}"
@@ -542,16 +953,16 @@ def resume_metrics(path, position=0):
         raise ValueError("read position must not be negative")
 
     def _generate():
-        remaining = position
-        for record in records:
-            if remaining:
-                remaining -= 1
-                continue
-            yield record
-        if remaining:
+        seen = 0
+        for member in members:
+            for record in _parse_file(member, member):
+                if pruned + seen >= position:
+                    yield record
+                seen += 1
+        if position > pruned + seen:
             raise ValueError(
                 f"read position {position} exceeds the record total of "
-                f"{position - remaining}"
+                f"{pruned + seen}"
             )
 
     return _generate()

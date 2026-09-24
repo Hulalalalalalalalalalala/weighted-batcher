@@ -7,6 +7,7 @@
     python3 -m weighted_batcher stream FILE
     python3 -m weighted_batcher compact FILE
     python3 -m weighted_batcher resume FILE [POSITION]
+    python3 -m weighted_batcher prune FILE QUOTA
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from . import (
     compact_metrics,
     iter_metrics,
     parse_metrics,
+    prune_metrics,
     recover_metrics,
     render_metrics,
     resume_metrics,
@@ -33,7 +35,8 @@ _USAGE = (
     "  python3 -m weighted_batcher rotate FILE\n"
     "  python3 -m weighted_batcher stream FILE\n"
     "  python3 -m weighted_batcher compact FILE\n"
-    "  python3 -m weighted_batcher resume FILE [POSITION]"
+    "  python3 -m weighted_batcher resume FILE [POSITION]\n"
+    "  python3 -m weighted_batcher prune FILE QUOTA"
 )
 
 
@@ -145,6 +148,11 @@ def _compact(path):
     return 0
 
 
+def _prune(path, quota):
+    prune_metrics(path, quota)
+    return 0
+
+
 def _resume(path, position):
     # Like stream, starting at the record position; a position that does
     # not parse as an integer is a usage error handled in main().
@@ -205,6 +213,16 @@ def main(argv=None):
                 print(_USAGE, file=sys.stderr)
                 return 2
         return _dispatch(lambda path: _resume(path, position), args[1])
+    if args and args[0] == "prune":
+        if len(args) != 3:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            quota = int(args[2])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda path: _prune(path, quota), args[1])
     print(_USAGE, file=sys.stderr)
     return 2
 

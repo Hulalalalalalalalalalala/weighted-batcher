@@ -22,6 +22,7 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher stream FILE
     python3 -m weighted_batcher compact FILE
     python3 -m weighted_batcher resume FILE [POSITION]
+    python3 -m weighted_batcher prune FILE QUOTA
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -30,9 +31,14 @@ highest number already present), leaving an empty `FILE` behind, and exits 0.
 empty `FILE` behind; an empty log set still produces an empty `FILE.1`.
 `resume` prints records from `POSITION` (the number of records already read
 from the start in write order, default 0) onward; the position stays valid
-across appends, rotations and compactions. `rotate`, `stream`, `compact` and
-`resume` exit 1 on failure; wrong argument counts and a `POSITION` that is
-not an integer print usage on stderr and exit 2.
+across appends, rotations, compactions and pruning. `prune` retains at most
+`QUOTA` records, dropping the oldest whole records; `QUOTA` 0 drops every
+record. Pruned records keep their write-order positions, so a `POSITION`
+inside or at the prune point reads from the oldest surviving record, and
+only a position past the total record count (pruned included) is out of
+range. `rotate`, `stream`, `compact`, `resume` and `prune` exit 1 on
+failure; wrong argument counts and a `POSITION` or `QUOTA` that is not an
+integer print usage on stderr and exit 2.
 
 ## Public interface
 
@@ -90,12 +96,32 @@ not an integer print usage on stderr and exit 2.
 - `weighted_batcher.resume_metrics(path, position=0)` streams records from
   `position` onward, where `position` is the number of records already read
   from the start of the segment set in write order. The position needs no
-  conversion across appends, rotations, compactions or crash cleanup, and is
-  only out of range when it exceeds the record total. Reading stays line by
-  line and linear, never materialising the segment set. Raises `TypeError`
-  if `position` is not an integer (booleans do not count), `ValueError` for
-  a negative or out-of-range position (the latter while iterating), with the
-  same path and line-level errors as `iter_metrics`.
+  conversion across appends, rotations, compactions, prunes or crash
+  cleanup, and is only out of range when it exceeds the record total
+  (pruned records included); equal to the total the stream is empty.
+  Reading stays line by line and linear, never materialising the segment
+  set. Raises `TypeError` if `position` is not an integer (booleans do not
+  count), `ValueError` for a negative or out-of-range position (the latter
+  while iterating), with the same path and line-level errors as
+  `iter_metrics`.
+- `weighted_batcher.prune_metrics(path, quota)` keeps at most `quota`
+  records, dropping whole records from the oldest end in write order;
+  `quota` 0 drops every record, and a quota at or above the current count
+  removes nothing. A record is never split, empty and torn-tail-only
+  segments spend no quota, and survivors keep their bytes, order,
+  newlines, `-0.0`, oversized counters and key order. The set remembers
+  the number of records pruned (`path.prune`), so pruned records keep
+  their write-order ordinals for `resume_metrics`. Whole evicted segments
+  are deleted and only the single boundary segment is rewritten, staged
+  atomically at `path.trim`; a crash leaves either the old set or a set
+  pruned to a complete record boundary, and a half-finished trim never
+  joins recovery. Pruning is serialised with appends, rotations and
+  compactions, and an unfinished compaction is settled first. Raises
+  `TypeError` if `quota` is not an integer (booleans do not count),
+  `ValueError` for a negative quota, `FileNotFoundError` if the log is
+  missing, `IsADirectoryError` for a directory, and `OSError` for a
+  non-string path or a locking/write failure. Old segment sets with no
+  prune marker need no migration; the first prune starts at zero pruned.
 
 ## Tests
 
