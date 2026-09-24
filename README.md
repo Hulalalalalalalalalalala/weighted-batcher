@@ -14,17 +14,25 @@ Python 3.11 or newer. Standard library only.
 
     python3 -m weighted_batcher --selftest
 
-Append one metric line to a durable log, recover the log back as JSON, seal it into a numbered segment, or stream it back:
+Append one metric line to a durable log, recover the log back as JSON, seal it into a numbered segment, stream it back, compact every segment into one, or resume reading at a saved position:
 
     python3 -m weighted_batcher record FILE METRICS_JSON
     python3 -m weighted_batcher recover FILE
     python3 -m weighted_batcher rotate FILE
     python3 -m weighted_batcher stream FILE
+    python3 -m weighted_batcher compact FILE
+    python3 -m weighted_batcher resume FILE [POSITION]
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
-`rotate` seals `FILE` into a numbered segment (`FILE.1`, then `FILE.2`, ...),
-leaving an empty `FILE` behind, and exits 0. `rotate` and `stream` exit 1 on
-failure; an empty log rotates into an empty segment.
+`rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
+highest number already present), leaving an empty `FILE` behind, and exits 0.
+`compact` merges every segment and the current log into `FILE.1`, leaving an
+empty `FILE` behind; an empty log set still produces an empty `FILE.1`.
+`resume` prints records from `POSITION` (the number of records already read
+from the start in write order, default 0) onward; the position stays valid
+across appends, rotations and compactions. `rotate`, `stream`, `compact` and
+`resume` exit 1 on failure; wrong argument counts and a `POSITION` that is
+not an integer print usage on stderr and exit 2.
 
 ## Public interface
 
@@ -53,7 +61,8 @@ failure; an empty log rotates into an empty segment.
   `IsADirectoryError`. Large counters return as exact ints, `-0.0` is
   preserved, and key order follows the file.
 - `weighted_batcher.rotate_metrics(path) -> None` seals the current log into
-  the next numbered segment (`path.1`, `path.2`, ...) and leaves an empty
+  the next numbered segment (`path.1`, then one past the greatest number
+  already present, so a deleted number is never reused) and leaves an empty
   file at `path`; an empty log seals an empty segment. Concurrent appenders
   are serialised with a file lock, so every accepted record lands in exactly
   one segment or in the current log. A crash after sealing but before
@@ -64,6 +73,29 @@ failure; an empty log rotates into an empty segment.
   `recover_metrics`: it yields records line by line across segments and the
   current log without loading them into memory, with the same parsing and
   error semantics.
+- `weighted_batcher.compact_metrics(path) -> None` merges all segments and
+  the current log into the single fixed segment `path.1` and leaves the
+  current log empty; a completely empty set still yields an empty segment.
+  Complete records are copied byte for byte with their original newlines —
+  not re-rendered, de-duplicated or reordered, so `-0.0`, oversized counters
+  and key order are preserved; torn tails are dropped and blank lines
+  skipped just like on read. The merge is fully written and flushed to a
+  temporary file before being atomically published as `path.compact`, and
+  only then are old segments removed and the result renamed to `path.1`;
+  a half-written crash leftover never joins recovery, and while staging
+  exists recovery and streaming read only it. A later append, rotation or
+  compaction transparently finishes an interrupted cleanup. Raises
+  `FileNotFoundError` if the log is missing, `IsADirectoryError` for a
+  directory, and `OSError` for a non-string path or a locking/write failure.
+- `weighted_batcher.resume_metrics(path, position=0)` streams records from
+  `position` onward, where `position` is the number of records already read
+  from the start of the segment set in write order. The position needs no
+  conversion across appends, rotations, compactions or crash cleanup, and is
+  only out of range when it exceeds the record total. Reading stays line by
+  line and linear, never materialising the segment set. Raises `TypeError`
+  if `position` is not an integer (booleans do not count), `ValueError` for
+  a negative or out-of-range position (the latter while iterating), with the
+  same path and line-level errors as `iter_metrics`.
 
 ## Tests
 
