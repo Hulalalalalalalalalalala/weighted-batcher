@@ -14,6 +14,8 @@ __all__ = [
     "parse_metrics",
     "append_metrics",
     "recover_metrics",
+    "rotate_metrics",
+    "iter_metrics",
 ]
 
 
@@ -23,6 +25,11 @@ class Sampler:
     The effective weight of ``0`` and ``-0.0`` is zero: such items can never
     be drawn.  All draws from one instance share a single PRNG stream, so the
     sequence produced from a given ``seed`` is reproducible item by item.
+
+    Without replacement, draws accumulate across calls: an index drawn by
+    one :meth:`sample` call is never drawn again by a later call on the same
+    instance, and requesting more draws than the remaining positive-weight
+    items raises :class:`ValueError`.
     """
 
     def __init__(self, weights, replacement=True, seed=None):
@@ -49,6 +56,8 @@ class Sampler:
             total += e
             cumulative.append(total)
         self._cumulative = cumulative
+        # Without-replacement pool, depleted across repeated sample() calls.
+        self._remaining = [i for i, e in enumerate(self._effective) if e > 0.0]
 
     @property
     def weights(self):
@@ -67,10 +76,11 @@ class Sampler:
             if self._positive == 0:
                 raise ValueError("no items with positive weight to draw from")
             return self._sample_with_replacement(n)
-        if n > self._positive:
+        remaining = len(self._remaining)
+        if n > remaining:
             raise ValueError(
-                f"cannot draw {n} items without replacement from "
-                f"{self._positive} positive-weight items"
+                f"cannot draw {n} items without replacement: only "
+                f"{remaining} positive-weight items remain"
             )
         return self._sample_without_replacement(n)
 
@@ -85,16 +95,17 @@ class Sampler:
         return [self._draw_one(self._cumulative, total) for _ in range(n)]
 
     def _sample_without_replacement(self, n):
-        remaining = [i for i, e in enumerate(self._effective) if e > 0.0]
+        # The pool persists on the instance, so draws stay distinct across
+        # repeated sample() calls.
         drawn = []
         for _ in range(n):
             total = 0.0
             cumulative = []
-            for i in remaining:
+            for i in self._remaining:
                 total += self._effective[i]
                 cumulative.append(total)
             pos = self._draw_one(cumulative, total)
-            drawn.append(remaining.pop(pos))
+            drawn.append(self._remaining.pop(pos))
         return drawn
 
 
@@ -133,4 +144,9 @@ def parse_metrics(line):
     return data
 
 
-from .persistence import append_metrics, recover_metrics  # noqa: E402
+from .persistence import (  # noqa: E402
+    append_metrics,
+    iter_metrics,
+    recover_metrics,
+    rotate_metrics,
+)

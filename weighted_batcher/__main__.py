@@ -3,6 +3,8 @@
     python3 -m weighted_batcher --selftest
     python3 -m weighted_batcher record FILE METRICS_JSON
     python3 -m weighted_batcher recover FILE
+    python3 -m weighted_batcher rotate FILE
+    python3 -m weighted_batcher stream FILE
 """
 
 from __future__ import annotations
@@ -12,16 +14,20 @@ import sys
 from . import (
     Sampler,
     append_metrics,
+    iter_metrics,
     parse_metrics,
     recover_metrics,
     render_metrics,
+    rotate_metrics,
 )
 
 _USAGE = (
     "usage:\n"
     "  python3 -m weighted_batcher --selftest\n"
     "  python3 -m weighted_batcher record FILE METRICS_JSON\n"
-    "  python3 -m weighted_batcher recover FILE"
+    "  python3 -m weighted_batcher recover FILE\n"
+    "  python3 -m weighted_batcher rotate FILE\n"
+    "  python3 -m weighted_batcher stream FILE"
 )
 
 
@@ -36,15 +42,31 @@ def _selftest():
     c = Sampler([0.0, -0.0, 5.0], seed=7)
     assert c.sample(20) == [2] * 20
 
-    # Without replacement: indices are unique and bounded by positive weights.
-    d = Sampler([1.0, 1.0, 1.0], replacement=False, seed=1)
-    assert sorted(d.sample(3)) == [0, 1, 2]
+    # Without replacement: draws accumulate on one instance, so indices
+    # drawn by earlier calls never reappear, and asking for more than the
+    # remaining pool raises.
+    d = Sampler([1.0, 1.0, 1.0, 1.0], replacement=False, seed=1)
+    first = d.sample(2)
     try:
-        d.sample(4)
+        d.sample(3)
     except ValueError:
         pass
     else:
         raise AssertionError("expected ValueError when over-drawing")
+    second = d.sample(2)
+    assert sorted(first + second) == [0, 1, 2, 3]
+    try:
+        d.sample(1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError when pool is exhausted")
+
+    # The same seed reproduces the same draws however the requested
+    # counts are split across calls.
+    f = Sampler([1.0, 2.0, 3.0, 4.0], replacement=False, seed=11)
+    g = Sampler([1.0, 2.0, 3.0, 4.0], replacement=False, seed=11)
+    assert f.sample(4) == g.sample(1) + g.sample(2) + g.sample(1)
 
     # No positive weights: any draw fails, zero draws return empty.
     e = Sampler([0.0, -0.0], seed=0)
@@ -99,6 +121,27 @@ def _recover(path):
     return 0
 
 
+def _rotate(path):
+    rotate_metrics(path)
+    return 0
+
+
+def _stream(path):
+    # Stream records straight to stdout, one JSON object per line.
+    for metrics in iter_metrics(path):
+        sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
+def _dispatch(handler, path):
+    # rotate/stream failures are reported cleanly and end with status 1.
+    try:
+        return handler(path)
+    except (OSError, ValueError) as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["--selftest"]:
@@ -115,6 +158,16 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _recover(args[1])
+    if args and args[0] == "rotate":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(_rotate, args[1])
+    if args and args[0] == "stream":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(_stream, args[1])
     print(_USAGE, file=sys.stderr)
     return 2
 
