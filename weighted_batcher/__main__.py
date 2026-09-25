@@ -26,7 +26,6 @@ import sys
 
 from . import (
     Sampler,
-    append_metrics,
     checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
@@ -45,6 +44,8 @@ from . import (
     snapshot_diff_metrics,
     snapshot_metrics,
 )
+
+from .persistence import _append_payload
 
 _USAGE = (
     "usage:\n"
@@ -146,15 +147,38 @@ def _selftest():
         raise AssertionError("expected ValueError for Infinity literal")
 
 
+def _record_line(metrics):
+    """Serialise one record as a compact JSON line for CLI output.
+
+    Unlike :func:`render_metrics` this imposes no numeric-value
+    restriction, so records carrying non-numeric values (string tags and
+    the like) print exactly as stored; key order, oversized counters and
+    ``-0.0`` survive the round trip unchanged.
+    """
+    return json.dumps(metrics, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
 def _record(path, line):
-    append_metrics(path, line)
+    # Append one metrics JSON object line.  The subcommand accepts any
+    # JSON object parse_metrics accepts -- values are not required to be
+    # numeric -- and stores the canonical compact rendering, so a record
+    # carrying string values appends exactly like a purely numeric one.
+    # Re-parsing the canonical form rejects non-finite floats (a 1e999
+    # style overflow) that json would otherwise emit as the invalid
+    # NaN/Infinity literals, so the log never gains an unreadable line.
+    metrics = parse_metrics(line)
+    payload = _record_line(metrics)
+    parse_metrics(payload)
+    _append_payload(path, payload.encode("utf-8"))
     return 0
 
 
 def _recover(path):
     # One canonical JSON line per recovered record, exit 0 afterwards.
+    # Records print through _record_line rather than render_metrics so
+    # records carrying non-numeric values print exactly as stored.
     for metrics in recover_metrics(path):
-        sys.stdout.write(render_metrics(metrics))
+        sys.stdout.write(_record_line(metrics))
     return 0
 
 
@@ -235,9 +259,10 @@ def _checkpoint(path, handle, cursor_path, position):
 
 def _cursor_resume(path, cursor_path):
     # Stream the pinned snapshot onward from the stored cursor position,
-    # one canonical JSON object per record.
+    # one canonical JSON object per record; like _recover, records print
+    # through _record_line so non-numeric values are not rejected.
     for metrics in resume_checkpoint_metrics(path, cursor_path):
-        sys.stdout.write(render_metrics(metrics))
+        sys.stdout.write(_record_line(metrics))
     return 0
 
 
@@ -315,12 +340,12 @@ def main(argv=None):
         if len(args) != 3:
             print(_USAGE, file=sys.stderr)
             return 2
-        return _record(args[1], args[2])
+        return _dispatch(lambda path: _record(path, args[2]), args[1])
     if args and args[0] == "recover":
         if len(args) != 2:
             print(_USAGE, file=sys.stderr)
             return 2
-        return _recover(args[1])
+        return _dispatch(_recover, args[1])
     if args and args[0] == "rotate":
         if len(args) != 2:
             print(_USAGE, file=sys.stderr)

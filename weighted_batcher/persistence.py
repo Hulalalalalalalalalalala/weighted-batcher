@@ -819,6 +819,44 @@ def rotate_metrics(path):
             os.close(fd)
 
 
+def _append_payload(path, payload):
+    """Append one already-rendered record payload to the log at ``path``.
+
+    This is the shared append core of :func:`append_metrics`: ``payload``
+    must already be a single newline-terminated record.  The write takes
+    the live-log lock, settles any half-finished compaction, prune or
+    snapshot left by a crash, and follows a rotation that swapped the
+    live inode while the lock was waited on, exactly as a validated
+    append does.
+    """
+    fd = _mutation_lock(path, create=True)
+    try:
+        _finish_pending(path)
+        if fd is None:
+            # Lock-less platform (Windows): the existence-proving handle is
+            # already closed and settling ran first, so open a fresh
+            # O_APPEND descriptor for the write and close it again, leaving
+            # no handle open across a later rename.
+            out = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666
+            )
+            try:
+                _write_bytes(out, payload)
+            finally:
+                os.close(out)
+        else:
+            # Settling may have replaced the live inode (a crashed
+            # quota-zero prune); lock the settled file before writing.
+            fd = _relock_after_settle(fd, path, create=True)
+            # One line per write loop on the locked O_APPEND descriptor:
+            # the kernel appends each write atomically, so concurrent
+            # processes do not tear or interleave records.
+            _write_bytes(fd, payload)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def append_metrics(path, line):
     """Validate one metric line and append it to the log at ``path``.
 
@@ -847,33 +885,7 @@ def append_metrics(path, line):
         raise OSError(f"log path must be a string, got {type(path).__name__}")
     metrics = parse_metrics(line)
     payload = render_metrics(metrics).encode("utf-8")
-
-    fd = _mutation_lock(path, create=True)
-    try:
-        _finish_pending(path)
-        if fd is None:
-            # Lock-less platform (Windows): the existence-proving handle is
-            # already closed and settling ran first, so open a fresh
-            # O_APPEND descriptor for the write and close it again, leaving
-            # no handle open across a later rename.
-            out = os.open(
-                path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666
-            )
-            try:
-                _write_bytes(out, payload)
-            finally:
-                os.close(out)
-        else:
-            # Settling may have replaced the live inode (a crashed
-            # quota-zero prune); lock the settled file before writing.
-            fd = _relock_after_settle(fd, path, create=True)
-            # One line per write loop on the locked O_APPEND descriptor:
-            # the kernel appends each write atomically, so concurrent
-            # processes do not tear or interleave records.
-            _write_bytes(fd, payload)
-    finally:
-        if fd is not None:
-            os.close(fd)
+    _append_payload(path, payload)
 
 
 def compact_metrics(path):
