@@ -105,6 +105,22 @@ atomically and serialised by a lock anchored on
 advances and takeovers neither clobber one another nor block or
 deadlock same-process readers and writers.
 
+:func:`start_batch_metrics` opens a persistent weighted batch on the log:
+the sampling plan (weights, total draws and an optional seed) is bound in
+the caller-named batch file ``path.batch.<batch>``, published atomically,
+and re-opening an existing batch with an identical plan simply reuses it.
+:func:`draw_batch_metrics` draws the next indices without replacement --
+an index is never drawn twice by one batch -- and appends one
+``{"ordinal": ..., "index": ...}`` record per draw to the log, ordinals
+consecutive from zero.  The draw sequence is reproducible from the seed,
+so a crash between appending a record and publishing the batch state is
+settled on the next draw by replaying the sequence and acknowledging the
+records already in the log: the persisted sequence equals an
+uninterrupted run item for item.  Draws of one batch are serialised by a
+lock anchored on ``path.batch.<batch>.lock`` -- never on the log -- and
+different batches, appends, rotations, compactions and prunes proceed
+independently.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -113,11 +129,13 @@ longer raise ``PermissionError`` there.
 from __future__ import annotations
 
 import json
+import math
+import numbers
 import os
 import tempfile
 import time
 
-from . import parse_metrics, render_metrics
+from . import Sampler, parse_metrics, render_metrics
 
 try:  # POSIX-only; the lock guards O_APPEND and serialises every mutation.
     import fcntl
@@ -145,6 +163,8 @@ __all__ = [
     "group_resume_metrics",
     "advance_group_metrics",
     "takeover_group_metrics",
+    "start_batch_metrics",
+    "draw_batch_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -197,6 +217,19 @@ _GROUP_COMMIT_TMP_SUFFIX = ".groupcursor.tmp"
 _GROUP_STATE_SUFFIX = ".group."
 _GROUP_STATE_LOCK_SUFFIX = ".lock"
 _GROUP_STATE_TMP_SUFFIX = ".tmp"
+# Batch-sampling state.  ``path.batch.<batch>`` is the caller-named batch
+# file: one atomically published JSON object binding the batch name, the
+# sampling plan (weights, total draws and the seed as given), the resolved
+# seed driving the reproducible draw sequence and the number of draws
+# already committed to the log.  ``path.batch.<batch>.lock`` anchors the
+# inter-process lock that serialises starts and draws of one batch; it is
+# never renamed or replaced, so a held lock stays valid.
+# ``path.batch.<batch>.tmp`` is the staging name of the next state
+# publication.  All three are non-numeric sidecars, invisible to
+# ``_segment_numbers``.
+_BATCH_STATE_SUFFIX = ".batch."
+_BATCH_STATE_LOCK_SUFFIX = ".lock"
+_BATCH_STATE_TMP_SUFFIX = ".tmp"
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -2916,6 +2949,427 @@ def takeover_group_metrics(path, group, member, lease_seconds=None):
         # Publishing the new state is the commit point of the takeover.
         _write_group_state(group_path, state)
         return _group_lease(state)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _batch_state_path(path, batch):
+    """The batch-state file path for batch ``batch``."""
+    return path + _BATCH_STATE_SUFFIX + batch
+
+
+def _batch_state_lock(batch_path):
+    """Take the exclusive batch-state lock and return its descriptor.
+
+    The lock is anchored on ``batch_path + ".lock"``, a dedicated file
+    that is never renamed or replaced, so the held lock stays valid for
+    the whole read-modify-write.  It is never the log and never the batch
+    file itself, so a same-process append, rotation, compaction, prune,
+    snapshot, cursor checkpoint or group operation interleaved with a
+    batch mutation neither deadlocks nor reports a spurious locking
+    failure.  Returns ``None`` on platforms without :mod:`fcntl`.
+    """
+    if fcntl is None:
+        return None
+    fd = os.open(
+        batch_path + _BATCH_STATE_LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o666
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _positive_weights(weights):
+    """The number of weights whose effective value is positive."""
+    return sum(1 for w in weights if w > 0)
+
+
+def _load_batch_state(batch_path):
+    """Read and structurally validate a batch-state file.
+
+    The state is one JSON object binding the batch name, the plan
+    (``weights``, ``total`` and ``seed`` as given), the ``resolved_seed``
+    driving the reproducible draw sequence and the ``drawn`` count of
+    records already committed to the log.  A missing file propagates
+    :class:`FileNotFoundError`; anything present but not exactly such a
+    document is a corrupt batch file and raises :class:`ValueError`.
+    """
+    fd = os.open(batch_path, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"corrupt batch file {batch_path!r}: {exc}"
+        ) from exc
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"corrupt batch file {batch_path!r}: state must be a JSON object"
+        )
+    keys = (
+        "version", "batch", "weights", "total",
+        "seed", "resolved_seed", "drawn",
+    )
+    if set(state) != set(keys):
+        raise ValueError(
+            f"corrupt batch file {batch_path!r}: unexpected batch fields"
+        )
+    if state["version"] != 1 or not isinstance(state["batch"], str):
+        raise ValueError(f"corrupt batch file {batch_path!r}: bad batch state")
+    weights = state["weights"]
+    if not isinstance(weights, list):
+        raise ValueError(
+            f"corrupt batch file {batch_path!r}: weights must be a list"
+        )
+    for w in weights:
+        if isinstance(w, bool) or not isinstance(w, (int, float)):
+            raise ValueError(
+                f"corrupt batch file {batch_path!r}: weight must be a number"
+            )
+        if math.isnan(w) or math.isinf(w):
+            raise ValueError(
+                f"corrupt batch file {batch_path!r}: weight must be finite"
+            )
+        if w < 0:
+            raise ValueError(
+                f"corrupt batch file {batch_path!r}: negative weight"
+            )
+    for key in ("total", "resolved_seed", "drawn"):
+        # Booleans are not acceptable batch numbers.
+        if isinstance(state[key], bool) or not isinstance(state[key], int):
+            raise ValueError(
+                f"corrupt batch file {batch_path!r}: {key} must be an integer"
+            )
+    if state["seed"] is not None and (
+        isinstance(state["seed"], bool) or not isinstance(state["seed"], int)
+    ):
+        raise ValueError(
+            f"corrupt batch file {batch_path!r}: seed must be an integer"
+        )
+    if state["total"] < 0 or state["drawn"] < 0:
+        raise ValueError(
+            f"corrupt batch file {batch_path!r}: negative batch value"
+        )
+    positive = _positive_weights(weights)
+    if state["total"] > positive or state["drawn"] > positive:
+        raise ValueError(
+            f"corrupt batch file {batch_path!r}: draw count past the "
+            f"positive-weight items"
+        )
+    return state
+
+
+def _write_batch_state(batch_path, state):
+    """Atomically publish ``state`` as the batch file and fsync it.
+
+    The replacement is staged at ``batch_path + ".tmp"``, fsynced and
+    atomically renamed over the batch file, so the file is never observed
+    half written and a crash leaves either the previous state or this
+    one, never a mixture.  Serialisation against other batch mutations is
+    the caller's concern (the batch-state lock).
+    """
+    payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
+    tmp = batch_path + _BATCH_STATE_TMP_SUFFIX
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            _write_bytes(out, payload)
+            os.fsync(out)
+        finally:
+            # Closed before the rename: on Windows an open file cannot
+            # be renamed.
+            os.close(out)
+        os.replace(tmp, batch_path)
+    except BaseException:
+        _unlink_if_exists(tmp)
+        raise
+
+
+def _check_batch_name(batch):
+    """Reject a non-string batch name."""
+    if not isinstance(batch, str):
+        raise TypeError(
+            f"batch name must be a string, got {type(batch).__name__}"
+        )
+
+
+def _check_batch_plan(plan):
+    """Validate a sampling plan, returning ``(weights, total, seed)``.
+
+    The weights come back as floats (``0`` and ``-0.0`` both stay
+    non-positive, so such items can never be drawn), ``total`` as an
+    integer and ``seed`` as an integer or ``None``.  A plan whose total
+    exceeds the positive-weight items can never be drawn without
+    replacement and is rejected up front.
+    """
+    if not isinstance(plan, dict):
+        raise TypeError(
+            f"sampling plan must be a mapping, got {type(plan).__name__}"
+        )
+    weights = plan.get("weights")
+    total = plan.get("total")
+    seed = plan.get("seed")
+    if not isinstance(weights, (list, tuple)):
+        raise TypeError(
+            f"plan weights must be a list, got {type(weights).__name__}"
+        )
+    checked = []
+    for w in weights:
+        if isinstance(w, bool) or not isinstance(w, numbers.Real):
+            raise TypeError(
+                f"weight must be a real number, got {type(w).__name__}"
+            )
+        if math.isnan(w) or math.isinf(w):
+            raise ValueError("weight must not be NaN or Infinity")
+        if w < 0:
+            raise ValueError("weight must not be negative")
+        checked.append(float(w))
+    if isinstance(total, bool) or not isinstance(total, int):
+        raise TypeError(
+            f"total draws must be an integer, got {type(total).__name__}"
+        )
+    if total < 0:
+        raise ValueError("total draws must not be negative")
+    if seed is not None and (
+        isinstance(seed, bool) or not isinstance(seed, int)
+    ):
+        raise TypeError(f"seed must be an integer, got {type(seed).__name__}")
+    positive = _positive_weights(checked)
+    if total > positive:
+        raise ValueError(
+            f"cannot draw {total} items without replacement: only "
+            f"{positive} positive-weight items"
+        )
+    return checked, total, seed
+
+
+def _batch_view(state):
+    """The public view of a batch state: the plan and the draws so far."""
+    return {
+        "batch": state["batch"],
+        "weights": list(state["weights"]),
+        "total": state["total"],
+        "seed": state["seed"],
+        "drawn": state["drawn"],
+    }
+
+
+def start_batch_metrics(path, batch, plan):
+    """Open a persistent weighted batch on the log at ``path``.
+
+    ``plan`` is a mapping with the sampling ``weights``, the ``total``
+    number of draws the batch plans and an optional ``seed``; a missing
+    or ``None`` seed is resolved to a fresh random one at creation and
+    remembered, so even a seedless batch resumes reproducibly.  The plan
+    is bound in the caller-named batch file ``path.batch.<batch>``,
+    published atomically (staged, fsynced and renamed into place), so a
+    crash leaves either no batch file or the published one.  Re-opening
+    an existing batch whose stored plan equals ``plan`` simply reuses it
+    and keeps its progress; a different plan for the same batch name
+    raises :class:`ValueError`.
+
+    Starts are serialised with draws of the same batch by a lock anchored
+    on ``path.batch.<batch>.lock`` -- never on the log -- so concurrent
+    starts neither clobber one another nor lose a creation, and a
+    same-process reader or writer interleaved with a start neither
+    deadlocks nor reports a spurious locking failure.  The log itself is
+    not touched here; a missing log is created empty by the first draw.
+
+    Returns the batch view: a plain mapping with the batch name, the
+    plan's weights, total and seed, and the number of draws committed so
+    far.
+
+    Raises:
+        TypeError: ``batch`` is not a string, a weight is not a real
+            number, or ``total`` or ``seed`` is not an integer (booleans
+            do not count).
+        ValueError: a weight is negative (negative zero is not), NaN or
+            Infinity, ``total`` is negative or exceeds the
+            positive-weight items, the stored plan differs from
+            ``plan``, or the batch file is corrupt.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking or writing the
+            batch file fails.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _check_batch_name(batch)
+    weights, total, seed = _check_batch_plan(plan)
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    batch_path = _batch_state_path(path, batch)
+    lock_fd = _batch_state_lock(batch_path)
+    try:
+        try:
+            state = _load_batch_state(batch_path)
+        except FileNotFoundError:
+            state = None
+        if state is None:
+            # Publishing the new state is the commit point of the start.
+            state = {
+                "version": 1,
+                "batch": batch,
+                "weights": weights,
+                "total": total,
+                "seed": seed,
+                "resolved_seed": (
+                    seed
+                    if seed is not None
+                    else int.from_bytes(os.urandom(8), "big")
+                ),
+                "drawn": 0,
+            }
+            _write_batch_state(batch_path, state)
+        elif (
+            state["weights"] != weights
+            or state["total"] != total
+            or state["seed"] != seed
+        ):
+            raise ValueError(
+                f"sampling plan does not match the stored plan of batch "
+                f"{batch!r}"
+            )
+        return _batch_view(state)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _settled_batch_sampler(path, batch_path, state):
+    """Rebuild the batch's sampler at its log-reconciled position.
+
+    A crash between appending a draw record and publishing the batch
+    state leaves the log ahead of the stored drawn count.  Because the
+    draw sequence is reproducible from the resolved seed, the orphaned
+    records are exactly the next expected ones: replay the stored draws,
+    then keep replaying while the log already holds the expected
+    ``{"ordinal": ..., "index": ...}`` record, and publish the settled
+    count.  Returns the sampler positioned past every committed draw, so
+    the persisted sequence equals an uninterrupted run item for item.
+    """
+    weights = state["weights"]
+    seed = state["resolved_seed"]
+    drawn = state["drawn"]
+    # Probe with a throwaway sampler: draws accumulate on one PRNG stream
+    # however the requested counts were split across calls, so one replay
+    # call reproduces them all, and a peek past the committed records is
+    # simply discarded with the probe.
+    probe = Sampler(weights, replacement=False, seed=seed)
+    probe.sample(drawn)
+    pairs = set()
+    try:
+        for record in iter_metrics(path):
+            if set(record) != {"ordinal", "index"}:
+                continue
+            ordinal = record["ordinal"]
+            index = record["index"]
+            if (
+                isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or isinstance(index, bool)
+                or not isinstance(index, int)
+            ):
+                continue
+            pairs.add((ordinal, index))
+    except FileNotFoundError:
+        # No log yet: no record of this batch exists anywhere.
+        pairs = set()
+    positive = _positive_weights(weights)
+    settled = drawn
+    while settled < positive:
+        index = probe.sample(1)[0]
+        if (settled, index) not in pairs:
+            break
+        settled += 1
+    if settled != drawn:
+        state["drawn"] = settled
+        _write_batch_state(batch_path, state)
+    sampler = Sampler(weights, replacement=False, seed=seed)
+    sampler.sample(settled)
+    return sampler
+
+
+def draw_batch_metrics(path, batch, count):
+    """Draw ``count`` more indices of batch ``batch`` and record them.
+
+    The draw runs without replacement: an index drawn by an earlier call
+    is never drawn again, and every draw appends one
+    ``{"ordinal": ..., "index": ...}`` record to the log at ``path``
+    (keys in that order, rendered the canonical compact way), with
+    ordinals consecutive from zero.  A missing log is created empty
+    first.  The whole sequence of one batch is reproducible from the
+    plan's seed, so a crash mid-draw is settled on the next call by
+    acknowledging the records already in the log (see
+    :func:`_settled_batch_sampler`) and the persisted sequence equals an
+    uninterrupted run item for item.
+
+    Draws of one batch are serialised by the batch-state lock, so
+    concurrent drawers neither draw the same index twice nor lose a
+    committed draw; different batches and the append, rotation,
+    compaction and pruning of the log proceed independently.  A failed
+    draw (an over-large ``count`` or an I/O error) appends no record of
+    its own and leaves no half-published state behind.
+
+    Returns the list of indices this call drew.
+
+    Raises:
+        FileNotFoundError: the batch file does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        TypeError: ``batch`` is not a string, or ``count`` is not an
+            integer (booleans do not count).
+        ValueError: ``count`` is negative or exceeds the remaining
+            positive-weight items (an all-zero plan has none), or the
+            batch file is corrupt.  Nothing is recorded then.
+        OSError: ``path`` is not a string, or locking or writing the log
+            or the batch file fails.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _check_batch_name(batch)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError(
+            f"draw count must be an integer, got {type(count).__name__}"
+        )
+    if count < 0:
+        raise ValueError("draw count must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    batch_path = _batch_state_path(path, batch)
+    lock_fd = _batch_state_lock(batch_path)
+    try:
+        state = _load_batch_state(batch_path)
+        if count == 0:
+            return []
+        sampler = _settled_batch_sampler(path, batch_path, state)
+        drawn = state["drawn"]
+        remaining = _positive_weights(state["weights"]) - drawn
+        if count > remaining:
+            raise ValueError(
+                f"cannot draw {count} items without replacement: only "
+                f"{remaining} positive-weight items remain"
+            )
+        indices = sampler.sample(count)
+        for offset, index in enumerate(indices):
+            record = {"ordinal": drawn + offset, "index": index}
+            _append_payload(path, render_metrics(record).encode("utf-8"))
+        state["drawn"] = drawn + count
+        # Publishing the new count is the commit point of the draw.
+        _write_batch_state(batch_path, state)
+        return indices
     finally:
         if lock_fd is not None:
             os.close(lock_fd)

@@ -32,6 +32,8 @@ __all__ = [
     "group_resume_metrics",
     "advance_group_metrics",
     "takeover_group_metrics",
+    "start_batch_metrics",
+    "draw_batch_metrics",
 ]
 
 
@@ -166,6 +168,7 @@ from .persistence import (  # noqa: E402
     checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
+    draw_batch_metrics,
     group_resume_metrics,
     iter_metrics,
     join_group_metrics,
@@ -180,5 +183,6 @@ from .persistence import (  # noqa: E402
     rotate_metrics,
     snapshot_diff_metrics,
     snapshot_metrics,
+    start_batch_metrics,
     takeover_group_metrics,
 )
