@@ -21,6 +21,8 @@
     python3 -m weighted_batcher group-read FILE GROUP
     python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION
     python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]
+    python3 -m weighted_batcher audit FILE
+    python3 -m weighted_batcher verify FILE
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from . import (
     Sampler,
     append_metrics,
     advance_group_metrics,
+    audit_metrics,
     checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
@@ -52,6 +55,7 @@ from . import (
     snapshot_diff_metrics,
     snapshot_metrics,
     takeover_group_metrics,
+    verify_metrics,
 )
 
 _USAGE = (
@@ -76,7 +80,9 @@ _USAGE = (
     "  python3 -m weighted_batcher group-join FILE GROUP MEMBER LEASE_SECONDS\n"
     "  python3 -m weighted_batcher group-read FILE GROUP\n"
     "  python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION\n"
-    "  python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]"
+    "  python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]\n"
+    "  python3 -m weighted_batcher audit FILE\n"
+    "  python3 -m weighted_batcher verify FILE"
 )
 
 
@@ -311,6 +317,22 @@ def _group_takeover(path, group, member, lease_seconds):
     # token; an omitted lease-seconds reuses the group's own seconds.
     lease = takeover_group_metrics(path, group, member, lease_seconds)
     sys.stdout.write(lease["token"] + "\n")
+    return 0
+
+
+def _audit(path):
+    # Build or refresh the audit chain and print the registered record
+    # total and chain-tail checksum as one JSON object, keys in the
+    # same count/checksum order the chain state file uses.
+    result = audit_metrics(path)
+    sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+    return 0
+
+
+def _verify(path):
+    # Compare the segment set against the audit chain; a mismatch
+    # raises ValueError, reported as a failure with status 1.
+    verify_metrics(path)
     return 0
 
 
@@ -575,6 +597,16 @@ def main(argv=None):
             ),
             args[1],
         )
+    if args and args[0] == "audit":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(_audit, args[1])
+    if args and args[0] == "verify":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(_verify, args[1])
     print(_USAGE, file=sys.stderr)
     return 2
 

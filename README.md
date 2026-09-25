@@ -30,6 +30,8 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher group-read FILE GROUP
     python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION
     python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]
+    python3 -m weighted_batcher audit FILE
+    python3 -m weighted_batcher verify FILE
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -59,6 +61,17 @@ integer print usage on stderr and exit 2. The four group subcommands
 exit 0 on success and 1 on failure; wrong argument counts and a
 `POSITION` or `LEASE_SECONDS` that is not an integer print usage on
 stderr and exit 2.
+`audit` builds or refreshes the integrity chain `FILE.audit` — one JSON
+line registering every surviving record's byte fingerprint and write
+ordinal together with the pruned-count basis, the registered record
+total and the chain-tail checksum, all exact decimal integers — prints
+`{"count":N,"checksum":M}` and exits 0. `verify` compares the segment
+set record by record against the chain and exits 0 when everything
+matches; a record modified by a single byte or mixed in fails with
+`ValueError` naming its file and line number, records truncated
+wholesale or a replaced segment fails naming the mismatched write
+ordinal, and any failure exits 1. Both print usage and exit 2 on a
+wrong argument count.
 
 ## Public interface
 
@@ -237,6 +250,34 @@ stderr and exit 2.
   `FileNotFoundError` if the group file is missing,
   `IsADirectoryError` for a directory, and `OSError` for a non-string
   path or a locking/write failure.
+- `weighted_batcher.audit_metrics(path) -> dict` builds or incrementally
+  refreshes the integrity audit chain of the segment set, kept as one
+  JSON line in the state file `path.audit`: every surviving record's
+  byte fingerprint and write ordinal (pruned records keep their
+  ordinals), the pruned-count basis, the registered record total and
+  the chain-tail checksum, all exact decimal integers with keys in
+  insertion order. Returns `{"count": ..., "checksum": ...}` with the
+  registered record total (pruned records included) and the chain-tail
+  checksum. Chain building shares the live-log lock with appends and
+  the other mutations and settles any half-finished compaction or prune
+  first; the state file is staged, fsynced and atomically renamed, so a
+  crash never leaves half a state file behind — the chain may lag, and
+  the next write or chain build catches it up. Appends, rotations,
+  compactions, prunes and snapshots keep the chain consistent as part
+  of their own locked section; old segment sets need no migration.
+  Raises `FileNotFoundError` if the log is missing, `IsADirectoryError`
+  for a directory, `OSError` for a non-string path or a locking/write
+  failure, and `ValueError` if the existing state file is corrupt.
+- `weighted_batcher.verify_metrics(path) -> None` compares the segment
+  set record by record against the audit chain and returns normally
+  when everything matches; an empty set or one holding only a torn tail
+  matches an accordingly empty chain. A record modified by a single
+  byte or mixed in raises `ValueError` naming its file and line number;
+  records truncated wholesale or a replaced segment raises `ValueError`
+  naming the mismatched write ordinal. Reading is lock free. Raises
+  `FileNotFoundError` if the log or the audit chain is missing,
+  `IsADirectoryError` for a directory, `OSError` for a non-string path,
+  and `ValueError` for a corrupt state file or a mismatch.
 
 ## Tests
 

@@ -32,6 +32,8 @@ __all__ = [
     "group_resume_metrics",
     "advance_group_metrics",
     "takeover_group_metrics",
+    "audit_metrics",
+    "verify_metrics",
     "sample_batch_metrics",
     "resume_batch_metrics",
 ]
@@ -165,6 +167,7 @@ def parse_metrics(line):
 from .persistence import (  # noqa: E402
     append_metrics,
     advance_group_metrics,
+    audit_metrics,
     checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
@@ -183,6 +186,7 @@ from .persistence import (  # noqa: E402
     snapshot_diff_metrics,
     snapshot_metrics,
     takeover_group_metrics,
+    verify_metrics,
 )
 from .batching import (  # noqa: E402
     resume_batch_metrics,

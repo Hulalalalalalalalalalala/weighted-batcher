@@ -105,6 +105,29 @@ atomically and serialised by a lock anchored on
 advances and takeovers neither clobber one another nor block or
 deadlock same-process readers and writers.
 
+:func:`audit_metrics` builds -- or incrementally refreshes -- the
+integrity audit chain of the segment set, kept as one JSON line in the
+state file ``path.audit``: every surviving record's byte fingerprint
+and write ordinal (pruned records keep their ordinals, exactly as in
+:func:`resume_metrics`), the pruned-count basis, the registered record
+total and the chain-tail checksum, all written as exact decimal
+integers with keys in insertion order.  Chain building shares the
+live-log lock with appends and the other mutations, settles any
+half-finished compaction or prune first, and the state file is staged,
+fsynced and atomically renamed, so a crash never leaves half a state
+file behind -- the chain may simply lag, and the next write or chain
+build catches it up before proceeding.  Appends, rotations,
+compactions, prunes and snapshots each catch the chain up as part of
+their own locked section, so it stays consistent across them; old
+segment sets need no migration, they simply have no chain yet.
+:func:`verify_metrics` compares the segment set record by record
+against the chain without holding the lock: an empty set or one
+holding only a torn tail matches an accordingly empty chain, a record
+modified by a single byte or an injected record raises
+:class:`ValueError` naming its file and line number, and records
+truncated wholesale or a replaced segment raises :class:`ValueError`
+naming the write ordinal that no longer matches.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -112,6 +135,7 @@ longer raise ``PermissionError`` there.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -145,6 +169,8 @@ __all__ = [
     "group_resume_metrics",
     "advance_group_metrics",
     "takeover_group_metrics",
+    "audit_metrics",
+    "verify_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -197,6 +223,17 @@ _GROUP_COMMIT_TMP_SUFFIX = ".groupcursor.tmp"
 _GROUP_STATE_SUFFIX = ".group."
 _GROUP_STATE_LOCK_SUFFIX = ".lock"
 _GROUP_STATE_TMP_SUFFIX = ".tmp"
+# Audit-chain state.  ``path.audit`` is the integrity chain of the
+# segment set: one JSON line binding the pruned-count basis, the
+# registered record total, the chain-tail checksum and every surviving
+# record's (write ordinal, byte fingerprint) entry, all exact decimal
+# integers with keys in insertion order.  ``path.audit.tmp`` is the
+# staging name of the next chain publication; a crash leaves at most
+# that staging file behind, never a half-written chain, and a later
+# write removes it transparently.  Both are non-numeric sidecars,
+# invisible to ``_segment_numbers``.
+_AUDIT_SUFFIX = ".audit"
+_AUDIT_TMP_SUFFIX = ".audit.tmp"
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -800,6 +837,9 @@ def _finish_pending(path):
     _finish_staged_compact(path)
     _finish_staged_prune(path)
     _finish_snapshot_orphans(path)
+    # A chain publication that crashed mid-way leaves only its staging
+    # file; the next mutation removes it transparently.
+    _unlink_if_exists(path + _AUDIT_TMP_SUFFIX)
 
 
 def rotate_metrics(path):
@@ -848,6 +888,7 @@ def rotate_metrics(path):
             path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666
         )
         os.close(new_fd)
+        _sync_audit_for_write(path)
     finally:
         if fd is not None:
             os.close(fd)
@@ -886,6 +927,7 @@ def _append_payload(path, payload):
             # the kernel appends each write atomically, so concurrent
             # processes do not tear or interleave records.
             _write_bytes(fd, payload)
+        _sync_audit_for_write(path)
     finally:
         if fd is not None:
             os.close(fd)
@@ -992,6 +1034,7 @@ def compact_metrics(path):
             _unlink_if_exists(tmp)
             raise
         _finish_staged_compact(path)
+        _sync_audit_for_write(path)
     finally:
         if fd is not None:
             os.close(fd)
@@ -1078,6 +1121,8 @@ def prune_metrics(path, quota):
                   for member in members]
         total = sum(counts)
         if total <= quota:
+            # Nothing is removed; still catch a lagging chain up.
+            _sync_audit_for_write(path)
             return
         drop = total - quota
 
@@ -1116,6 +1161,7 @@ def prune_metrics(path, quota):
         )
         _replace_marker(path, plan)
         _finish_staged_prune(path)
+        _sync_audit_for_write(path)
     finally:
         if fd is not None:
             os.close(fd)
@@ -1268,6 +1314,7 @@ def snapshot_metrics(path):
         # is already whole on disk.
         registry[handle] = {"pruned": pruned, "total": pruned + count}
         _write_snapshot_registry(path, registry)
+        _sync_audit_for_write(path)
         return handle
     finally:
         if fd is not None:
@@ -2919,3 +2966,408 @@ def takeover_group_metrics(path, group, member, lease_seconds=None):
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
+
+
+# Audit-chain arithmetic.  The chain-tail checksum folds each record's
+# write ordinal and byte fingerprint into a 256-bit rolling value with
+# exact integer arithmetic -- no ordinal, fingerprint or checksum ever
+# passes through a float, however large it grows.
+_AUDIT_MOD = 1 << 256
+_AUDIT_MUL = 0x100000001B3
+_AUDIT_ORD = 0x9E3779B97F4A7C15
+_AUDIT_SEED = 0x6A09E667F3BCC909
+
+
+def _record_fingerprint(raw):
+    """The 256-bit byte fingerprint of one complete record line.
+
+    ``raw`` is the line's content bytes without the terminating newline,
+    exactly as :func:`_iter_lines` yields them, so two records that
+    differ in a single byte fingerprint differently.
+    """
+    digest = hashlib.blake2b(raw, digest_size=32).digest()
+    return int.from_bytes(digest, "big")
+
+
+def _audit_fold(checksum, ordinal, fingerprint):
+    """Fold one record's write ordinal and fingerprint into the chain."""
+    return (
+        checksum * _AUDIT_MUL + ordinal * _AUDIT_ORD + fingerprint
+    ) % _AUDIT_MOD
+
+
+def _load_audit_state(path):
+    """Read and structurally validate the audit chain, returning its state.
+
+    The chain is one JSON line binding ``version``, ``count`` (the
+    registered record total, pruned records included), ``checksum`` (the
+    chain-tail checksum), ``pruned`` (the pruned-count basis the entries
+    start at) and ``records`` (one ``[ordinal, fingerprint]`` entry per
+    surviving record, ordinals consecutive from the basis).  A missing
+    file propagates :class:`FileNotFoundError`; anything present but not
+    exactly such a document -- including entries that do not fold to the
+    stored checksum -- is a corrupt chain and raises :class:`ValueError`.
+    """
+    state_path = path + _AUDIT_SUFFIX
+    fd = os.open(state_path, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"corrupt audit state {state_path!r}: {exc}"
+        ) from exc
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"corrupt audit state {state_path!r}: state must be a JSON object"
+        )
+    keys = ("version", "count", "checksum", "pruned", "records")
+    if set(state) != set(keys):
+        raise ValueError(
+            f"corrupt audit state {state_path!r}: unexpected chain fields"
+        )
+    if state["version"] != 1:
+        raise ValueError(f"corrupt audit state {state_path!r}: bad version")
+    for key in ("count", "checksum", "pruned"):
+        # Booleans are not acceptable chain numbers.
+        if isinstance(state[key], bool) or not isinstance(state[key], int):
+            raise ValueError(
+                f"corrupt audit state {state_path!r}: {key} must be an integer"
+            )
+        if state[key] < 0:
+            raise ValueError(
+                f"corrupt audit state {state_path!r}: negative chain value"
+            )
+    if state["checksum"] >= _AUDIT_MOD:
+        raise ValueError(
+            f"corrupt audit state {state_path!r}: checksum out of range"
+        )
+    records = state["records"]
+    if not isinstance(records, list):
+        raise ValueError(
+            f"corrupt audit state {state_path!r}: records must be a list"
+        )
+    entries = []
+    checksum = _AUDIT_SEED
+    ordinal = state["pruned"]
+    for entry in records:
+        if not (isinstance(entry, list) and len(entry) == 2):
+            raise ValueError(
+                f"corrupt audit state {state_path!r}: bad chain entry"
+            )
+        entry_ordinal, fingerprint = entry
+        if (
+            isinstance(entry_ordinal, bool)
+            or not isinstance(entry_ordinal, int)
+            or isinstance(fingerprint, bool)
+            or not isinstance(fingerprint, int)
+            or not 0 <= fingerprint < _AUDIT_MOD
+        ):
+            raise ValueError(
+                f"corrupt audit state {state_path!r}: bad chain entry"
+            )
+        if entry_ordinal != ordinal:
+            raise ValueError(
+                f"corrupt audit state {state_path!r}: chain ordinals are "
+                f"not consecutive from the pruned basis"
+            )
+        checksum = _audit_fold(checksum, entry_ordinal, fingerprint)
+        entries.append([entry_ordinal, fingerprint])
+        ordinal += 1
+    if state["count"] != ordinal or state["checksum"] != checksum:
+        raise ValueError(
+            f"corrupt audit state {state_path!r}: chain-tail checksum "
+            f"does not match the entries"
+        )
+    return {
+        "version": 1,
+        "count": state["count"],
+        "checksum": state["checksum"],
+        "pruned": state["pruned"],
+        "records": entries,
+    }
+
+
+def _write_audit_state(path, state):
+    """Atomically publish ``state`` as the audit chain and fsync it.
+
+    The replacement is staged at ``path.audit.tmp``, fsynced and
+    atomically renamed over the chain, so a crash never leaves half a
+    state file behind -- the previous chain or this one, never a
+    mixture.  Serialisation against other chain writes is the caller's
+    concern (the live-log lock).
+    """
+    payload = json.dumps(state, separators=(",", ":")) + "\n"
+    tmp = path + _AUDIT_TMP_SUFFIX
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            _write_bytes(out, payload.encode("utf-8"))
+            os.fsync(out)
+        finally:
+            # Closed before the rename: on Windows an open file cannot
+            # be renamed.
+            os.close(out)
+        os.replace(tmp, path + _AUDIT_SUFFIX)
+    except BaseException:
+        _unlink_if_exists(tmp)
+        raise
+
+
+def _iter_chain_records(members, pruned):
+    """Yield ``(ordinal, fingerprint)`` for every surviving record.
+
+    The walk matches a recovery read exactly: complete non-blank lines
+    only, the torn unterminated tail dropped, ordinals counting from the
+    pruned basis so pruned records keep their numbers.
+    """
+    ordinal = pruned
+    for member in members:
+        for _lineno, raw in _iter_lines(member):
+            if raw and raw != b"\r":
+                yield ordinal, _record_fingerprint(raw)
+                ordinal += 1
+
+
+def _sync_audit(path, strict):
+    """Bring the audit chain up to date with the segment set.
+
+    Called with the write lock held and any half-finished mutation
+    already settled.  When the stored chain still sits on the current
+    pruned basis and no record is missing, only the records past the
+    registered total are folded in (an incremental refresh); otherwise
+    -- no chain yet, a prune since the last build, or an externally
+    shortened set -- the chain is rebuilt over the surviving records.
+    With ``strict`` a corrupt stored chain raises :class:`ValueError`;
+    otherwise it is rebuilt from scratch.  Returns the published state.
+    """
+    members = _segment_members(path)
+    pruned = _read_prune_state(path)[0]
+    try:
+        state = _load_audit_state(path)
+    except FileNotFoundError:
+        state = None
+    except ValueError:
+        if strict:
+            raise
+        state = None
+    found = list(_iter_chain_records(members, pruned))
+    total = pruned + len(found)
+    keep = 0
+    if (
+        state is not None
+        and state["pruned"] == pruned
+        and state["count"] <= total
+    ):
+        keep = state["count"] - pruned
+        # The registered prefix must still sit in the set unchanged;
+        # a record mixed in or altered under the chain, or a segment
+        # replaced ahead of the tail, diverges here and the chain is
+        # rebuilt over what the set actually holds.
+        for (ordinal, fingerprint), entry in zip(
+            found[:keep], state["records"]
+        ):
+            if entry != [ordinal, fingerprint]:
+                keep = 0
+                break
+    if keep:
+        entries = state["records"]
+        checksum = state["checksum"]
+        new = found[keep:]
+    else:
+        entries = []
+        checksum = _AUDIT_SEED
+        new = found
+    for ordinal, fingerprint in new:
+        checksum = _audit_fold(checksum, ordinal, fingerprint)
+        entries.append([ordinal, fingerprint])
+    new_state = {
+        "version": 1,
+        "count": total,
+        "checksum": checksum,
+        "pruned": pruned,
+        "records": entries,
+    }
+    _write_audit_state(path, new_state)
+    return new_state
+
+
+def _sync_audit_for_write(path):
+    """Catch the audit chain up after a mutation; never raises.
+
+    Runs inside the caller's locked section, so chain writes share the
+    live-log lock with appends and the other mutations.  A segment set
+    that was never audited has no chain to maintain and is left alone
+    (old sets need no migration); a crashed chain publication is
+    rebuilt.  Any failure leaves the chain lagging -- the next write or
+    chain build catches it up -- rather than leaking a new error into
+    an existing entry point.
+    """
+    try:
+        if os.path.exists(path + _AUDIT_SUFFIX) or os.path.exists(
+            path + _AUDIT_TMP_SUFFIX
+        ):
+            _sync_audit(path, strict=False)
+    except Exception:
+        pass
+
+
+def audit_metrics(path):
+    """Build or incrementally refresh the audit chain of the segment set.
+
+    The chain lives in the state file ``path.audit``, one JSON line
+    registering every surviving record's byte fingerprint and write
+    ordinal (pruned records keep their ordinals, exactly as in
+    :func:`resume_metrics`), the pruned-count basis, the registered
+    record total and the chain-tail checksum, all exact decimal
+    integers with keys in insertion order.  A first call builds the
+    chain from scratch -- old segment sets need no migration -- and a
+    later call folds in only the records written since, or rebuilds
+    when a prune moved the basis.  Returns ``{"count": ..., "checksum":
+    ...}`` with the registered record total (pruned records included)
+    and the chain-tail checksum.
+
+    Chain building takes the same live-log lock as appends and the
+    other mutations and settles any half-finished compaction, prune or
+    snapshot left by a crash before reading, so the chain is built from
+    a settled segment set.  The state file is staged, fsynced and
+    atomically renamed into place, so a crash never leaves half a state
+    file behind; the chain may simply lag, and the next write or chain
+    build catches it up before proceeding.
+
+    Raises:
+        FileNotFoundError: ``path`` does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking or writing the
+            state file fails.
+        ValueError: the existing state file is corrupt.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    fd = _mutation_lock(path, create=False)
+    try:
+        _finish_pending(path)
+        fd = _relock_after_settle(fd, path, create=False)
+        state = _sync_audit(path, strict=True)
+        return {"count": state["count"], "checksum": state["checksum"]}
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def verify_metrics(path):
+    """Compare the segment set record by record against the audit chain.
+
+    Every surviving record's byte fingerprint and write ordinal is
+    checked against the chain entry registered for it in ``path.audit``
+    (built or refreshed by :func:`audit_metrics`).  An empty segment
+    set, or one holding only a torn unterminated tail, matches a chain
+    whose registered records are likewise absent.  When everything
+    matches the call returns normally; otherwise:
+
+    * a record modified by as little as one byte, or a record mixed in
+      that the chain never registered, raises :class:`ValueError`
+      naming the file and the 1-based line number;
+    * records truncated wholesale or a replaced segment raises
+      :class:`ValueError` naming the write ordinal that no longer
+      matches.
+
+    Reading is lock free and line by line (the same crash-consistent
+    member resolution :func:`iter_metrics` uses), so a verification
+    neither blocks nor disturbs a concurrent append, rotation,
+    compaction or prune and never reports a spurious locking failure.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists, or
+            the audit chain does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        ValueError: the state file is corrupt, or a record does not
+            match the chain.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    members, pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    state = _load_audit_state(path)
+    count = state["count"]
+    entries = state["records"]
+    if state["pruned"] != pruned:
+        # The chain sits on another pruned basis than the segment set:
+        # records vanished (or the chain lagged a prune) before any
+        # write caught it up.
+        raise ValueError(
+            f"audit mismatch: no record matches write ordinal "
+            f"{min(state['pruned'], pruned)} in the audit chain"
+        )
+
+    index = 0
+    mismatch_count = 0
+    first_mismatch = None
+    first_extra = None
+    for member in members:
+        for lineno, raw in _iter_lines(member):
+            if not raw or raw == b"\r":
+                continue
+            ordinal = pruned + index
+            if ordinal >= count:
+                # A record the chain never registered.
+                if first_extra is None:
+                    first_extra = (member, lineno, ordinal)
+            elif _record_fingerprint(raw) != entries[index][1]:
+                mismatch_count += 1
+                if first_mismatch is None:
+                    first_mismatch = (member, lineno, ordinal)
+            index += 1
+    total = pruned + index
+
+    if total < count:
+        # Records are missing wholesale -- truncated from the tail or
+        # lost with a replaced segment.
+        ordinal = first_mismatch[2] if first_mismatch is not None else total
+        raise ValueError(
+            f"audit mismatch: no record matches write ordinal {ordinal} "
+            f"in the audit chain"
+        )
+    if total > count:
+        # Records were mixed in; the first diverging line is the
+        # intruder (or, when only the tail grew, the first unregistered
+        # record).
+        if first_mismatch is not None:
+            member, lineno, _ordinal = first_mismatch
+            detail = "record bytes do not match the audit chain"
+        else:
+            member, lineno, _ordinal = first_extra
+            detail = "record is not registered in the audit chain"
+        raise ValueError(
+            f"audit mismatch in {member} at line {lineno}: {detail}"
+        )
+    if mismatch_count == 1:
+        # Exactly one record differs: a tampered record, named by where
+        # it sits.
+        member, lineno, _ordinal = first_mismatch
+        raise ValueError(
+            f"audit mismatch in {member} at line {lineno}: "
+            f"record bytes do not match the audit chain"
+        )
+    if mismatch_count > 1:
+        # A whole run of records diverges: a segment was replaced.
+        raise ValueError(
+            f"audit mismatch: no record matches write ordinal "
+            f"{first_mismatch[2]} in the audit chain"
+        )
