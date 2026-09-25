@@ -105,6 +105,14 @@ atomically and serialised by a lock anchored on
 advances and takeovers neither clobber one another nor block or
 deadlock same-process readers and writers.
 
+The audit layer (see :mod:`weighted_batcher.audit`) keeps a
+tamper-evident chain of every record's byte fingerprint and write-order
+ordinal beside the segment set.  Appends, rotations, compactions, prunes
+and snapshot creations catch the chain up under the same write lock
+before continuing, so it stays consistent with the record set across
+every mutation; a crash may leave it momentarily behind, never half
+written.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -802,6 +810,17 @@ def _finish_pending(path):
     _finish_snapshot_orphans(path)
 
 
+def _sync_audit(path):
+    """Catch the audit chain up with the settled segment set, if one exists.
+
+    Called with the write lock held, after :func:`_finish_pending`.  The
+    import is lazy: the audit layer builds on this module's helpers, so
+    a module-level import would be circular.
+    """
+    from .audit import _sync_audit_locked
+    _sync_audit_locked(path)
+
+
 def rotate_metrics(path):
     """Seal the current log into a numbered segment and start a new one.
 
@@ -833,6 +852,7 @@ def rotate_metrics(path):
     try:
         _finish_pending(path)
         fd = _relock_after_settle(fd, path, create=False)
+        _sync_audit(path)
         used = _segment_numbers(path)
         number = (max(used) + 1) if used else 1
         segment = f"{path}.{number}"
@@ -886,6 +906,10 @@ def _append_payload(path, payload):
             # the kernel appends each write atomically, so concurrent
             # processes do not tear or interleave records.
             _write_bytes(fd, payload)
+        # Register the landed record in the audit chain before
+        # releasing the lock; a crash between the write and this point
+        # leaves the chain merely behind, caught up by the next write.
+        _sync_audit(path)
     finally:
         if fd is not None:
             os.close(fd)
@@ -965,6 +989,7 @@ def compact_metrics(path):
         # a previous prune.
         _finish_pending(path)
         fd = _relock_after_settle(fd, path, create=False)
+        _sync_audit(path)
 
         staging = _staging_path(path)
         tmp = staging + ".tmp"
@@ -1070,6 +1095,7 @@ def prune_metrics(path, quota):
     try:
         _finish_pending(path)
         fd = _relock_after_settle(fd, path, create=False)
+        _sync_audit(path)
 
         members = _segment_members(path)
         # One streaming count pass (the same cheap line walk reads use)
@@ -1116,6 +1142,10 @@ def prune_metrics(path, quota):
         )
         _replace_marker(path, plan)
         _finish_staged_prune(path)
+        # Fold the evicted records' fingerprints into the chain base, so
+        # they keep their write-order ordinals without staying in the
+        # chain's entry list.
+        _sync_audit(path)
     finally:
         if fd is not None:
             os.close(fd)
@@ -1236,6 +1266,7 @@ def snapshot_metrics(path):
     try:
         _finish_pending(path)
         fd = _relock_after_settle(fd, path, create=False)
+        _sync_audit(path)
 
         registry = _read_snapshot_registry(path)
         while True:

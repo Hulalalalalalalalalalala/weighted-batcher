@@ -13,6 +13,7 @@ __all__ = [
     "render_metrics",
     "parse_metrics",
     "append_metrics",
+    "audit_metrics",
     "recover_metrics",
     "rotate_metrics",
     "iter_metrics",
@@ -34,6 +35,7 @@ __all__ = [
     "takeover_group_metrics",
     "sample_batch_metrics",
     "resume_batch_metrics",
+    "verify_metrics",
 ]
 
 
@@ -187,4 +189,8 @@ from .persistence import (  # noqa: E402
 from .batching import (  # noqa: E402
     resume_batch_metrics,
     sample_batch_metrics,
+)
+from .audit import (  # noqa: E402
+    audit_metrics,
+    verify_metrics,
 )
