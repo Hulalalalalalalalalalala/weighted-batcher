@@ -105,6 +105,18 @@ atomically and serialised by a lock anchored on
 advances and takeovers neither clobber one another nor block or
 deadlock same-process readers and writers.
 
+:func:`sampling_batch_metrics` opens a persistent without-replacement
+weighted sampling batch whose progress lives in the caller-named batch
+file and is republished atomically after every draw, so a process
+restart with the same file continues exactly where the uninterrupted
+draw sequence stopped -- already drawn indices never repeat and not-yet
+drawn indices are never skipped.  The state is rebuilt into a
+:class:`~weighted_batcher.Sampler` at its committed position, so the
+sequence after recovery matches one uninterrupted run item for item.
+Two processes advancing the same batch file are serialised by a lock
+anchored on that file's own lock sidecar -- never on the log -- while
+distinct batch files never touch each other's state.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -113,11 +125,13 @@ longer raise ``PermissionError`` there.
 from __future__ import annotations
 
 import json
+import math
+import numbers
 import os
 import tempfile
 import time
 
-from . import parse_metrics, render_metrics
+from . import Sampler, parse_metrics, render_metrics
 
 try:  # POSIX-only; the lock guards O_APPEND and serialises every mutation.
     import fcntl
@@ -145,6 +159,7 @@ __all__ = [
     "group_resume_metrics",
     "advance_group_metrics",
     "takeover_group_metrics",
+    "sampling_batch_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -197,6 +212,17 @@ _GROUP_COMMIT_TMP_SUFFIX = ".groupcursor.tmp"
 _GROUP_STATE_SUFFIX = ".group."
 _GROUP_STATE_LOCK_SUFFIX = ".lock"
 _GROUP_STATE_TMP_SUFFIX = ".tmp"
+# Sampling-batch state.  The caller names the final batch file; each
+# advance stages its replacement at a unique
+# ``batch_path.batch.tmp.<random>`` name, fsyncs it and atomically
+# renames it over the batch file, so the batch file is never observed
+# half written and two processes advancing the same file (serialised by
+# a lock anchored on ``batch_path.lock``) never clobber one another's
+# staging.  Both are non-segment sidecars: a batch file is only ever
+# read through its own caller-named path, never through segment
+# recovery.
+_BATCH_LOCK_SUFFIX = ".lock"
+_BATCH_TMP_SUFFIX = ".batch.tmp."
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -2916,6 +2942,338 @@ def takeover_group_metrics(path, group, member, lease_seconds=None):
         # Publishing the new state is the commit point of the takeover.
         _write_group_state(group_path, state)
         return _group_lease(state)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _batch_lock(batch_file):
+    """Take the exclusive sampling-batch lock and return its descriptor.
+
+    The lock is anchored on ``batch_file + ".lock"``, a dedicated file
+    that is never renamed or replaced, so the held lock stays valid for
+    the whole read-modify-write.  It is never the log and never the
+    batch file itself, so draws of distinct batch files and an append,
+    rotation, compaction, prune, snapshot, cursor checkpoint or group
+    operation interleaved with a batch advance neither deadlock nor
+    report a spurious locking failure.  Returns ``None`` on platforms
+    without :mod:`fcntl`.
+    """
+    if fcntl is None:
+        return None
+    fd = os.open(batch_file + _BATCH_LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_batch_file(batch_file):
+    """Read and structurally validate a sampling-batch state file.
+
+    A missing file propagates :class:`FileNotFoundError`; anything
+    present but not exactly the published state document is a corrupt
+    batch file and raises :class:`ValueError`.
+    """
+    fd = os.open(batch_file, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"corrupt batch file {batch_file!r}: {exc}") from exc
+    if not isinstance(state, dict) or set(state) != {
+        "version", "weights", "seed", "position",
+    }:
+        raise ValueError(
+            f"corrupt batch file {batch_file!r}: unexpected batch fields"
+        )
+    if state["version"] != 1 or not isinstance(state["weights"], list):
+        raise ValueError(f"corrupt batch file {batch_file!r}: bad batch state")
+    if isinstance(state["seed"], bool) or not isinstance(state["seed"], int):
+        raise ValueError(
+            f"corrupt batch file {batch_file!r}: seed must be an integer"
+        )
+    if isinstance(state["position"], bool) or not isinstance(
+        state["position"], int
+    ):
+        raise ValueError(
+            f"corrupt batch file {batch_file!r}: position must be an integer"
+        )
+    if state["position"] < 0:
+        raise ValueError(
+            f"corrupt batch file {batch_file!r}: negative batch position"
+        )
+    for weight in state["weights"]:
+        if isinstance(weight, bool) or not isinstance(weight, numbers.Real):
+            raise ValueError(
+                f"corrupt batch file {batch_file!r}: weight must be a number"
+            )
+        if math.isnan(weight) or math.isinf(weight) or weight < 0:
+            raise ValueError(
+                f"corrupt batch file {batch_file!r}: invalid stored weight"
+            )
+    if state["position"] > sum(1 for w in state["weights"] if w > 0):
+        raise ValueError(
+            f"corrupt batch file {batch_file!r}: position past the "
+            f"positive-weight items"
+        )
+    return state
+
+
+def _write_batch_file(batch_file, state):
+    """Atomically publish ``state`` as the batch file.
+
+    The replacement is staged at a unique
+    ``batch_file.batch.tmp.<random>`` name, fsynced and atomically
+    renamed over the batch file, so the file is never observed half
+    written and two processes serialised on the batch lock never
+    clobber one another's staging.  A failed write removes the staging
+    file and leaves the previously published state untouched.
+    """
+    payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
+    tmp = batch_file + _BATCH_TMP_SUFFIX + os.urandom(8).hex()
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+            _write_bytes(out, payload)
+            os.fsync(out)
+        finally:
+            # Closed before the rename: on Windows an open file cannot
+            # be renamed.
+            os.close(out)
+        os.replace(tmp, batch_file)
+    except BaseException:
+        _unlink_if_exists(tmp)
+        raise
+
+
+def _clean_batch_staging(batch_file):
+    """Remove staging files a crashed batch advance left behind.
+
+    Only a whole fully-fsynced state ever reaches the batch file (the
+    publish is one atomic rename), so a crash can never leave half a
+    state under the batch name; the only possible leftover is an
+    unpublished private staging file, removed here transparently by the
+    next advance holding the batch lock.
+    """
+    directory = os.path.dirname(batch_file) or "."
+    prefix = os.path.basename(batch_file) + _BATCH_TMP_SUFFIX
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if name.startswith(prefix):
+            _unlink_if_exists(os.path.join(directory, name))
+
+
+def _check_batch_weights(weights):
+    """Validate one batch's weights and normalise them for storage.
+
+    Mirrors the :class:`Sampler` rules at the public boundary: every
+    weight must be a real number that is neither NaN nor Infinity, and
+    negative weights are rejected while negative zero is allowed (its
+    effective weight is zero, so the item can never be drawn).  Integers
+    are kept as integers so a huge integer weight is serialised as an
+    exact decimal counter and never rounded on disk; every other real
+    (a ``fractions.Fraction`` or ``decimal.Decimal``) collapses to the
+    float the :class:`Sampler` itself draws with, which also makes the
+    state strictly JSON-serialisable.  ``-0.0`` stays ``-0.0``.
+    """
+    checked = []
+    for weight in weights:
+        if isinstance(weight, bool) or not isinstance(weight, numbers.Real):
+            raise TypeError(
+                f"weight must be a real number, got {type(weight).__name__}"
+            )
+        if math.isnan(weight) or math.isinf(weight):
+            raise ValueError("weight must not be NaN or Infinity")
+        if weight < 0:
+            raise ValueError("weight must not be negative")
+        checked.append(weight if isinstance(weight, int) else float(weight))
+    return checked
+
+
+def sampling_batch_metrics(path, weights, count, batch_file, position=None):
+    """Advance one persistent without-replacement weighted sampling batch.
+
+    The batch's progress lives in the caller-named ``batch_file``;
+    ``path`` only names the metric log the batch belongs to.  When
+    ``batch_file`` does not exist yet a fresh batch is started at
+    position zero -- its reproducible seed is generated once and stored
+    in the file -- and this call's ``count`` indices are the first of
+    the sequence.  Every later call with the same file continues the
+    same without-replacement draw from the stored position: an index
+    already drawn never repeats and a not-yet-drawn index is never
+    skipped.  Weights of zero and negative zero never enter the pool.
+    Requesting draws whose cumulative count passes the number of
+    positive-weight items raises :class:`ValueError` and changes
+    nothing.  Drawing zero returns an empty list and leaves the
+    position where it was.
+
+    The draw is rebuilt into a
+    :class:`~weighted_batcher.Sampler` in without-replacement mode from
+    the stored seed and position, so the sequence after a process
+    restart equals one uninterrupted run item by item for the same
+    weights and seed.  Each advance publishes the whole state --
+    weights, seed and position, in that fixed key order -- staged,
+    fsynced and atomically renamed over the batch file, so a crash
+    leaves either the pre-advance file or the post-advance one, never a
+    half-written state; a leftover staging file is removed
+    transparently by the next advance.  Advances of one batch file are
+    serialised by a lock anchored on ``batch_file.lock`` -- never on the
+    log -- while distinct batch files never share a lock or a state
+    file, so concurrent advances neither lose updates, self-deadlock nor
+    report spurious locking failures.
+
+    ``position`` optionally names a resume point (draws already made).
+    When it is omitted the call opens the batch at zero if the file is
+    missing and otherwise resumes at the file's stored position.  When it
+    is given the call is a continue-at-a-known-point read-out: a missing
+    batch file raises :class:`FileNotFoundError`, and an existing file is
+    authoritative -- the given position is still validated but never
+    re-draws committed indices or skips undrawn ones.
+
+    The return value is a plain persistable mapping: the weights and
+    seed bound to the batch, the new ``position`` (draws committed in
+    total) and the ``indices`` drawn by this call, in draw order.
+
+    Counters are written as exact decimal integers, ``-0.0`` weights are
+    preserved, and the state's key order is the order it is written in.
+
+    Raises:
+        TypeError: ``path`` or ``batch_file`` is not a string, a weight
+            is not a real number, or ``count`` or ``position`` is not an
+            integer (booleans do not count).
+        ValueError: a weight is negative, NaN or Infinity, ``count`` or
+            ``position`` is negative, the cumulative request passes the
+            remaining positive-weight items, or the batch file is
+            corrupt.  A rejected call publishes nothing.
+        IsADirectoryError: ``path`` or ``batch_file`` is a directory.
+        FileNotFoundError: ``position`` was given (a resume read-out)
+            and the batch file does not exist.
+        OSError: a non-string path aside, locking or writing the batch
+            file fails.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(batch_file, str):
+        raise OSError(
+            f"batch file path must be a string, got {type(batch_file).__name__}"
+        )
+    weights = list(weights)
+    weights = _check_batch_weights(weights)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError(
+            f"sample count must be an integer, got {type(count).__name__}"
+        )
+    if count < 0:
+        raise ValueError("sample count must not be negative")
+    if position is None:
+        explicit = False
+        position = 0
+    else:
+        explicit = True
+        if isinstance(position, bool) or not isinstance(position, int):
+            raise TypeError(
+                f"batch position must be an integer, got "
+                f"{type(position).__name__}"
+            )
+        if position < 0:
+            raise ValueError("batch position must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    if os.path.isdir(batch_file):
+        raise IsADirectoryError(
+            f"batch file path is a directory: {batch_file!r}"
+        )
+
+    positive = sum(1 for weight in weights if weight > 0)
+    if explicit and not os.path.exists(batch_file):
+        # A resume read-out must leave no sidecar behind: a missing
+        # batch file is reported before the lock anchor is created.
+        raise FileNotFoundError(f"no sampling batch file at {batch_file!r}")
+    lock_fd = _batch_lock(batch_file)
+    try:
+        _clean_batch_staging(batch_file)
+        try:
+            state = _read_batch_file(batch_file)
+        except FileNotFoundError:
+            if explicit:
+                # A continue-at-a-known-point read-out names a batch
+                # file that must already exist; never fabricate one.
+                raise
+            state = None
+        if state is None:
+            # Publishing the first state is the commit point of the
+            # start; the seed is fixed here and remembered forever, so
+            # a batch resumed after a crash and one drawn without
+            # interruption share one stream.
+            state = {
+                "version": 1,
+                "weights": weights,
+                "seed": int.from_bytes(os.urandom(8), "big"),
+                "position": 0,
+            }
+        else:
+            # The file is authoritative: it binds the weights and seed
+            # the persisted sequence was drawn with, so a reopened batch
+            # continues its own sequence whatever weights were passed.
+            weights = list(state["weights"])
+            positive = sum(1 for weight in weights if weight > 0)
+            # The committed position is authoritative: an earlier
+            # position cannot resurrect drawn indices and a later one
+            # cannot skip undrawn ones, so reopening always resumes at
+            # the file's own point.
+            position = int(state["position"])
+        remaining = positive - position
+        if remaining < 0:
+            raise ValueError(
+                f"batch position {position} is past the {positive} "
+                f"positive-weight items"
+            )
+        if count > remaining:
+            raise ValueError(
+                f"cannot draw {count} items without replacement: "
+                f"{remaining} positive-weight items remain"
+            )
+        if count:
+            sampler = Sampler(
+                weights, replacement=False, seed=int(state["seed"])
+            )
+            if position:
+                # One replay call reproduces every prior PRNG step: the
+                # Sampler depletes its pool deterministically however
+                # the original draws were split across calls, so this
+                # midpoint is exactly where the uninterrupted stream is.
+                sampler.sample(position)
+            indices = sampler.sample(count)
+            position += count
+        else:
+            indices = []
+        state = {
+            "version": 1,
+            "weights": weights,
+            "seed": int(state["seed"]),
+            "position": position,
+        }
+        _write_batch_file(batch_file, state)
+        return {
+            "weights": list(weights),
+            "seed": int(state["seed"]),
+            "position": position,
+            "indices": indices,
+        }
     finally:
         if lock_fd is not None:
             os.close(lock_fd)

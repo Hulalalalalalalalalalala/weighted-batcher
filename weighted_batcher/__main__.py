@@ -171,16 +171,14 @@ def _record_line(metrics):
 
 
 def _record(path, line):
-    # Append one metrics JSON object line.  The subcommand accepts any
-    # JSON object parse_metrics accepts -- values are not required to be
-    # numeric -- and stores the canonical compact rendering, so a record
-    # carrying string values appends exactly like a purely numeric one.
-    # Re-parsing the canonical form rejects non-finite floats (a 1e999
-    # style overflow) that json would otherwise emit as the invalid
-    # NaN/Infinity literals, so the log never gains an unreadable line.
+    # Append one metrics JSON object line.  Metric-value validation is
+    # aligned with the append entry: the line is parsed and re-rendered
+    # through render_metrics, so a value that is not an int or float (a
+    # string, boolean or null) raises TypeError and NaN or Infinity
+    # raises ValueError, exactly as append_metrics rejects them, and the
+    # canonical compact rendering is what gets stored.
     metrics = parse_metrics(line)
-    payload = _record_line(metrics)
-    parse_metrics(payload)
+    payload = render_metrics(metrics)
     _append_payload(path, payload.encode("utf-8"))
     return 0
 
@@ -377,6 +375,16 @@ def _dispatch(handler, path):
         return 1
 
 
+def _dispatch_validated(handler, path):
+    # Like _dispatch, but a validation TypeError (a non-numeric metric
+    # value) is reported the same way and also ends with status 1.
+    try:
+        return handler(path)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["--selftest"]:
@@ -387,7 +395,7 @@ def main(argv=None):
         if len(args) != 3:
             print(_USAGE, file=sys.stderr)
             return 2
-        return _dispatch(lambda path: _record(path, args[2]), args[1])
+        return _dispatch_validated(lambda path: _record(path, args[2]), args[1])
     if args and args[0] == "recover":
         if len(args) != 2:
             print(_USAGE, file=sys.stderr)

@@ -32,6 +32,7 @@ __all__ = [
     "group_resume_metrics",
     "advance_group_metrics",
     "takeover_group_metrics",
+    "sampling_batch_metrics",
 ]
 
 
@@ -178,6 +179,7 @@ from .persistence import (  # noqa: E402
     resume_snapshot_delta_metrics,
     resume_snapshot_metrics,
     rotate_metrics,
+    sampling_batch_metrics,
     snapshot_diff_metrics,
     snapshot_metrics,
     takeover_group_metrics,
