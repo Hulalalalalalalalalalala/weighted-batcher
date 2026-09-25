@@ -13,6 +13,8 @@
     python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]
     python3 -m weighted_batcher snap-diff FILE OLD_HANDLE NEW_HANDLE
     python3 -m weighted_batcher snap-cursor FILE HANDLE [POSITION]
+    python3 -m weighted_batcher checkpoint FILE HANDLE CURSOR_FILE [POSITION]
+    python3 -m weighted_batcher cursor-resume FILE CURSOR_FILE
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import sys
 from . import (
     Sampler,
     append_metrics,
+    checkpoint_metrics,
     compact_metrics,
     iter_metrics,
     parse_metrics,
@@ -29,6 +32,7 @@ from . import (
     recover_metrics,
     release_metrics,
     render_metrics,
+    resume_checkpoint_metrics,
     resume_metrics,
     resume_snapshot_delta_metrics,
     resume_snapshot_metrics,
@@ -51,7 +55,9 @@ _USAGE = (
     "  python3 -m weighted_batcher release FILE HANDLE\n"
     "  python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]\n"
     "  python3 -m weighted_batcher snap-diff FILE OLD_HANDLE NEW_HANDLE\n"
-    "  python3 -m weighted_batcher snap-cursor FILE HANDLE [POSITION]"
+    "  python3 -m weighted_batcher snap-cursor FILE HANDLE [POSITION]\n"
+    "  python3 -m weighted_batcher checkpoint FILE HANDLE CURSOR_FILE [POSITION]\n"
+    "  python3 -m weighted_batcher cursor-resume FILE CURSOR_FILE"
 )
 
 
@@ -212,6 +218,22 @@ def _snap_cursor(path, handle, position):
     return 0
 
 
+def _checkpoint(path, handle, cursor_path, position):
+    # Persist the pull cursor (position, handle and record boundary) to
+    # the caller-named cursor file; a position that does not parse as an
+    # integer is a usage error handled in main().
+    checkpoint_metrics(path, handle, cursor_path, position)
+    return 0
+
+
+def _cursor_resume(path, cursor_path):
+    # Stream the pinned snapshot onward from the stored cursor position,
+    # one canonical JSON object per record.
+    for metrics in resume_checkpoint_metrics(path, cursor_path):
+        sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
 def _dispatch(handler, path):
     # rotate/stream failures are reported cleanly and end with status 1.
     try:
@@ -318,6 +340,28 @@ def main(argv=None):
                 return 2
         return _dispatch(
             lambda path: _snap_cursor(path, args[2], position), args[1]
+        )
+    if args and args[0] == "checkpoint":
+        if len(args) not in (4, 5):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        position = 0
+        if len(args) == 5:
+            try:
+                position = int(args[4])
+            except ValueError:
+                print(_USAGE, file=sys.stderr)
+                return 2
+        return _dispatch(
+            lambda path: _checkpoint(path, args[2], args[3], position),
+            args[1],
+        )
+    if args and args[0] == "cursor-resume":
+        if len(args) != 3:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda path: _cursor_resume(path, args[2]), args[1]
         )
     print(_USAGE, file=sys.stderr)
     return 2

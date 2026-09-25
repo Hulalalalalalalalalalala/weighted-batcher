@@ -53,6 +53,19 @@ the write lock only for the constant-sized boundary pin -- never while
 its records are produced -- so appends, rotations, compactions and
 prunes proceed normally while either read runs.
 
+:func:`checkpoint_metrics` persists a reader's place in a caller-named
+cursor file.  The cursor binds the write-order read position, the
+snapshot handle the reader pulls through and that snapshot's record
+boundary (its pruned count and record total); every advance replaces the
+whole cursor atomically, so a crash between consuming and advancing
+leaves either the old cursor or the new one, never a half-written file.
+:func:`resume_checkpoint_metrics` reads that one file and streams the
+pinned snapshot from the stored position with exactly the ordinal rules
+of :func:`resume_snapshot_metrics`.  A cursor takes no log lock to write
+and reads only the snapshot's private copy, so concurrent readers with
+separate cursor files and same-process writers neither block nor lose
+updates.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -84,6 +97,8 @@ __all__ = [
     "resume_snapshot_metrics",
     "snapshot_diff_metrics",
     "resume_snapshot_delta_metrics",
+    "checkpoint_metrics",
+    "resume_checkpoint_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -106,6 +121,13 @@ _TRIM_TMP_SUFFIX = ".trim.tmp"
 _REGISTRY_SUFFIX = ".snapshots"
 _REGISTRY_TMP_SUFFIX = ".snapshots.tmp"
 _SNAP_COPY_SUFFIX = ".snap."
+# Cursor state.  The caller names the final cursor file; each write stages
+# its replacement at a unique ``cursor_path.cursor.tmp.<random>`` name,
+# fsyncs it and atomically renames it over the cursor, so the cursor
+# itself is never observed half written and concurrent writers (serialised
+# by a lock anchored on the cursor file, for the unusual case of two
+# processes sharing one cursor file) never clobber one another's staging.
+_CURSOR_TMP_SUFFIX = ".cursor.tmp."
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -1751,3 +1773,251 @@ def resume_snapshot_delta_metrics(path, old_handle, position=0):
             _close_pins(pins)
 
     return _generate()
+
+
+def _load_cursor(cursor_path):
+    """Read and structurally validate a cursor file, returning its state.
+
+    The cursor is one JSON object binding the read position, the snapshot
+    handle and the snapshot's record boundary (``pruned`` and ``total``).
+    A missing file is a missing checkpoint; anything present but not
+    exactly such a document is a corrupt cursor, including a cursor an
+    earlier version could have written with different fields.
+    """
+    fd = os.open(cursor_path, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"corrupt cursor file {cursor_path!r}: {exc}") from exc
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"corrupt cursor file {cursor_path!r}: state must be a JSON object"
+        )
+    keys = ("version", "position", "handle", "pruned", "total")
+    if set(state) != set(keys):
+        raise ValueError(
+            f"corrupt cursor file {cursor_path!r}: unexpected cursor fields"
+        )
+    if state["version"] != 1 or not isinstance(state["handle"], str):
+        raise ValueError(f"corrupt cursor file {cursor_path!r}: bad cursor state")
+    for key in ("position", "pruned", "total"):
+        # Booleans are not acceptable cursor numbers.
+        if isinstance(state[key], bool) or not isinstance(state[key], int):
+            raise ValueError(
+                f"corrupt cursor file {cursor_path!r}: {key} must be an integer"
+            )
+    if state["position"] < 0 or state["pruned"] < 0 or state["total"] < 0:
+        raise ValueError(
+            f"corrupt cursor file {cursor_path!r}: negative cursor value"
+        )
+    if state["total"] < state["pruned"]:
+        raise ValueError(
+            f"corrupt cursor file {cursor_path!r}: pruned count past the total"
+        )
+    return state
+
+
+def checkpoint_metrics(path, handle, cursor_path, position=0):
+    """Write the reader's incremental-pull cursor to ``cursor_path``.
+
+    The cursor binds three things together: the integer write-order read
+    ``position`` (the next ordinal to consume), the snapshot ``handle``
+    the pull streams through, and that snapshot's record boundary -- its
+    pruned-record count and its record total including pruned records --
+    captured from the snapshot registry at write time.  Repeated calls
+    advance the cursor by replacing the whole file, so a crash between
+    consuming records and advancing the checkpoint leaves either the
+    previous cursor or this one on disk, never a half-written file.
+
+    The replacement is staged at a unique
+    ``cursor_path.cursor.tmp.<random>`` name, fsynced and atomically
+    renamed over the cursor; on platforms with :mod:`fcntl` the cursor
+    file itself is locked for the write, so even two processes that
+    mistakenly share one cursor file replace it serially without ever
+    interleaving payloads or losing one another's update.  Distinct
+    readers that name distinct cursor files never touch each other's
+    state and never block one another; no log lock is taken here, so an
+    upstream append, rotation, compaction or prune in the same process
+    neither deadlocks against the checkpoint write nor fails to acquire
+    its lock.
+
+    Raises:
+        TypeError: ``handle`` is not a string, or ``position`` is not an
+            integer (booleans do not count).
+        ValueError: ``position`` is negative, or ``handle`` is forged,
+            belongs to another segment set or was released.
+            A position past the snapshot total (pruned records included)
+            is not rejected here; :func:`resume_checkpoint_metrics`
+            reports it lazily while iterating, like
+            :func:`resume_snapshot_metrics`.
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking or writing the
+            cursor file fails.  A failed write leaves the previously
+            published cursor (if any) untouched.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(handle, str):
+        raise TypeError(
+            f"snapshot handle must be a string, got {type(handle).__name__}"
+        )
+    if not isinstance(cursor_path, str):
+        raise OSError(
+            f"cursor path must be a string, got {type(cursor_path).__name__}"
+        )
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError(
+            f"read position must be an integer, got {type(position).__name__}"
+        )
+    if position < 0:
+        raise ValueError("read position must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    entry = _snapshot_entry(path, handle)
+    pruned = int(entry["pruned"])
+    total = int(entry["total"])
+    state = {
+        "version": 1,
+        "position": position,
+        "handle": handle,
+        "pruned": pruned,
+        "total": total,
+    }
+    payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
+
+    tmp = cursor_path + _CURSOR_TMP_SUFFIX + os.urandom(8).hex()
+    existed = os.path.exists(cursor_path)
+    lock_fd = None
+    out = None
+    try:
+        if fcntl is not None:
+            # The lock is anchored on the cursor file itself, never on
+            # the log: it serialises writes that share a cursor file
+            # without ever blocking an upstream append, rotation,
+            # compaction or prune or a reader using another cursor file.
+            # Follow the same inode-revalidation rule as _open_locked: a
+            # failed predecessor may have unlinked an empty anchor while
+            # this open waited, so re-lock until the descriptor names the
+            # file currently at the cursor path.
+            while True:
+                lock_fd = os.open(cursor_path, os.O_RDWR | os.O_CREAT, 0o666)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                except OSError:
+                    os.close(lock_fd)
+                    raise
+                held = os.fstat(lock_fd)
+                try:
+                    current = os.stat(cursor_path)
+                except FileNotFoundError:
+                    current = None
+                if current is not None and (
+                    current.st_dev, current.st_ino
+                ) == (held.st_dev, held.st_ino):
+                    break
+                os.close(lock_fd)
+                lock_fd = None
+        # A per-process unique staging name means two waiters never
+        # clobber one another's staging file while queued on the lock.
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        _write_bytes(out, payload)
+        os.fsync(out)
+        os.close(out)
+        out = None
+        os.replace(tmp, cursor_path)
+    except BaseException:
+        if out is not None:
+            try:
+                os.close(out)
+            except OSError:
+                pass
+        _unlink_if_exists(tmp)
+        # An empty file created only to anchor the lock is no cursor at
+        # all; remove it when no published cursor predated this call, so
+        # a failed write leaves no half cursor behind.
+        if not existed:
+            try:
+                if os.path.exists(cursor_path) and os.path.getsize(
+                    cursor_path
+                ) == 0:
+                    os.unlink(cursor_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def resume_checkpoint_metrics(path, cursor_path):
+    """Stream an incremental pull onward from the cursor in ``cursor_path``.
+
+    The cursor file is read first and its bound state validated eagerly:
+    the snapshot handle is checked against the current registry exactly as
+    in :func:`resume_snapshot_metrics` -- a forged handle, one from another
+    segment set or a released one is rejected -- and the stored boundary
+    is compared with the registry's, so a cursor whose state was tampered
+    with is reported rather than silently trusted.  Streaming then runs
+    through :func:`resume_snapshot_metrics` from the stored position:
+
+    * records already consumed (ordinals below the position) are not
+      produced again, and no unconsumed record is skipped;
+    * a position inside the snapshot's pruned region starts at the oldest
+      pinned record, because pruned records keep their ordinals;
+    * a position equal to the snapshot total (pruned included) yields an
+      empty stream; a larger one raises :class:`ValueError` only once the
+      end is reached while iterating.
+
+    Because the snapshot is a creation-time private copy, records appended,
+    rotated, compacted or pruned after the cursor was written are invisible
+    to this pull -- callers pin a fresh snapshot to see them -- and the
+    read never blocks a same-process or upstream writer.
+
+    Raises:
+        FileNotFoundError: ``cursor_path`` does not exist, or neither
+            ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` or ``cursor_path`` is not a string, or reading
+            the cursor file fails.
+        ValueError: the cursor file is corrupt (including a non-string
+            handle or a non-integer position), or its handle is forged,
+            belongs to another segment set, was released, or records a
+            boundary that no longer matches the snapshot registry; a
+            stored position past the snapshot total raises lazily while
+            iterating, as do non-metrics lines in the snapshot copy.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(cursor_path, str):
+        raise OSError(
+            f"cursor path must be a string, got {type(cursor_path).__name__}"
+        )
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    state = _load_cursor(cursor_path)
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    entry = _snapshot_entry(path, state["handle"])
+    if (
+        int(entry["pruned"]) != state["pruned"]
+        or int(entry["total"]) != state["total"]
+    ):
+        raise ValueError(
+            f"cursor {cursor_path!r} does not match the snapshot record "
+            f"boundary of handle {state['handle']!r}"
+        )
+    return resume_snapshot_metrics(path, state["handle"], state["position"])
