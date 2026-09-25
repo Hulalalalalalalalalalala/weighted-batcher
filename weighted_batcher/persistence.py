@@ -53,6 +53,14 @@ the write lock only for the constant-sized boundary pin -- never while
 its records are produced -- so appends, rotations, compactions and
 prunes proceed normally while either read runs.
 
+:func:`checkpoint_metrics` persists an incremental-pull cursor -- the
+read position, the snapshot handle and the record boundary pinned at
+call time -- into a caller-named file in one atomic overwrite.
+:func:`resume_checkpoint_metrics` reads that cursor back and streams
+the pinned slice line by line, advancing the cursor file as each
+record is consumed, so a reader that restarts picks up exactly where
+its cursor stands and a crash never leaves half a cursor behind.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -84,6 +92,8 @@ __all__ = [
     "resume_snapshot_metrics",
     "snapshot_diff_metrics",
     "resume_snapshot_delta_metrics",
+    "checkpoint_metrics",
+    "resume_checkpoint_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -1744,6 +1754,284 @@ def resume_snapshot_delta_metrics(path, old_handle, position=0):
                 raise ValueError(
                     f"read position {position} exceeds the record total of "
                     f"{pruned + seen}"
+                )
+        finally:
+            # Descriptors -- the anonymous live copy included -- die
+            # with the generator, whether it ran out or was closed early.
+            _close_pins(pins)
+
+    return _generate()
+
+
+# Suffix of the temporary a cursor overwrite is staged under before the
+# atomic rename onto the cursor path itself.
+_CURSOR_TMP_SUFFIX = ".tmp"
+
+
+def _write_cursor_file(cursor_path, state):
+    """Atomically publish ``state`` as the cursor file and fsync it.
+
+    The JSON object is fully written and flushed at a sibling temporary
+    name and renamed onto the cursor path only once it is whole on disk,
+    so a crash leaves either the old cursor or the new one, never half
+    of one.  A failed write removes the temporary and leaves any
+    previous cursor untouched.
+    """
+    tmp = cursor_path + _CURSOR_TMP_SUFFIX
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            payload = json.dumps(state, separators=(",", ":"))
+            _write_bytes(fd, payload.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            # Closed before the rename: on Windows an open file cannot
+            # be renamed.
+            os.close(fd)
+        os.replace(tmp, cursor_path)
+    except BaseException:
+        _unlink_if_exists(tmp)
+        raise
+
+
+def _read_cursor_file(cursor_path):
+    """Read a cursor file back into ``(handle, position, boundary)``.
+
+    A missing cursor file raises :class:`FileNotFoundError`; content
+    that is not a JSON object carrying a string handle and non-negative
+    integer position and boundary raises :class:`ValueError`.
+    """
+    fd = os.open(cursor_path, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid cursor file {cursor_path!r}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"invalid cursor file {cursor_path!r}: not a JSON object"
+        )
+    handle = data.get("handle")
+    position = data.get("position")
+    boundary = data.get("boundary")
+    if (
+        not isinstance(handle, str)
+        or isinstance(position, bool)
+        or not isinstance(position, int)
+        or isinstance(boundary, bool)
+        or not isinstance(boundary, int)
+        or position < 0
+        or boundary < 0
+    ):
+        raise ValueError(
+            f"invalid cursor file {cursor_path!r}: malformed cursor state"
+        )
+    return handle, position, boundary
+
+
+def _count_pinned_records(pins):
+    """Count the complete records a boundary pin holds.
+
+    Blank lines are skipped exactly as on a read, so the count matches
+    the record total a recovery of the same pinned bytes would see.
+    """
+    total = 0
+    for descriptor, size, member in pins:
+        if descriptor is None:
+            # Lock-less platform: members are read by path.
+            for _raw in _iter_raw_records(member):
+                total += 1
+        else:
+            for _lineno, raw in _iter_fd_lines(descriptor, size):
+                if raw and raw != b"\r":
+                    total += 1
+    return total
+
+
+def checkpoint_metrics(path, handle, position, cursor_path):
+    """Persist an incremental-pull cursor into ``cursor_path``.
+
+    The cursor binds three things as of this call: the read ``position``
+    (the write-order ordinal of the next record the reader has not
+    consumed), the snapshot ``handle`` identifying the reader, and the
+    current record boundary -- the record total, pruned records
+    included.  The state is written as one JSON object, fully landed
+    and flushed at a sibling temporary name and atomically renamed onto
+    ``cursor_path``, so a crash leaves either the old cursor or the new
+    one, never half of one, and a failed write leaves any previous
+    cursor untouched.  Every later advance overwrites the whole state
+    the same way.
+
+    ``position`` uses the same write-order ordinals as
+    :func:`resume_metrics`: records pruned from the oldest end keep
+    their ordinals, and a position inside the pruned region later reads
+    from the oldest surviving record.  The boundary is pinned at the
+    live record boundary exactly the way
+    :func:`resume_snapshot_delta_metrics` pins it -- a brief lock to
+    settle and capture the members, then lock-free counting -- so
+    upstream appends, rotations, compactions and prunes proceed
+    normally while the checkpoint is taken, and a reader in the same
+    process neither deadlocks against itself nor reports a spurious
+    locking failure.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` or ``cursor_path`` is not a string, or
+            writing the cursor file fails.
+        TypeError: ``handle`` is not a string, or ``position`` is not
+            an integer (booleans do not count).
+        ValueError: ``handle`` is forged, belongs to another segment
+            set or was released, or ``position`` is negative.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(handle, str):
+        raise TypeError(
+            f"snapshot handle must be a string, got {type(handle).__name__}"
+        )
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError(
+            f"read position must be an integer, got {type(position).__name__}"
+        )
+    if position < 0:
+        raise ValueError("read position must not be negative")
+    if not isinstance(cursor_path, str):
+        raise OSError(
+            f"cursor path must be a string, got {type(cursor_path).__name__}"
+        )
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    pruned, pins = _pin_live_delta(path)
+    try:
+        _snapshot_entry(path, handle)
+        boundary = pruned + _count_pinned_records(pins)
+    finally:
+        _close_pins(pins)
+    _write_cursor_file(cursor_path, {
+        "handle": handle,
+        "position": position,
+        "boundary": boundary,
+    })
+
+
+def resume_checkpoint_metrics(path, cursor_path):
+    """Stream the records a persisted cursor points at, advancing it.
+
+    The cursor file written by :func:`checkpoint_metrics` is read back;
+    the stream is the live record sequence from the cursor's read
+    position up to the boundary the cursor pinned, pinned again at this
+    call exactly as in :func:`resume_snapshot_delta_metrics`: a brief
+    lock settles and captures the members, the live log's bytes move
+    into an anonymous descriptor, and the lock is released before this
+    returns.  Appends, rotations, compactions and prunes after the pin
+    never change what is produced, upstream writes proceed normally
+    while records stream, and a writer in the same process neither
+    deadlocks against the pull nor reports a spurious locking failure.
+    Ordinals follow :func:`resume_metrics`: pruned records keep their
+    ordinals, a cursor position inside the pruned region starts at the
+    oldest surviving record, a position equal to the pinned boundary
+    yields nothing, and a position past it raises :class:`ValueError`
+    while iterating.
+
+    Each record's ordinal is advanced into the cursor file with one
+    atomic overwrite just before the record is produced, so a restart
+    resumes at the first unconsumed record: already consumed records
+    are not re-sent, unconsumed ones are not skipped, and
+    concatenating the output before a restart with the output after it
+    equals one uninterrupted pull.  A crash between advancing and
+    consuming leaves the cursor on either side of the record, never
+    half-written.  Every reader uses its own cursor file, so readers
+    never overwrite or block each other.
+
+    Path-level and cursor-file problems are reported when this function
+    is called; line content problems and an out-of-range position are
+    reported lazily while iterating.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists, or
+            the cursor file does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` or ``cursor_path`` is not a string, or
+            writing the advanced cursor fails (raised while iterating).
+        ValueError: the cursor file is corrupt; the handle it names is
+            forged, belongs to another segment set or was released; the
+            cursor position is past the pinned record total (raised
+            while iterating); or a complete line is not a metrics JSON
+            object (raised while iterating).
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(cursor_path, str):
+        raise OSError(
+            f"cursor path must be a string, got {type(cursor_path).__name__}"
+        )
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    # The boundary is pinned first, exactly as in
+    # resume_snapshot_delta_metrics, so a missing log reports
+    # FileNotFoundError before the cursor file is consulted; the cursor
+    # and the registry are then validated without streaming.
+    pruned, pins = _pin_live_delta(path)
+    try:
+        handle, position, boundary = _read_cursor_file(cursor_path)
+        _snapshot_entry(path, handle)
+    except BaseException:
+        _close_pins(pins)
+        raise
+
+    def _generate():
+        seen = 0
+        try:
+            stop = False
+            for descriptor, size, member in pins:
+                if descriptor is None:
+                    # Lock-less platform: members are read by path.
+                    records = _parse_file(member, member)
+                else:
+                    records = _parse_lined(
+                        _iter_fd_lines(descriptor, size), member
+                    )
+                for record in records:
+                    ordinal = pruned + seen
+                    seen += 1
+                    if ordinal >= boundary:
+                        # Records appended after the checkpoint stay
+                        # for a later checkpoint's cursor.
+                        stop = True
+                        break
+                    if ordinal < position:
+                        continue
+                    # Advance before the record is handed out: the
+                    # overwrite is atomic, so a crash between advancing
+                    # and consuming leaves the cursor on either side of
+                    # this record, never in between, and a consumer
+                    # that stops after a record always finds the cursor
+                    # already past it.
+                    _write_cursor_file(cursor_path, {
+                        "handle": handle,
+                        "position": ordinal + 1,
+                        "boundary": boundary,
+                    })
+                    yield record
+                if stop:
+                    break
+            if position > boundary:
+                raise ValueError(
+                    f"read position {position} exceeds the checkpointed "
+                    f"record total of {boundary}"
                 )
         finally:
             # Descriptors -- the anonymous live copy included -- die
