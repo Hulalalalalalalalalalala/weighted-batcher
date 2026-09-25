@@ -66,6 +66,28 @@ and reads only the snapshot's private copy, so concurrent readers with
 separate cursor files and same-process writers neither block nor lose
 updates.
 
+:func:`checkpoint_group_metrics` advances a whole group of such cursors
+in one commit.  It publishes a single unified commit record
+(``path.groupcursor``) covering every cursor in the group -- one write
+for the whole group instead of one per reader -- and only then replaces
+the individual cursor files, so a crash leaves either the pre-commit
+cursors or, once the next group commit finishes the published plan, the
+post-commit ones, never a durable mixture.  Concurrent group commits
+are serialised by a lock anchored on ``path.groupcursor.lock`` -- never
+on the log -- so same-process readers and writers neither deadlock
+against a group commit nor report spurious locking failures.
+
+:func:`replay_metrics` re-reads a window of the write-order record
+sequence, merging the cursor's pinned snapshot copy with a pinned live
+boundary and de-duplicating by write ordinal, so a record already
+consumed inside the window is never produced twice.  A window start
+inside the pruned region backfills from the oldest surviving record and
+reports the gap; a window end past the record total (pruned records
+included) closes with a gap.  The live side is pinned the way
+:func:`resume_snapshot_delta_metrics` pins it, so pruning, rotation and
+compaction proceed concurrently and the read never holds the write lock
+while records are produced.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -99,6 +121,8 @@ __all__ = [
     "resume_snapshot_delta_metrics",
     "checkpoint_metrics",
     "resume_checkpoint_metrics",
+    "checkpoint_group_metrics",
+    "replay_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -128,6 +152,17 @@ _SNAP_COPY_SUFFIX = ".snap."
 # by a lock anchored on the cursor file, for the unusual case of two
 # processes sharing one cursor file) never clobber one another's staging.
 _CURSOR_TMP_SUFFIX = ".cursor.tmp."
+# Group-commit state.  ``path.groupcursor`` is the unified commit record
+# of a group checkpoint: one atomically published JSON plan covering
+# every cursor in the group.  ``path.groupcursor.lock`` anchors the
+# inter-process lock that serialises group commits; it is never renamed
+# or replaced, so a held lock stays valid for the whole commit.
+# ``path.groupcursor.tmp`` is the staging name of the next commit
+# record.  All three are non-numeric sidecars, invisible to
+# ``_segment_numbers``.
+_GROUP_COMMIT_SUFFIX = ".groupcursor"
+_GROUP_LOCK_SUFFIX = ".groupcursor.lock"
+_GROUP_COMMIT_TMP_SUFFIX = ".groupcursor.tmp"
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -2021,3 +2056,386 @@ def resume_checkpoint_metrics(path, cursor_path):
             f"boundary of handle {state['handle']!r}"
         )
     return resume_snapshot_metrics(path, state["handle"], state["position"])
+
+
+def _publish_cursor(cursor_path, payload):
+    """Atomically replace the cursor at ``cursor_path`` with ``payload``.
+
+    The replacement is staged at a unique
+    ``cursor_path.cursor.tmp.<random>`` name, fsynced and atomically
+    renamed over the cursor, so the cursor is never observed half
+    written.  Serialisation against other writers is the caller's
+    concern (the group-commit lock); a failed write removes the staging
+    file and leaves the previously published cursor untouched.
+    """
+    tmp = cursor_path + _CURSOR_TMP_SUFFIX + os.urandom(8).hex()
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+            _write_bytes(out, payload)
+            os.fsync(out)
+        finally:
+            # Closed before the rename: on Windows an open file cannot
+            # be renamed.
+            os.close(out)
+        os.replace(tmp, cursor_path)
+    except BaseException:
+        _unlink_if_exists(tmp)
+        raise
+
+
+def _read_group_plan(path):
+    """Return the published group-commit plan, or ``None`` when absent.
+
+    The commit record only ever names a whole, fully-fsynced JSON plan:
+    it is staged at ``path.groupcursor.tmp`` and atomically renamed into
+    place, so a read never observes a half-written one.
+    """
+    try:
+        fd = os.open(path + _GROUP_COMMIT_SUFFIX, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    return json.loads(raw.decode("utf-8"))
+
+
+def _finish_group_commit(path):
+    """Apply a published group-commit plan to every cursor it names.
+
+    Called with the group-commit lock held, by
+    :func:`checkpoint_group_metrics` both before its own commit (a
+    crashed predecessor may have left a plan behind) and straight after
+    publishing that commit.  The plan is the commit point; applying it
+    is idempotent whole-cursor replacement, so a crash anywhere leaves
+    either the pre-commit cursors or a state the next group commit
+    finishes deterministically -- never a durable mixture of advanced
+    and unadvanced readers.
+    """
+    plan = _read_group_plan(path)
+    if plan is None:
+        return
+    for entry in plan["entries"]:
+        _publish_cursor(entry["cursor"], entry["payload"].encode("utf-8"))
+    _unlink_if_exists(path + _GROUP_COMMIT_SUFFIX)
+
+
+def _group_commit_lock(path):
+    """Take the exclusive group-commit lock and return its descriptor.
+
+    The lock is anchored on ``path.groupcursor.lock``, a dedicated file
+    that is never renamed or replaced, so the held lock stays valid for
+    the whole commit.  It is never the log and never a cursor file, so a
+    same-process append, rotation, compaction, prune, snapshot or single
+    cursor checkpoint neither deadlocks against a group commit nor
+    reports a spurious locking failure.  Returns ``None`` on platforms
+    without :mod:`fcntl`.
+    """
+    if fcntl is None:
+        return None
+    fd = os.open(path + _GROUP_LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def checkpoint_group_metrics(path, cursor_paths, positions=None):
+    """Advance a whole group of reader cursors in one atomic commit.
+
+    ``cursor_paths`` names the cursor files of the group's readers (each
+    previously written by :func:`checkpoint_metrics`) and ``positions``
+    the matching new read positions, in the same order.  Every cursor
+    keeps the snapshot handle and record boundary it already binds; only
+    the position advances.  The whole group advances or none of it does:
+    every cursor and position is validated before anything is written,
+    and the commit itself publishes a single unified cursor state -- one
+    JSON plan at ``path.groupcursor`` naming every cursor's replacement,
+    staged, fsynced and atomically renamed into place -- instead of one
+    write per reader.  That publication is the commit point; only then
+    are the individual cursor files replaced, each staged at a unique
+    temporary name, fsynced and atomically renamed over its cursor.
+
+    A crash therefore leaves either the pre-commit cursors or, once the
+    next group commit finishes the published plan (applying it is
+    idempotent), the post-commit ones -- never a durable mixture of
+    advanced and unadvanced readers.  Concurrent group commits are
+    serialised by an exclusive lock anchored on
+    ``path.groupcursor.lock`` -- never on the log and never on a cursor
+    file -- so they neither overwrite one another nor lose updates, and
+    a same-process append, rotation, compaction, prune, snapshot or
+    single cursor checkpoint interleaved with a group commit neither
+    deadlocks nor reports a spurious locking failure.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists, or a
+            named cursor file does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        TypeError: a position is not an integer (booleans do not count).
+        ValueError: a position is negative, the cursor and position
+            counts differ, a cursor file is corrupt, or a cursor's
+            handle is forged, belongs to another segment set or was
+            released.  A position past the snapshot total is not
+            rejected here, exactly as in :func:`checkpoint_metrics`.
+        OSError: ``path`` or a cursor path is not a string, or locking
+            or writing the commit record or a cursor file fails.  A
+            failed write leaves the previously published cursors
+            untouched.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if positions is None and isinstance(cursor_paths, dict):
+        # A mapping of cursor file to new position is the same group.
+        cursor_paths, positions = (
+            list(cursor_paths),
+            list(cursor_paths.values()),
+        )
+    if isinstance(cursor_paths, str):
+        cursor_paths = [cursor_paths]
+    cursor_paths = list(cursor_paths)
+    if isinstance(positions, int) and not isinstance(positions, bool):
+        positions = [positions]
+    positions = list(positions)
+    if len(cursor_paths) != len(positions):
+        raise ValueError(
+            f"cursor and position counts differ: {len(cursor_paths)} "
+            f"cursor file(s) but {len(positions)} position(s)"
+        )
+    for cursor_path in cursor_paths:
+        if not isinstance(cursor_path, str):
+            raise OSError(
+                f"cursor path must be a string, got "
+                f"{type(cursor_path).__name__}"
+            )
+    for position in positions:
+        if isinstance(position, bool) or not isinstance(position, int):
+            raise TypeError(
+                f"read position must be an integer, got "
+                f"{type(position).__name__}"
+            )
+        if position < 0:
+            raise ValueError("read position must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+
+    # Validate the whole group before anything is written: a missing or
+    # corrupt cursor and a forged, foreign or released handle reject the
+    # commit with every published cursor untouched.
+    entries = []
+    for cursor_path, position in zip(cursor_paths, positions):
+        state = _load_cursor(cursor_path)
+        entry = _snapshot_entry(path, state["handle"])
+        new_state = {
+            "version": 1,
+            "position": position,
+            "handle": state["handle"],
+            "pruned": int(entry["pruned"]),
+            "total": int(entry["total"]),
+        }
+        entries.append(
+            {
+                "cursor": cursor_path,
+                "payload": json.dumps(new_state, separators=(",", ":")),
+            }
+        )
+
+    lock_fd = _group_commit_lock(path)
+    try:
+        # A crashed predecessor may have published its plan and died
+        # mid-application; settle that commit before starting this one.
+        _finish_group_commit(path)
+        plan = json.dumps(
+            {"version": 2, "entries": entries}, separators=(",", ":")
+        )
+        tmp = path + _GROUP_COMMIT_TMP_SUFFIX
+        try:
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+            try:
+                _write_bytes(out, plan.encode("utf-8"))
+                os.fsync(out)
+            finally:
+                os.close(out)
+            # The commit point: one unified cursor state covering the
+            # whole group, atomically renamed into place.
+            os.replace(tmp, path + _GROUP_COMMIT_SUFFIX)
+        except BaseException:
+            _unlink_if_exists(tmp)
+            raise
+        _finish_group_commit(path)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def replay_metrics(path, cursor_path, start, end=None):
+    """Re-read the write-order records of a window, streaming line by line.
+
+    The window covers the write-order ordinals from ``start`` up to
+    ``end`` (exclusive); ``end`` may be omitted to run to the current
+    end of the record sequence.  Records come from two aligned sources:
+    the snapshot copy pinned for the handle the cursor binds (ordinals
+    from the snapshot's pruned count to its record total) and the live
+    segment set pinned at call time the way
+    :func:`resume_snapshot_delta_metrics` pins it (ordinals from the
+    current pruned count to the current record total).  The sources
+    overlap where the live set still holds records the snapshot pinned;
+    each write-order ordinal is produced exactly once, so a record
+    already consumed inside the window is never produced twice, and the
+    merged stream equals the ordinal slice of one uninterrupted read.
+
+    Records a prune removed from every source are reported, not
+    silently skipped: a window start inside the pruned region backfills
+    from the oldest surviving record, preceded by a gap marker
+    ``{"kind": "gap", "start": ..., "end": ...}`` naming the missing
+    ordinal range, and a window end past the record total (pruned
+    records included) closes with a gap marker for the missing tail.
+    Gap markers are plain JSON objects but never valid metrics (their
+    values are not all numbers), so they cannot be mistaken for a
+    record.  Records themselves keep their stored form: original
+    newlines, ``-0.0``, oversized counters and key order.
+
+    The live boundary is pinned under a write lock held only for the
+    constant-sized capture -- never while records are produced -- so a
+    concurrent append, rotation, compaction or prune proceeds normally
+    and the read neither deadlocks against a same-process writer nor
+    reports a spurious locking failure; records appended after the pin
+    never enter the stream.
+
+    Path-, cursor- and window-level problems are reported when this
+    function is called; line content problems and an out-of-range
+    ``start`` are reported lazily while iterating.
+
+    Raises:
+        FileNotFoundError: ``cursor_path`` does not exist, or neither
+            ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` or ``cursor_path`` is not a string.
+        TypeError: ``start`` or ``end`` is not an integer (booleans do
+            not count).
+        ValueError: ``start`` or ``end`` is negative, ``end`` is less
+            than ``start``, the cursor file is corrupt, its handle is
+            forged, belongs to another segment set, was released, or
+            records a boundary that no longer matches the snapshot
+            registry, or ``start`` is past the record total (the latter
+            raised while iterating), or a complete line is not a
+            metrics JSON object (raised while iterating).
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if not isinstance(cursor_path, str):
+        raise OSError(
+            f"cursor path must be a string, got {type(cursor_path).__name__}"
+        )
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise TypeError(
+            f"window start must be an integer, got {type(start).__name__}"
+        )
+    if end is not None and (isinstance(end, bool) or not isinstance(end, int)):
+        raise TypeError(
+            f"window end must be an integer, got {type(end).__name__}"
+        )
+    if start < 0:
+        raise ValueError("window start must not be negative")
+    if end is not None and end < 0:
+        raise ValueError("window end must not be negative")
+    if end is not None and end < start:
+        raise ValueError(
+            f"window end {end} must not be less than window start {start}"
+        )
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    state = _load_cursor(cursor_path)
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    entry = _snapshot_entry(path, state["handle"])
+    if (
+        int(entry["pruned"]) != state["pruned"]
+        or int(entry["total"]) != state["total"]
+    ):
+        raise ValueError(
+            f"cursor {cursor_path!r} does not match the snapshot record "
+            f"boundary of handle {state['handle']!r}"
+        )
+    snap_pruned = int(entry["pruned"])
+    snap_total = int(entry["total"])
+    copy_path = path + _SNAP_COPY_SUFFIX + state["handle"]
+    # Pin the live boundary exactly as an incremental pull does: the
+    # write lock is released before this returns, and the pinned
+    # descriptors stay readable through any later mutation.
+    live_pruned, pins = _pin_live_delta(path)
+
+    def _gap(gap_start, gap_end):
+        # A gap marker names the missing ordinal range [start, end); its
+        # string "kind" value makes it invalid as a metric, so it can
+        # never be confused with a record.
+        return {"kind": "gap", "start": gap_start, "end": gap_end}
+
+    def _generate():
+        try:
+            # Ordinals below the snapshot's pruned count survive nowhere:
+            # report the gap, then backfill from the oldest survivor.
+            if start < snap_pruned:
+                gap_end = snap_pruned if end is None else min(snap_pruned, end)
+                if start < gap_end:
+                    yield _gap(start, gap_end)
+            ordinal = snap_pruned
+            for record in _parse_file(copy_path, copy_path):
+                if ordinal >= start and (end is None or ordinal < end):
+                    yield record
+                ordinal += 1
+            # Records appended after the snapshot and pruned before the
+            # pin survive in neither source: report the hole.
+            if live_pruned > snap_total:
+                gap_start = max(start, snap_total)
+                gap_end = live_pruned if end is None else min(live_pruned, end)
+                if gap_start < gap_end:
+                    yield _gap(gap_start, gap_end)
+            seen = 0
+            for descriptor, size, member in pins:
+                if descriptor is None:
+                    # Lock-less platform: members are read by path.
+                    records = _parse_file(member, member)
+                else:
+                    records = _parse_lined(
+                        _iter_fd_lines(descriptor, size), member
+                    )
+                for record in records:
+                    ordinal = live_pruned + seen
+                    seen += 1
+                    if ordinal < snap_total:
+                        # De-duplicated by write ordinal: the snapshot
+                        # copy already produced this record.
+                        continue
+                    if ordinal >= start and (end is None or ordinal < end):
+                        yield record
+            total = live_pruned + seen
+            if start > total:
+                raise ValueError(
+                    f"window start {start} exceeds the record total of "
+                    f"{total}"
+                )
+            # A window end past the record total (pruned records
+            # included) closes with a gap for the missing tail.
+            if end is not None and end > total:
+                gap_start = max(start, total)
+                if gap_start < end:
+                    yield _gap(gap_start, end)
+        finally:
+            # Descriptors -- the anonymous live copy included -- die
+            # with the generator, whether it ran out or was closed early.
+            _close_pins(pins)
+
+    return _generate()

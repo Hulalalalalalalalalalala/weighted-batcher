@@ -15,15 +15,19 @@
     python3 -m weighted_batcher snap-cursor FILE HANDLE [POSITION]
     python3 -m weighted_batcher checkpoint FILE HANDLE CURSOR_FILE [POSITION]
     python3 -m weighted_batcher cursor-resume FILE CURSOR_FILE
+    python3 -m weighted_batcher group-checkpoint FILE CURSOR_FILE POSITION [CURSOR_FILE POSITION ...]
+    python3 -m weighted_batcher replay FILE CURSOR_FILE START [END]
 """
 
 from __future__ import annotations
 
+import json
 import sys
 
 from . import (
     Sampler,
     append_metrics,
+    checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
     iter_metrics,
@@ -32,6 +36,7 @@ from . import (
     recover_metrics,
     release_metrics,
     render_metrics,
+    replay_metrics,
     resume_checkpoint_metrics,
     resume_metrics,
     resume_snapshot_delta_metrics,
@@ -57,7 +62,9 @@ _USAGE = (
     "  python3 -m weighted_batcher snap-diff FILE OLD_HANDLE NEW_HANDLE\n"
     "  python3 -m weighted_batcher snap-cursor FILE HANDLE [POSITION]\n"
     "  python3 -m weighted_batcher checkpoint FILE HANDLE CURSOR_FILE [POSITION]\n"
-    "  python3 -m weighted_batcher cursor-resume FILE CURSOR_FILE"
+    "  python3 -m weighted_batcher cursor-resume FILE CURSOR_FILE\n"
+    "  python3 -m weighted_batcher group-checkpoint FILE CURSOR_FILE POSITION [CURSOR_FILE POSITION ...]\n"
+    "  python3 -m weighted_batcher replay FILE CURSOR_FILE START [END]"
 )
 
 
@@ -234,6 +241,61 @@ def _cursor_resume(path, cursor_path):
     return 0
 
 
+def _group_checkpoint(path, cursor_paths, positions):
+    # Advance the whole group of cursors in one atomic commit; positions
+    # that do not parse as integers are usage errors handled in main().
+    checkpoint_group_metrics(path, cursor_paths, positions)
+    return 0
+
+
+def _replay(path, cursor_path, start, end):
+    # Stream the window one compact JSON object per line: metric records
+    # and gap markers (a gap marker is not a metric, so items are
+    # rendered directly rather than through render_metrics).
+    for item in replay_metrics(path, cursor_path, start, end):
+        sys.stdout.write(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+    return 0
+
+
+def _group_pairs(rest):
+    """Parse the group-checkpoint cursor/position arguments into pairs.
+
+    Positions are the arguments that parse as integers.  Alternating
+    ``CURSOR POSITION`` pairs, alternating ``POSITION CURSOR`` pairs and
+    all cursor files followed by all positions are all accepted; a
+    position that does not parse as an integer or a leftover argument
+    count makes the whole form a usage error (``None``).
+    """
+    def _is_int(text):
+        try:
+            int(text)
+        except ValueError:
+            return False
+        return True
+
+    if not rest or len(rest) % 2 != 0:
+        return None
+    if all(
+        not _is_int(rest[i]) and _is_int(rest[i + 1])
+        for i in range(0, len(rest), 2)
+    ):
+        return [(rest[i], int(rest[i + 1])) for i in range(0, len(rest), 2)]
+    if all(
+        _is_int(rest[i]) and not _is_int(rest[i + 1])
+        for i in range(0, len(rest), 2)
+    ):
+        return [(rest[i + 1], int(rest[i])) for i in range(0, len(rest), 2)]
+    half = len(rest) // 2
+    cursors, numbers = rest[:half], rest[half:]
+    if all(not _is_int(text) for text in cursors) and all(
+        _is_int(text) for text in numbers
+    ):
+        return list(zip(cursors, [int(text) for text in numbers]))
+    return None
+
+
 def _dispatch(handler, path):
     # rotate/stream failures are reported cleanly and end with status 1.
     try:
@@ -362,6 +424,39 @@ def main(argv=None):
             return 2
         return _dispatch(
             lambda path: _cursor_resume(path, args[2]), args[1]
+        )
+    if args and args[0] == "group-checkpoint":
+        if len(args) < 4 or len(args) % 2 != 0:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        pairs = _group_pairs(args[2:])
+        if pairs is None:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        cursor_paths = [cursor for cursor, _position in pairs]
+        positions = [position for _cursor, position in pairs]
+        return _dispatch(
+            lambda path: _group_checkpoint(path, cursor_paths, positions),
+            args[1],
+        )
+    if args and args[0] == "replay":
+        if len(args) not in (4, 5):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            start = int(args[3])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        end = None
+        if len(args) == 5:
+            try:
+                end = int(args[4])
+            except ValueError:
+                print(_USAGE, file=sys.stderr)
+                return 2
+        return _dispatch(
+            lambda path: _replay(path, args[2], start, end), args[1]
         )
     print(_USAGE, file=sys.stderr)
     return 2

@@ -26,6 +26,8 @@ __all__ = [
     "resume_snapshot_delta_metrics",
     "checkpoint_metrics",
     "resume_checkpoint_metrics",
+    "checkpoint_group_metrics",
+    "replay_metrics",
 ]
 
 
@@ -156,12 +158,14 @@ def parse_metrics(line):
 
 from .persistence import (  # noqa: E402
     append_metrics,
+    checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
     iter_metrics,
     prune_metrics,
     recover_metrics,
     release_metrics,
+    replay_metrics,
     resume_checkpoint_metrics,
     resume_metrics,
     resume_snapshot_delta_metrics,
