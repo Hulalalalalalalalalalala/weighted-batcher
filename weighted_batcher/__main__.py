@@ -21,6 +21,8 @@
     python3 -m weighted_batcher group-read FILE GROUP
     python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION
     python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]
+    python3 -m weighted_batcher batch-start FILE NAME PLAN_JSON
+    python3 -m weighted_batcher batch-draw FILE NAME COUNT
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import sys
 from . import (
     Sampler,
     advance_group_metrics,
+    append_metrics,
     checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
@@ -51,9 +54,10 @@ from . import (
     snapshot_diff_metrics,
     snapshot_metrics,
     takeover_group_metrics,
+    draw_batch_metrics,
+    start_batch_metrics,
 )
 
-from .persistence import _append_payload
 
 _USAGE = (
     "usage:\n"
@@ -77,7 +81,9 @@ _USAGE = (
     "  python3 -m weighted_batcher group-join FILE GROUP MEMBER LEASE_SECONDS\n"
     "  python3 -m weighted_batcher group-read FILE GROUP\n"
     "  python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION\n"
-    "  python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]"
+    "  python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]\n"
+    "  python3 -m weighted_batcher batch-start FILE NAME PLAN_JSON\n"
+    "  python3 -m weighted_batcher batch-draw FILE NAME COUNT"
 )
 
 
@@ -171,17 +177,12 @@ def _record_line(metrics):
 
 
 def _record(path, line):
-    # Append one metrics JSON object line.  The subcommand accepts any
-    # JSON object parse_metrics accepts -- values are not required to be
-    # numeric -- and stores the canonical compact rendering, so a record
-    # carrying string values appends exactly like a purely numeric one.
-    # Re-parsing the canonical form rejects non-finite floats (a 1e999
-    # style overflow) that json would otherwise emit as the invalid
-    # NaN/Infinity literals, so the log never gains an unreadable line.
-    metrics = parse_metrics(line)
-    payload = _record_line(metrics)
-    parse_metrics(payload)
-    _append_payload(path, payload.encode("utf-8"))
+    # Append one metrics JSON object line, with validation aligned with
+    # the append entry point (append_metrics): values must be ints or
+    # floats (booleans rejected), and the record is stored in its
+    # canonical compact rendering.  A non-numeric value raises TypeError,
+    # reported as a failure with status 1.
+    append_metrics(path, line)
     return 0
 
 
@@ -320,6 +321,35 @@ def _group_takeover(path, group, member, lease_seconds):
     return 0
 
 
+def _batch_start(path, name, plan_text):
+    # Open (or rejoin) the named batch from one JSON plan of the form
+    # {"weights": [...], "total": N, "seed": S}; seed is optional.  The
+    # entry point validates the plan's shape and every value; malformed
+    # JSON is reported as a ValueError and a bad value type as a
+    # TypeError, both failures with status 1 -- only argument counts and
+    # an unparseable integer COUNT are usage errors (handled in main()).
+    try:
+        plan = json.loads(plan_text)
+    except ValueError as exc:
+        # Report malformed JSON as a plain ValueError like the other
+        # parse failures rather than leaking the JSONDecodeError name.
+        raise ValueError(f"invalid batch plan: {exc}") from exc
+    start_batch_metrics(path, name, plan)
+    return 0
+
+
+def _batch_draw(path, name, count):
+    # Draw COUNT items and print this call's drawn indices as one JSON
+    # array; each drawn item is also appended to the log inside the entry
+    # point.  COUNT that does not parse as an integer is a usage error
+    # handled in main().
+    indices = draw_batch_metrics(path, name, count)
+    sys.stdout.write(
+        json.dumps(indices, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    return 0
+
+
 def _replay(path, cursor_path, start, end):
     # Stream the window one compact JSON object per line: metric records
     # and gap markers (a gap marker is not a metric, so items are
@@ -369,10 +399,13 @@ def _group_pairs(rest):
 
 
 def _dispatch(handler, path):
-    # rotate/stream failures are reported cleanly and end with status 1.
+    # Runtime failures (bad types or values discovered inside an entry
+    # point, OS errors) are reported cleanly and end with status 1; only
+    # argument counts and unparseable integer arguments are usage errors
+    # (status 2), handled by main() before this is reached.
     try:
         return handler(path)
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
@@ -577,6 +610,25 @@ def main(argv=None):
                 path, args[2], args[3], lease_seconds
             ),
             args[1],
+        )
+    if args and args[0] == "batch-start":
+        if len(args) != 4:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda path: _batch_start(path, args[2], args[3]), args[1]
+        )
+    if args and args[0] == "batch-draw":
+        if len(args) != 4:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            count = int(args[3])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda path: _batch_draw(path, args[2], count), args[1]
         )
     print(_USAGE, file=sys.stderr)
     return 2
