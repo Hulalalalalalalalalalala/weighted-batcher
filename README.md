@@ -26,6 +26,10 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher snapshot FILE
     python3 -m weighted_batcher release FILE HANDLE
     python3 -m weighted_batcher snap-resume FILE HANDLE [POSITION]
+    python3 -m weighted_batcher group-join FILE GROUP MEMBER LEASE_SECONDS
+    python3 -m weighted_batcher group-read FILE GROUP
+    python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION
+    python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -42,10 +46,19 @@ only a position past the total record count (pruned included) is out of
 range. `snapshot` pins the complete record sequence at creation time and
 prints a persistable handle; `snap-resume` streams the pinned sequence
 from `POSITION` (same ordinal rules as `resume`, default 0), and
-`release` retires the handle. `rotate`, `stream`, `compact`, `resume`,
+`release` retires the handle. `group-join` creates (or rejoins) consumer
+group `GROUP` and prints the lease's takeover token; `group-read`
+streams records from the group's current position; `group-advance`
+moves the group position to `POSITION` under the lease token;
+`group-takeover` takes over the group's expired lease (reusing its lease
+seconds unless `LEASE_SECONDS` is given) and prints the fresh token.
+`rotate`, `stream`, `compact`, `resume`,
 `prune`, `snapshot`, `release` and `snap-resume` exit 1 on
 failure; wrong argument counts and a `POSITION` or `QUOTA` that is not an
-integer print usage on stderr and exit 2.
+integer print usage on stderr and exit 2. The four group subcommands
+exit 0 on success and 1 on failure; wrong argument counts and a
+`POSITION` or `LEASE_SECONDS` that is not an integer print usage on
+stderr and exit 2.
 
 ## Public interface
 
@@ -165,6 +178,64 @@ integer print usage on stderr and exit 2.
   latter while iterating), `FileNotFoundError` when neither the log nor
   any segment exists, `IsADirectoryError` for a directory, and `OSError`
   for a non-string path.
+- `weighted_batcher.join_group_metrics(path, group, member, lease_seconds)`
+  joins consumer group `group` on the log at `path` and returns the
+  group's lease: a persistable mapping carrying the holder `member`, the
+  takeover `token`, the shared write-order read `position`, the
+  `lease_seconds` and the `expires_at` timestamp. The first join creates
+  the group file `path.group.<group>` at position 0; later joins return
+  the group's current lease, so every member apportions the same record
+  sequence and at any moment exactly one lease can advance the position.
+  The state is published atomically and serialised with advances and
+  takeovers by a lock anchored on `path.group.<group>.lock` — never on
+  the log — so concurrent joins, advances and takeovers neither clobber
+  one another nor lose updates, and same-process readers and writers
+  interleaved with them neither deadlock nor report spurious locking
+  failures. Old segment sets need no migration. Raises `TypeError` if
+  `group` or `member` is not a string or `lease_seconds` is not an
+  integer (booleans do not count), `ValueError` for a negative
+  `lease_seconds` or a corrupt group file, `IsADirectoryError` for a
+  directory, and `OSError` for a non-string path or a locking/write
+  failure.
+- `weighted_batcher.group_resume_metrics(path, group)` streams records
+  from the group's current position with exactly the ordinal rules of
+  `resume_metrics`: pruned records keep their ordinals, a position
+  inside the pruned region starts at the oldest surviving record, a
+  position equal to the record total (pruned records included) yields an
+  empty stream, and only a position past that total is out of range
+  (raised while iterating). Reading takes no lock. Raises
+  `FileNotFoundError` if the group file is missing (or neither the log
+  nor any segment exists), `ValueError` for a corrupt group file,
+  `TypeError` if `group` is not a string, `IsADirectoryError` for a
+  directory, and `OSError` for a non-string path.
+- `weighted_batcher.advance_group_metrics(path, group, token, position)`
+  moves the group's read position to `position` under the current
+  lease's takeover `token` (the lease mapping itself is accepted too).
+  The advance commits only when the token matches, the lease has not
+  expired and `position` moves the group forward: a forged or
+  superseded token, an expired lease, or a position another member
+  already committed raises `ValueError`. The new state is published
+  atomically, so a crash leaves either the old position or the new one.
+  A position past the record total is not rejected here;
+  `group_resume_metrics` reports it lazily while iterating. Raises
+  `TypeError` if `token` is not a string or `position` is not an
+  integer (booleans do not count), `ValueError` for a negative
+  `position` or a corrupt group file, `FileNotFoundError` if the group
+  file is missing, `IsADirectoryError` for a directory, and `OSError`
+  for a non-string path or a locking/write failure.
+- `weighted_batcher.takeover_group_metrics(path, group, member, lease_seconds=None)`
+  takes over the group's expired lease: the caller becomes the holder, a
+  fresh takeover token is issued (an advance under the old token now
+  raises `ValueError`), the group position is kept so apportioning
+  resumes without loss or duplication, and the new lease runs for
+  `lease_seconds` — the group's own lease seconds when omitted. A
+  takeover while the current lease is unexpired raises `ValueError`.
+  Returns the same lease mapping `join_group_metrics` returns. Raises
+  `TypeError` if `member` is not a string or `lease_seconds` is not an
+  integer (booleans do not count), `ValueError` for a negative
+  `lease_seconds` or a corrupt group file, `FileNotFoundError` if the
+  group file is missing, `IsADirectoryError` for a directory, and
+  `OSError` for a non-string path or a locking/write failure.
 
 ## Tests
 
