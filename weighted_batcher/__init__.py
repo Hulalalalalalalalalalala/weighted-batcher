@@ -32,6 +32,8 @@ __all__ = [
     "group_resume_metrics",
     "advance_group_metrics",
     "takeover_group_metrics",
+    "sample_batch_metrics",
+    "resume_batch_metrics",
 ]
 
 
@@ -181,4 +183,8 @@ from .persistence import (  # noqa: E402
     snapshot_diff_metrics,
     snapshot_metrics,
     takeover_group_metrics,
+)
+from .batching import (  # noqa: E402
+    resume_batch_metrics,
+    sample_batch_metrics,
 )

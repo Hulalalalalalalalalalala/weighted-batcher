@@ -30,6 +30,7 @@ import sys
 
 from . import (
     Sampler,
+    append_metrics,
     advance_group_metrics,
     checkpoint_group_metrics,
     checkpoint_metrics,
@@ -52,8 +53,6 @@ from . import (
     snapshot_metrics,
     takeover_group_metrics,
 )
-
-from .persistence import _append_payload
 
 _USAGE = (
     "usage:\n"
@@ -171,17 +170,12 @@ def _record_line(metrics):
 
 
 def _record(path, line):
-    # Append one metrics JSON object line.  The subcommand accepts any
-    # JSON object parse_metrics accepts -- values are not required to be
-    # numeric -- and stores the canonical compact rendering, so a record
-    # carrying string values appends exactly like a purely numeric one.
-    # Re-parsing the canonical form rejects non-finite floats (a 1e999
-    # style overflow) that json would otherwise emit as the invalid
-    # NaN/Infinity literals, so the log never gains an unreadable line.
-    metrics = parse_metrics(line)
-    payload = _record_line(metrics)
-    parse_metrics(payload)
-    _append_payload(path, payload.encode("utf-8"))
+    # Append one metrics JSON object line, with validation aligned with
+    # the append entry point (append_metrics): values must be ints or
+    # floats (booleans rejected), and the record is stored in its
+    # canonical compact rendering.  A non-numeric value raises TypeError,
+    # reported as a failure with status 1.
+    append_metrics(path, line)
     return 0
 
 
@@ -369,10 +363,13 @@ def _group_pairs(rest):
 
 
 def _dispatch(handler, path):
-    # rotate/stream failures are reported cleanly and end with status 1.
+    # Runtime failures (bad types or values discovered inside an entry
+    # point, OS errors) are reported cleanly and end with status 1; only
+    # argument counts and unparseable integer arguments are usage errors
+    # (status 2), handled by main() before this is reached.
     try:
         return handler(path)
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
