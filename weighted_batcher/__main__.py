@@ -17,6 +17,10 @@
     python3 -m weighted_batcher cursor-resume FILE CURSOR_FILE
     python3 -m weighted_batcher group-checkpoint FILE CURSOR_FILE POSITION [CURSOR_FILE POSITION ...]
     python3 -m weighted_batcher replay FILE CURSOR_FILE START [END]
+    python3 -m weighted_batcher group-join FILE GROUP MEMBER LEASE_SECONDS
+    python3 -m weighted_batcher group-read FILE GROUP
+    python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION
+    python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]
 """
 
 from __future__ import annotations
@@ -26,10 +30,13 @@ import sys
 
 from . import (
     Sampler,
+    advance_group_metrics,
     checkpoint_group_metrics,
     checkpoint_metrics,
     compact_metrics,
+    group_resume_metrics,
     iter_metrics,
+    join_group_metrics,
     parse_metrics,
     prune_metrics,
     recover_metrics,
@@ -43,6 +50,7 @@ from . import (
     rotate_metrics,
     snapshot_diff_metrics,
     snapshot_metrics,
+    takeover_group_metrics,
 )
 
 from .persistence import _append_payload
@@ -65,7 +73,11 @@ _USAGE = (
     "  python3 -m weighted_batcher checkpoint FILE HANDLE CURSOR_FILE [POSITION]\n"
     "  python3 -m weighted_batcher cursor-resume FILE CURSOR_FILE\n"
     "  python3 -m weighted_batcher group-checkpoint FILE CURSOR_FILE POSITION [CURSOR_FILE POSITION ...]\n"
-    "  python3 -m weighted_batcher replay FILE CURSOR_FILE START [END]"
+    "  python3 -m weighted_batcher replay FILE CURSOR_FILE START [END]\n"
+    "  python3 -m weighted_batcher group-join FILE GROUP MEMBER LEASE_SECONDS\n"
+    "  python3 -m weighted_batcher group-read FILE GROUP\n"
+    "  python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION\n"
+    "  python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]"
 )
 
 
@@ -270,6 +282,41 @@ def _group_checkpoint(path, cursor_paths, positions):
     # Advance the whole group of cursors in one atomic commit; positions
     # that do not parse as integers are usage errors handled in main().
     checkpoint_group_metrics(path, cursor_paths, positions)
+    return 0
+
+
+def _group_join(path, group, member, lease_seconds):
+    # Join (or create) the consumer group and print the lease's takeover
+    # token, the way snapshot prints its handle; a lease-seconds value
+    # that does not parse as an integer is a usage error in main().
+    lease = join_group_metrics(path, group, member, lease_seconds)
+    sys.stdout.write(lease["token"] + "\n")
+    return 0
+
+
+def _group_read(path, group):
+    # Stream records from the group's current position, one canonical
+    # JSON object per line.  Like stream/resume, records print through
+    # render_metrics, so a stored record whose value is not numeric (a
+    # string tag appended through record) is rejected with a TypeError,
+    # matching the append entry's validation.
+    for metrics in group_resume_metrics(path, group):
+        sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
+def _group_advance(path, group, token, position):
+    # Move the group's read position under the lease token; a position
+    # that does not parse as an integer is a usage error in main().
+    advance_group_metrics(path, group, token, position)
+    return 0
+
+
+def _group_takeover(path, group, member, lease_seconds):
+    # Take over the group's expired lease and print the fresh takeover
+    # token; an omitted lease-seconds reuses the group's own seconds.
+    lease = takeover_group_metrics(path, group, member, lease_seconds)
+    sys.stdout.write(lease["token"] + "\n")
     return 0
 
 
@@ -482,6 +529,54 @@ def main(argv=None):
                 return 2
         return _dispatch(
             lambda path: _replay(path, args[2], start, end), args[1]
+        )
+    if args and args[0] == "group-join":
+        if len(args) != 5:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            lease_seconds = int(args[4])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda path: _group_join(path, args[2], args[3], lease_seconds),
+            args[1],
+        )
+    if args and args[0] == "group-read":
+        if len(args) != 3:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda path: _group_read(path, args[2]), args[1])
+    if args and args[0] == "group-advance":
+        if len(args) != 5:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            position = int(args[4])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda path: _group_advance(path, args[2], args[3], position),
+            args[1],
+        )
+    if args and args[0] == "group-takeover":
+        if len(args) not in (4, 5):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        lease_seconds = None
+        if len(args) == 5:
+            try:
+                lease_seconds = int(args[4])
+            except ValueError:
+                print(_USAGE, file=sys.stderr)
+                return 2
+        return _dispatch(
+            lambda path: _group_takeover(
+                path, args[2], args[3], lease_seconds
+            ),
+            args[1],
         )
     print(_USAGE, file=sys.stderr)
     return 2

@@ -88,6 +88,23 @@ included) closes with a gap.  The live side is pinned the way
 compaction proceed concurrently and the read never holds the write lock
 while records are produced.
 
+:func:`join_group_metrics` creates a consumer group on first use -- or
+rejoins an existing one -- and hands back the group's lease, which
+carries the takeover token authorising :func:`advance_group_metrics` to
+move the group's shared write-order read position.  Members of one
+group apportion one record sequence: every member reads from the group
+position with :func:`group_resume_metrics`, and the first advance to
+commit wins, so a reader whose position was committed by someone else
+fails instead of double-consuming.  Once the lease lapses,
+:func:`takeover_group_metrics` issues a fresh token to another member --
+reusing the group's lease seconds -- and apportioning resumes from the
+group position without loss or duplication.  The group state lives in
+the caller-named group file (``path.group.<group>``), published
+atomically and serialised by a lock anchored on
+``path.group.<group>.lock`` -- never on the log -- so concurrent joins,
+advances and takeovers neither clobber one another nor block or
+deadlock same-process readers and writers.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -98,6 +115,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 
 from . import parse_metrics, render_metrics
 
@@ -123,6 +141,10 @@ __all__ = [
     "resume_checkpoint_metrics",
     "checkpoint_group_metrics",
     "replay_metrics",
+    "join_group_metrics",
+    "group_resume_metrics",
+    "advance_group_metrics",
+    "takeover_group_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -163,6 +185,18 @@ _CURSOR_TMP_SUFFIX = ".cursor.tmp."
 _GROUP_COMMIT_SUFFIX = ".groupcursor"
 _GROUP_LOCK_SUFFIX = ".groupcursor.lock"
 _GROUP_COMMIT_TMP_SUFFIX = ".groupcursor.tmp"
+# Consumer-group state.  ``path.group.<group>`` is the caller-named
+# group file: one atomically published JSON object binding the group's
+# shared write-order read position, the current lease holder, its
+# takeover token and the lease expiry.  ``path.group.<group>.lock``
+# anchors the inter-process lock that serialises joins, advances and
+# takeovers; it is never renamed or replaced, so a held lock stays
+# valid.  ``path.group.<group>.tmp`` is the staging name of the next
+# state publication.  All three are non-numeric sidecars, invisible to
+# ``_segment_numbers``.
+_GROUP_STATE_SUFFIX = ".group."
+_GROUP_STATE_LOCK_SUFFIX = ".lock"
+_GROUP_STATE_TMP_SUFFIX = ".tmp"
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -2451,3 +2485,437 @@ def replay_metrics(path, cursor_path, start, end=None):
             _close_pins(pins)
 
     return _generate()
+
+
+def _group_state_path(path, group):
+    """The group-state file path for consumer group ``group``."""
+    return path + _GROUP_STATE_SUFFIX + group
+
+
+def _group_state_lock(group_path):
+    """Take the exclusive group-state lock and return its descriptor.
+
+    The lock is anchored on ``group_path + ".lock"``, a dedicated file
+    that is never renamed or replaced, so the held lock stays valid for
+    the whole read-modify-write.  It is never the log and never the
+    group file itself, so a same-process append, rotation, compaction,
+    prune, snapshot, cursor checkpoint or group read interleaved with a
+    group mutation neither deadlocks nor reports a spurious locking
+    failure.  Returns ``None`` on platforms without :mod:`fcntl`.
+    """
+    if fcntl is None:
+        return None
+    fd = os.open(
+        group_path + _GROUP_STATE_LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o666
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _load_group_state(group_path):
+    """Read and structurally validate a group-state file.
+
+    The state is one JSON object binding the group name, the lease
+    holder's member name, the takeover token, the shared write-order
+    read position, the lease length and its expiry.  A missing file
+    propagates :class:`FileNotFoundError`; anything present but not
+    exactly such a document is a corrupt group file and raises
+    :class:`ValueError`.
+    """
+    fd = os.open(group_path, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"corrupt group file {group_path!r}: {exc}"
+        ) from exc
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"corrupt group file {group_path!r}: state must be a JSON object"
+        )
+    keys = (
+        "version", "group", "member", "token",
+        "position", "lease_seconds", "expires_at",
+    )
+    if set(state) != set(keys):
+        raise ValueError(
+            f"corrupt group file {group_path!r}: unexpected group fields"
+        )
+    if (
+        state["version"] != 1
+        or not isinstance(state["group"], str)
+        or not isinstance(state["member"], str)
+        or not isinstance(state["token"], str)
+    ):
+        raise ValueError(f"corrupt group file {group_path!r}: bad group state")
+    for key in ("position", "lease_seconds"):
+        # Booleans are not acceptable group numbers.
+        if isinstance(state[key], bool) or not isinstance(state[key], int):
+            raise ValueError(
+                f"corrupt group file {group_path!r}: {key} must be an integer"
+            )
+    if isinstance(state["expires_at"], bool) or not isinstance(
+        state["expires_at"], (int, float)
+    ):
+        raise ValueError(
+            f"corrupt group file {group_path!r}: expires_at must be a number"
+        )
+    if (
+        state["position"] < 0
+        or state["lease_seconds"] < 0
+        or state["expires_at"] < 0
+    ):
+        raise ValueError(
+            f"corrupt group file {group_path!r}: negative group value"
+        )
+    return state
+
+
+def _write_group_state(group_path, state):
+    """Atomically publish ``state`` as the group file and fsync it.
+
+    The replacement is staged at ``group_path + ".tmp"``, fsynced and
+    atomically renamed over the group file, so the file is never
+    observed half written and a crash leaves either the previous state
+    or this one, never a mixture.  Serialisation against other group
+    mutations is the caller's concern (the group-state lock).
+    """
+    payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
+    tmp = group_path + _GROUP_STATE_TMP_SUFFIX
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            _write_bytes(out, payload)
+            os.fsync(out)
+        finally:
+            # Closed before the rename: on Windows an open file cannot
+            # be renamed.
+            os.close(out)
+        os.replace(tmp, group_path)
+    except BaseException:
+        _unlink_if_exists(tmp)
+        raise
+
+
+def _group_lease(state):
+    """The public lease view of a group state.
+
+    The lease is a plain persistable mapping; its ``token`` is the
+    takeover token :func:`advance_group_metrics` requires.
+    """
+    return {
+        "group": state["group"],
+        "member": state["member"],
+        "token": state["token"],
+        "position": state["position"],
+        "lease_seconds": state["lease_seconds"],
+        "expires_at": state["expires_at"],
+    }
+
+
+def _check_group_name(group):
+    """Reject a non-string group name."""
+    if not isinstance(group, str):
+        raise TypeError(
+            f"group name must be a string, got {type(group).__name__}"
+        )
+
+
+def _check_member_name(member):
+    """Reject a non-string member name."""
+    if not isinstance(member, str):
+        raise TypeError(
+            f"member name must be a string, got {type(member).__name__}"
+        )
+
+
+def _check_lease_seconds(lease_seconds):
+    """Reject a non-integer or negative lease length."""
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+        raise TypeError(
+            f"lease seconds must be an integer, got "
+            f"{type(lease_seconds).__name__}"
+        )
+    if lease_seconds < 0:
+        raise ValueError("lease seconds must not be negative")
+
+
+def _lease_token(token):
+    """Extract the takeover token string, rejecting wrong types.
+
+    The lease mapping returned by :func:`join_group_metrics` and
+    :func:`takeover_group_metrics` is accepted whole exactly like the
+    bare token string it carries; anything else that is not a string is
+    a :class:`TypeError`.
+    """
+    if isinstance(token, dict) and isinstance(token.get("token"), str):
+        return token["token"]
+    if not isinstance(token, str):
+        raise TypeError(
+            f"group lease token must be a string, got {type(token).__name__}"
+        )
+    return token
+
+
+def join_group_metrics(path, group, member, lease_seconds):
+    """Join consumer group ``group`` and return its lease.
+
+    The group's state lives in the caller-named group file
+    ``path.group.<group>``.  The first join creates the group at
+    write-order read position 0 with the caller as lease holder; a later
+    join -- by any member -- returns the group's current lease, so every
+    member of the group apportions the same record sequence and at any
+    moment exactly one lease, and so one position, can be advanced.  The
+    returned lease is a plain mapping carrying the holder ``member``,
+    the takeover ``token`` that authorises
+    :func:`advance_group_metrics`, the shared ``position``, the
+    ``lease_seconds`` and the ``expires_at`` timestamp.
+
+    Creating the group publishes the whole state atomically (staged,
+    fsynced and renamed into place), so a crash leaves either no group
+    file or the published one.  Joins are serialised with advances and
+    takeovers by a lock anchored on ``path.group.<group>.lock`` -- never
+    on the log -- so concurrent joins neither clobber one another nor
+    lose a creation, and a same-process reader or writer interleaved
+    with a join neither deadlocks nor reports a spurious locking
+    failure.  Old segment sets need no migration: the group file simply
+    does not exist yet.  Joining is the one group operation that needs
+    no existing group file; it still requires a usable path.
+
+    Raises:
+        TypeError: ``group`` or ``member`` is not a string, or
+            ``lease_seconds`` is not an integer (booleans do not count).
+        ValueError: ``lease_seconds`` is negative, or the group file is
+            corrupt.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking or writing the
+            group file fails.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _check_group_name(group)
+    _check_member_name(member)
+    _check_lease_seconds(lease_seconds)
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    group_path = _group_state_path(path, group)
+    lock_fd = _group_state_lock(group_path)
+    try:
+        try:
+            state = _load_group_state(group_path)
+        except FileNotFoundError:
+            state = None
+        if state is None:
+            # Publishing the new state is the commit point of the join.
+            state = {
+                "version": 1,
+                "group": group,
+                "member": member,
+                "token": os.urandom(8).hex(),
+                "position": 0,
+                "lease_seconds": lease_seconds,
+                "expires_at": time.time() + lease_seconds,
+            }
+            _write_group_state(group_path, state)
+        return _group_lease(state)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def group_resume_metrics(path, group):
+    """Stream records onward from consumer group ``group``'s position.
+
+    The group's shared write-order read position is loaded from the
+    group file and the stream is exactly
+    :func:`resume_metrics` at that position: pruned records keep their
+    ordinals, a position inside the pruned region starts at the oldest
+    surviving record, a position equal to the record total (pruned
+    records included) yields an empty stream, and only a position past
+    that total is out of range -- reported while iterating.  Records
+    come back with the established recovery semantics, line by line,
+    without materialising the segment set, and reading takes no lock, so
+    a concurrent join, advance, takeover or upstream writer neither
+    blocks nor disturbs the stream.
+
+    Path- and group-file-level problems are reported when this function
+    is called; line content problems and an out-of-range position are
+    reported lazily while iterating.
+
+    Raises:
+        FileNotFoundError: the group file does not exist, or neither
+            ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+        TypeError: ``group`` is not a string.
+        ValueError: the group file is corrupt, the stored position is
+            past the record total (raised while iterating), or a
+            complete line is not a metrics JSON object (raised while
+            iterating).
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _check_group_name(group)
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    state = _load_group_state(_group_state_path(path, group))
+    return resume_metrics(path, state["position"])
+
+
+def advance_group_metrics(path, group, token, position):
+    """Advance consumer group ``group``'s read position under its lease.
+
+    ``token`` is the takeover token of the group's current lease (the
+    ``token`` of the mapping :func:`join_group_metrics` or
+    :func:`takeover_group_metrics` returned; the lease mapping itself is
+    accepted as well) and ``position`` is the new write-order read
+    position -- the number of records the group has consumed.  The
+    advance commits only when the token matches the current lease, the
+    lease has not expired and ``position`` moves the group strictly
+    forward: a forged or superseded token, an expired lease, or a
+    position another member already committed to or past raises
+    :class:`ValueError`, so one position is ever advanced at a time and
+    no record is consumed twice or skipped.
+
+    The new state is published atomically (staged, fsynced and renamed
+    into place) under the group-state lock, so a crash leaves either the
+    previous position or the advanced one, and concurrent advances and
+    takeovers are serialised without clobbering one another or losing an
+    update.  The lock is anchored on the group file's own lock file,
+    never on the log, so a same-process reader or writer interleaved
+    with an advance neither deadlocks nor reports a spurious locking
+    failure.  A position past the record total is not rejected here;
+    :func:`group_resume_metrics` reports it lazily while iterating,
+    exactly like :func:`resume_metrics`.
+
+    Raises:
+        FileNotFoundError: the group file does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        TypeError: ``group`` or ``token`` is not a string, or
+            ``position`` is not an integer (booleans do not count).
+        ValueError: ``position`` is negative, the group file is corrupt,
+            the token is forged or no longer current, the lease has
+            expired, or ``position`` does not move past the current
+            group position.
+        OSError: ``path`` is not a string, or locking or writing the
+            group file fails.  A failed write leaves the previously
+            published state untouched.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _check_group_name(group)
+    token = _lease_token(token)
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise TypeError(
+            f"read position must be an integer, got {type(position).__name__}"
+        )
+    if position < 0:
+        raise ValueError("read position must not be negative")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    group_path = _group_state_path(path, group)
+    lock_fd = _group_state_lock(group_path)
+    try:
+        state = _load_group_state(group_path)
+        if token != state["token"]:
+            raise ValueError(
+                f"forged or superseded lease token for group {group!r}"
+            )
+        if time.time() >= state["expires_at"]:
+            raise ValueError(f"lease of group {group!r} has expired")
+        if position <= state["position"]:
+            raise ValueError(
+                f"group position {position} does not move past the "
+                f"current group position {state['position']}"
+            )
+        state["position"] = position
+        # Publishing the new state is the commit point of the advance.
+        _write_group_state(group_path, state)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def takeover_group_metrics(path, group, member, lease_seconds=None):
+    """Take over consumer group ``group``'s expired lease.
+
+    Once the current lease has expired, any member may take the group
+    over: the caller becomes the lease holder, a fresh takeover token is
+    issued -- invalidating the previous one, so an advance under the old
+    token now raises :class:`ValueError` -- and the group position is
+    kept, so apportioning resumes exactly where the group stood without
+    loss or duplication.  The new lease runs for ``lease_seconds``;
+    when that is omitted the group's own lease seconds are reused.  A
+    takeover while the current lease is still unexpired raises
+    :class:`ValueError`.
+
+    The returned lease is the same plain mapping
+    :func:`join_group_metrics` returns.  The new state is published
+    atomically under the group-state lock, so a crash leaves either the
+    old lease or the new one, and concurrent takeovers, joins and
+    advances are serialised without clobbering one another or losing an
+    update.
+
+    Raises:
+        FileNotFoundError: the group file does not exist.
+        IsADirectoryError: ``path`` is a directory.
+        TypeError: ``group`` or ``member`` is not a string, or
+            ``lease_seconds`` is not an integer (booleans do not count).
+        ValueError: ``lease_seconds`` is negative, the group file is
+            corrupt, or the current lease has not expired.
+        OSError: ``path`` is not a string, or locking or writing the
+            group file fails.  A failed write leaves the previously
+            published state untouched.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _check_group_name(group)
+    _check_member_name(member)
+    if lease_seconds is not None:
+        _check_lease_seconds(lease_seconds)
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+    group_path = _group_state_path(path, group)
+    lock_fd = _group_state_lock(group_path)
+    try:
+        state = _load_group_state(group_path)
+        now = time.time()
+        if now < state["expires_at"]:
+            raise ValueError(
+                f"lease of group {group!r} held by member "
+                f"{state['member']!r} has not expired"
+            )
+        if lease_seconds is None:
+            # A takeover continues with the group's own lease seconds.
+            lease_seconds = state["lease_seconds"]
+        state = {
+            "version": 1,
+            "group": group,
+            "member": member,
+            "token": os.urandom(8).hex(),
+            "position": state["position"],
+            "lease_seconds": lease_seconds,
+            "expires_at": now + lease_seconds,
+        }
+        # Publishing the new state is the commit point of the takeover.
+        _write_group_state(group_path, state)
+        return _group_lease(state)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
