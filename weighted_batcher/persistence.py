@@ -138,6 +138,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 
@@ -171,6 +172,10 @@ __all__ = [
     "takeover_group_metrics",
     "audit_metrics",
     "verify_metrics",
+    "tx_begin_metrics",
+    "tx_commit_metrics",
+    "tx_rollback_metrics",
+    "tx_read_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -234,6 +239,33 @@ _GROUP_STATE_TMP_SUFFIX = ".tmp"
 # invisible to ``_segment_numbers``.
 _AUDIT_SUFFIX = ".audit"
 _AUDIT_TMP_SUFFIX = ".audit.tmp"
+# Cross-log transaction state.  Transaction identifiers are exact decimal
+# integers minted by a single process-wide coordinator; the coordinator
+# lives in one machine-local state directory (``tempfile.gettempdir()``
+# plus a fixed name, overridable through ``WEIGHTED_BATCHER_TX_DIR``) so
+# commit and rollback need nothing but the identifier.  Each transaction
+# owns one coordinator directory ``<coord>/<id>`` holding one atomically
+# published ``state.json``; its status moves prepared -> committed or
+# prepared -> rolled back exactly once.
+#
+# Per participating log ``path`` the transaction stages its whole batch
+# of rendered record lines at ``path.txstage.<id>`` before it is
+# committed; stage files are invisible to segment-number resolution.  A
+# commit swaps a complete whole live image -- the current live bytes
+# followed by the staged batch, staged at ``path.txpub.<id>`` -- over
+# the live log, so a lock-free reader observes either the old live log
+# or the whole new one, never a half-applied batch.  ``.txstage.tmp.*``
+# and ``.txpub.tmp.*`` are private staging names a crashed writer can
+# leave behind; the next write removes them transparently.
+_TX_COORD_ENV = "WEIGHTED_BATCHER_TX_DIR"
+_TX_COORD_DIRNAME = "weighted_batcher_tx"
+_TX_STATE_NAME = "state.json"
+_TX_STATE_TMP_NAME = "state.tmp"
+_TX_STAGE_SUFFIX = ".txstage."
+_TX_PUB_SUFFIX = ".txpub."
+_TX_STAGE_TMP_SUFFIX = ".txstage.tmp."
+_TX_PUB_TMP_SUFFIX = ".txpub.tmp."
+_TX_STATUSES = ("prepared", "committed", "rolledback")
 # Label of the live log inside a prune plan; numbered segments use their
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
@@ -832,14 +864,258 @@ def _finish_staged_compact(path):
     os.replace(staging, f"{path}.1")
 
 
-def _finish_pending(path):
-    """Settle any half-finished compaction, prune or snapshot before a mutation."""
+def _finish_pending(path, lock_fd=None):
+    """Settle any half-finished transaction, compaction, prune or snapshot.
+
+    Transaction residue is settled first: a prepared transaction a
+    crashed process left behind is rolled back, and a committed swap
+    interrupted mid-log is finished before anything else observes the
+    set.  Only then does a half-finished compaction, prune or snapshot
+    get cleaned up, so the ordering between transaction residue and an
+    unfinished compaction, trim or snapshot copy is fixed and
+    checkable -- a transaction never merges into a half-finished
+    compaction and a half-finished transaction never leaks into a
+    normal recovery read.
+
+    Returns the descriptor that locks the live log after settling;
+    ``None`` on a lock-less platform.
+    """
+    lock_fd = _finish_pending_transactions(path, lock_fd)
     _finish_staged_compact(path)
     _finish_staged_prune(path)
     _finish_snapshot_orphans(path)
     # A chain publication that crashed mid-way leaves only its staging
     # file; the next mutation removes it transparently.
     _unlink_if_exists(path + _AUDIT_TMP_SUFFIX)
+    return lock_fd
+
+
+def _lock_image_before_publish(image_path):
+    """Lock a whole image inode before it is renamed over the live log.
+
+    The lock is taken while the image still sits under its private
+    staging name and follows the inode across the upcoming rename, so
+    once that inode becomes the live log no other process can open and
+    lock it until the holder releases the returned fd.  This closes the
+    unlocked window a rename of a file locked under its old name would
+    leave.  Returns the guard fd (``None`` on a platform without
+    :mod:`fcntl`).
+    """
+    if fcntl is None:
+        return None
+    guard = os.open(image_path, os.O_RDWR)
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+    except OSError:
+        os.close(guard)
+        raise
+    # The guard outlives the rename and may be written through by an
+    # appender whose settle performed the swap (see _append_payload);
+    # force append mode so such a write lands at the end rather than at
+    # the descriptor's offset zero.
+    flags = fcntl.fcntl(guard, fcntl.F_GETFL)
+    fcntl.fcntl(guard, fcntl.F_SETFL, flags | os.O_APPEND)
+    return guard
+
+
+def _finish_pending_transactions(path, lock_fd=None):
+    """Finish or discard transaction sidecars a crashed writer left.
+
+    Called while the caller holds ``lock_fd`` on the live inode; the
+    lock a settled swap publishes is relayed through this function and
+    returned.  Each ``path.txstage.<id>``/``path.txpub.<id>`` pair is
+    reconciled against the coordinator status of ``<id>``:
+
+    * ``committed`` whose committer is still alive (its apply lock is
+      held) is left strictly alone: the live committer applies the
+      batch itself, and any append this process is settling landed
+      before the committer takes the lock is read into the committer's
+      whole image, so the batch and the append never diverge;
+    * ``committed`` whose committer is gone -- the kernel released the
+      apply lock with the dead process -- is a crashed commit and is
+      finished here, applying the batch to the live log exactly once;
+    * ``prepared`` batches are live and left untouched; ``rolledback``
+      or coordinator-less batches and their images are discarded.
+
+    Crashed commits waiting on one log are applied in identifier order.
+    Private staging temp names only ever hold a half-written file and
+    are always removed.  A corrupt coordinator entry is neither applied
+    nor discarded.
+    """
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return lock_fd
+    staged = {}
+    pubbed = {}
+    for name in names:
+        txid = _tx_sidecar_id(name, base + _TX_STAGE_SUFFIX)
+        if txid is not None:
+            staged[txid] = _tx_status(txid)
+        pubid = _tx_sidecar_id(name, base + _TX_PUB_SUFFIX)
+        if pubid is not None:
+            pubbed[pubid] = _tx_status(pubid)
+
+    for txid in sorted(staged, key=int):
+        stage = path + _TX_STAGE_SUFFIX + txid
+        pub = path + _TX_PUB_SUFFIX + txid
+        status = staged[txid]
+        if status == "committed":
+            if int(txid) in _TX_ACTIVE:
+                # This process is the live committer applying its own
+                # commit; it holds the apply lock already.
+                lock_fd = _tx_apply_committed(path, stage, pub, lock_fd)
+                continue
+            # On a platform without process locks there is no owner to
+            # track: recover the residue as the pre-lock code did.
+            owner = "unlocked" if fcntl is None else _tx_try_apply_lock(txid)
+            if owner is None:
+                # A live committer on another process still applies this
+                # batch; its residue must survive this settling pass.
+                continue
+            try:
+                lock_fd = _tx_apply_committed(path, stage, pub, lock_fd)
+            finally:
+                # The owner died mid-commit; release the recovery claim
+                # once its batch is whole.
+                if isinstance(owner, int):
+                    os.close(owner)
+        elif status == "prepared":
+            # A fully prepared transaction is still committable; its
+            # staging must survive ordinary mutations.  An unpublished
+            # image cannot exist in this state and is pure crash debris.
+            _unlink_if_exists(pub)
+        elif status == "rolledback" or status is None:
+            # The batch never reached commit (or was undone); drop both.
+            _unlink_if_exists(pub)
+            _unlink_if_exists(stage)
+        # A corrupt coordinator entry is left exactly as found.
+    for pubid in sorted(pubbed, key=int):
+        if pubid in staged:
+            continue
+        pub = path + _TX_PUB_SUFFIX + pubid
+        if pubbed[pubid] != "committed":
+            # Debris from a crashed prepare; the batch never committed.
+            _unlink_if_exists(pub)
+            continue
+        # Image without a stage.  A live committer will swap it itself;
+        # only a dead owner's image is recovered here.
+        if int(pubid) in _TX_ACTIVE:
+            continue
+        owner = "unlocked" if fcntl is None else _tx_try_apply_lock(pubid)
+        if owner is None:
+            continue
+        try:
+            if not os.path.exists(pub):
+                continue
+            guard = _lock_image_before_publish(pub)
+            try:
+                os.replace(pub, path)
+            finally:
+                if guard is not None:
+                    os.close(guard)
+        finally:
+            if isinstance(owner, int):
+                os.close(owner)
+    # Private staging names of crashed writers never name a whole file.
+    for name in names:
+        if name.startswith(base + _TX_STAGE_TMP_SUFFIX) or name.startswith(
+            base + _TX_PUB_TMP_SUFFIX
+        ):
+            _unlink_if_exists(os.path.join(directory, name))
+    return lock_fd
+
+
+
+def _tx_apply_committed(path, stage, pub, lock_fd):
+    """Apply one committed batch to ``path`` exactly once.
+
+    Returns the descriptor that locks the live log after the swap (the
+    lock is relayed onto the new inode).  A whole image already at
+    ``pub`` is locked and published; a live log already ending with the
+    staged bytes means the swap previously finished and only leftovers
+    are cleared; otherwise a whole image of the current live log
+    followed by the staged batch is built at a private temp, fsynced,
+    locked while still private and atomically renamed over the live
+    log.  The swap is the only point at which the set changes, so a
+    reader never sees part of the batch and a waiting writer never
+    locks the new live inode before the settlement finishes.
+    """
+    if os.path.exists(pub):
+        try:
+            guard = _lock_image_before_publish(pub)
+        except FileNotFoundError:
+            # Another settler published it first; fall through below.
+            guard = None
+        if guard is not None:
+            try:
+                held = os.fstat(guard)
+                current = os.stat(path)
+            except FileNotFoundError:
+                current = None
+            if current is not None and (
+                current.st_dev, current.st_ino
+            ) == (held.st_dev, held.st_ino):
+                # Another settler renamed this inode onto the live log
+                # while we waited for its lock; the guard now already
+                # locks the live log, so just relay it.
+                _unlink_if_exists(stage)
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                return guard
+            os.replace(pub, path)
+            _unlink_if_exists(stage)
+            if lock_fd is not None:
+                os.close(lock_fd)
+            return guard
+    payload = _read_whole(stage) if os.path.exists(stage) else b""
+    if not payload:
+        # An empty batch changes no record; only sidecars remain.
+        _unlink_if_exists(pub)
+        _unlink_if_exists(stage)
+        return lock_fd
+    if _file_ends_with(path, payload):
+        # The swap already happened; only the leftovers remain.
+        _unlink_if_exists(stage)
+        return lock_fd
+    # Build the whole new live image (old bytes + batch) at a private
+    # temp, fsync it, then lock the private inode BEFORE any rename: the
+    # lock follows the inode through both renames onto the live-log name
+    # and closes the unlocked window a rename of a separately locked
+    # file would otherwise leave.
+    tmp = path + _TX_PUB_TMP_SUFFIX + os.urandom(8).hex()
+    out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        if os.path.exists(path):
+            src = os.open(path, os.O_RDONLY)
+            try:
+                while True:
+                    chunk = os.read(src, _READ_CHUNK)
+                    if not chunk:
+                        break
+                    _write_bytes(out, chunk)
+            finally:
+                os.close(src)
+        _write_bytes(out, payload)
+        os.fsync(out)
+    finally:
+        os.close(out)
+    guard = _lock_image_before_publish(tmp)
+    try:
+        os.replace(tmp, pub)
+        os.replace(pub, path)
+    except BaseException:
+        if guard is not None:
+            os.close(guard)
+        _unlink_if_exists(tmp)
+        _unlink_if_exists(pub)
+        raise
+    _unlink_if_exists(stage)
+    if lock_fd is not None:
+        os.close(lock_fd)
+    return guard
 
 
 def rotate_metrics(path):
@@ -871,7 +1147,7 @@ def rotate_metrics(path):
 
     fd = _mutation_lock(path, create=False)
     try:
-        _finish_pending(path)
+        fd = _finish_pending(path, fd)
         fd = _relock_after_settle(fd, path, create=False)
         used = _segment_numbers(path)
         number = (max(used) + 1) if used else 1
@@ -906,7 +1182,7 @@ def _append_payload(path, payload):
     """
     fd = _mutation_lock(path, create=True)
     try:
-        _finish_pending(path)
+        fd = _finish_pending(path, fd)
         if fd is None:
             # Lock-less platform (Windows): the existence-proving handle is
             # already closed and settling ran first, so open a fresh
@@ -1005,7 +1281,7 @@ def compact_metrics(path):
         # A previous compaction may have staged its segment and died
         # before cleanup; settle that world before merging again.  So may
         # a previous prune.
-        _finish_pending(path)
+        fd = _finish_pending(path, fd)
         fd = _relock_after_settle(fd, path, create=False)
 
         staging = _staging_path(path)
@@ -1111,7 +1387,7 @@ def prune_metrics(path, quota):
 
     fd = _mutation_lock(path, create=False)
     try:
-        _finish_pending(path)
+        fd = _finish_pending(path, fd)
         fd = _relock_after_settle(fd, path, create=False)
 
         members = _segment_members(path)
@@ -1280,7 +1556,7 @@ def snapshot_metrics(path):
 
     fd = _mutation_lock(path, create=False)
     try:
-        _finish_pending(path)
+        fd = _finish_pending(path, fd)
         fd = _relock_after_settle(fd, path, create=False)
 
         registry = _read_snapshot_registry(path)
@@ -1351,7 +1627,7 @@ def release_metrics(path, handle):
 
     fd = _mutation_lock(path, create=False)
     try:
-        _finish_pending(path)
+        fd = _finish_pending(path, fd)
         registry = _read_snapshot_registry(path)
         if handle not in registry:
             raise ValueError(
@@ -1476,7 +1752,7 @@ def _capture_delta_members(path):
     lock_fd = _open_locked(path, create=False)
     captured = []
     try:
-        _finish_pending(path)
+        lock_fd = _finish_pending(path, lock_fd)
         lock_fd = _relock_after_settle(lock_fd, path, create=False)
         members = _segment_members(path)
         pruned = _read_prune_state(path)[0]
@@ -3257,7 +3533,7 @@ def audit_metrics(path):
 
     fd = _mutation_lock(path, create=False)
     try:
-        _finish_pending(path)
+        fd = _finish_pending(path, fd)
         fd = _relock_after_settle(fd, path, create=False)
         state = _sync_audit(path, strict=True)
         return {"count": state["count"], "checksum": state["checksum"]}
@@ -3371,3 +3647,743 @@ def verify_metrics(path):
             f"audit mismatch: no record matches write ordinal "
             f"{first_mismatch[2]} in the audit chain"
         )
+
+
+# ---------------------------------------------------------------------------
+# Cross-log atomic transactions
+# ---------------------------------------------------------------------------
+
+
+def _tx_coord_dir():
+    """The directory that carries the process-wide transaction coordinator.
+
+    Transaction identifiers alone address a transaction, so commit and
+    rollback need one machine-local place that maps an identifier to its
+    state.  It defaults to a fixed directory under the system temporary
+    directory and may be redirected with ``WEIGHTED_BATCHER_TX_DIR`` (a
+    test-only seam; production callers leave it unset).
+    """
+    override = os.environ.get(_TX_COORD_ENV)
+    if override:
+        return override
+    return os.path.join(tempfile.gettempdir(), _TX_COORD_DIRNAME)
+
+
+def _tx_dir(txid):
+    return os.path.join(_tx_coord_dir(), str(int(txid)))
+
+
+def _tx_state_path(txid):
+    return os.path.join(_tx_dir(txid), _TX_STATE_NAME)
+
+
+def _tx_apply_lock_path(txid):
+    """The lock naming the active applier of a committed transaction.
+
+    The committer holds it across every participating log; a crashed
+    committer releases it automatically with its process, so the next
+    writer can distinguish a still-running commit (wait for it) from a
+    crashed one (finish it).
+    """
+    return os.path.join(_tx_dir(txid), "apply.lock")
+
+
+# Transaction identifiers whose commit this very process is applying
+# right now: settling one of their logs applies the batch directly
+# instead of trying to re-lock the apply lock this process already
+# holds (a second flock from the same process would block).
+_TX_ACTIVE = set()
+
+
+def _tx_try_apply_lock(txid):
+    """Acquire a committed transaction's apply lock, non-blocking.
+
+    Returns the guard fd when this process now owns the application
+    (the previous owner was gone -- its process released the lock on
+    exit, so it crashed mid-commit and the batch remains to be
+    finished), or ``None`` while a live committer holds it.
+    """
+    if fcntl is None:
+        return None
+    guard = os.open(_tx_apply_lock_path(txid), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(guard)
+        return None
+    return guard
+
+
+def _tx_coord_lock_fd():
+    """Take the exclusive coordinator lock, creating the coordinator store.
+
+    The lock is anchored on one dedicated file that is never renamed, so
+    concurrent begins, commits and rollbacks serialise their identifier
+    minting and status transitions without clobbering one another.
+    """
+    directory = _tx_coord_dir()
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(os.path.join(directory, "lock"), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except (OSError, AttributeError):
+        # fcntl is None on non-POSIX platforms; locking is unavailable
+        # there exactly as for every other mutation.
+        if fcntl is not None:
+            os.close(fd)
+            raise
+    return fd
+
+
+def _tx_sidecar_id(name, prefix):
+    """Return the decimal transaction id encoded in a sidecar ``name``.
+
+    ``None`` when ``name`` is not such a sidecar or its id tail is not a
+    plain decimal integer, so a foreign or forged file name is never
+    mistaken for transaction state.
+    """
+    if not name.startswith(prefix):
+        return None
+    tail = name[len(prefix):]
+    if tail.isascii() and tail.isdigit():
+        return tail
+    return None
+
+
+def _read_whole(path):
+    """Read a whole sidecar file's bytes (the files are transaction-sized)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    return raw
+
+
+def _file_ends_with(path, suffix):
+    """Whether ``path`` exists and its final bytes are exactly ``suffix``."""
+    if not suffix or not os.path.exists(path):
+        return False
+    size = os.path.getsize(path)
+    if size < len(suffix):
+        return False
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.lseek(fd, size - len(suffix), os.SEEK_SET)
+        tail = b""
+        while len(tail) < len(suffix):
+            chunk = os.read(fd, len(suffix) - len(tail))
+            if not chunk:
+                break
+            tail += chunk
+    finally:
+        os.close(fd)
+    return tail == suffix
+
+
+def _tx_status(txid):
+    """The coordinator status of ``txid`` without full validation.
+
+    Returns ``"prepared"``/``"committed"``/``"rolledback"``, ``None``
+    when no transaction state exists (a forged identifier or one whose
+    process died before publishing state), and ``"corrupt"`` for state
+    present but unreadable -- such residue is never touched by crash
+    settling, so a damaged transaction cannot be silently applied or
+    discarded; the explicit entry points report it as :class:`ValueError`.
+    """
+    try:
+        fd = os.open(_tx_state_path(txid), os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    except (IsADirectoryError, NotADirectoryError):
+        return "corrupt"
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        state = json.loads(raw.decode("utf-8"))
+        status = state["status"]
+    except (ValueError, UnicodeDecodeError, KeyError, TypeError):
+        return "corrupt"
+    return status if status in _TX_STATUSES else "corrupt"
+
+
+def _load_tx_state(txid):
+    """Read and strictly validate a transaction's coordinator state.
+
+    A missing transaction is a forged identifier and raises
+    :class:`ValueError`; so does any structurally invalid state file.
+    """
+    state_path = _tx_state_path(txid)
+    try:
+        raw = _read_whole(state_path)
+    except FileNotFoundError:
+        raise ValueError(f"unknown transaction identifier: {txid}") from None
+    except (IsADirectoryError, NotADirectoryError) as exc:
+        raise ValueError(f"corrupt transaction state for {txid}: {exc}") from exc
+    try:
+        state = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"corrupt transaction state for {txid}: {exc}") from exc
+    if not isinstance(state, dict) or set(state) != {
+        "version", "id", "status", "logs"
+    }:
+        raise ValueError(f"corrupt transaction state for {txid}: bad fields")
+    if state["version"] != 1:
+        raise ValueError(f"corrupt transaction state for {txid}: bad version")
+    if isinstance(state["id"], bool) or not isinstance(state["id"], int):
+        raise ValueError(f"corrupt transaction state for {txid}: bad id")
+    if state["id"] != int(txid):
+        raise ValueError(
+            f"transaction state names a different identifier: {state['id']}"
+        )
+    if state["status"] not in _TX_STATUSES:
+        raise ValueError(f"corrupt transaction state for {txid}: bad status")
+    logs = state["logs"]
+    if not isinstance(logs, list) or not logs:
+        raise ValueError(f"corrupt transaction state for {txid}: bad log set")
+    entries = []
+    for entry in logs:
+        if not isinstance(entry, dict) or set(entry) != {"path", "base", "lines"}:
+            raise ValueError(f"corrupt transaction state for {txid}: bad log entry")
+        if not isinstance(entry["path"], str):
+            raise ValueError(f"corrupt transaction state for {txid}: bad log path")
+        if isinstance(entry["base"], bool) or not isinstance(entry["base"], int):
+            raise ValueError(f"corrupt transaction state for {txid}: bad ordinal")
+        if entry["base"] < 0:
+            raise ValueError(f"corrupt transaction state for {txid}: bad ordinal")
+        lines = entry["lines"]
+        if not isinstance(lines, list) or not all(
+            isinstance(line, str) for line in lines
+        ):
+            raise ValueError(f"corrupt transaction state for {txid}: bad records")
+        entries.append(
+            {"path": entry["path"], "base": entry["base"], "lines": list(lines)}
+        )
+    return {
+        "version": 1,
+        "id": state["id"],
+        "status": state["status"],
+        "logs": entries,
+    }
+
+
+def _write_tx_state(txid, state):
+    """Atomically publish a transaction state document and fsync it."""
+    directory = _tx_dir(txid)
+    tmp = os.path.join(directory, _TX_STATE_TMP_NAME)
+    out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        _write_bytes(out, (json.dumps(state, separators=(",", ":")) + "\n").encode())
+        os.fsync(out)
+    finally:
+        os.close(out)
+    os.replace(tmp, _tx_state_path(txid))
+
+
+def _mint_tx_id():
+    """Mint the next exact-decimal transaction identifier under the coord lock."""
+    lock_fd = _tx_coord_lock_fd()
+    try:
+        counter_path = os.path.join(_tx_coord_dir(), "counter")
+        try:
+            raw = _read_whole(counter_path)
+            next_id = int(raw.decode("ascii").strip() or "0") + 1
+        except FileNotFoundError:
+            next_id = 1
+        except (ValueError, UnicodeDecodeError):
+            raise ValueError("corrupt transaction counter") from None
+        tmp = counter_path + ".tmp"
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            _write_bytes(out, str(next_id).encode("ascii"))
+            os.fsync(out)
+        finally:
+            os.close(out)
+        os.replace(tmp, counter_path)
+        return next_id
+    finally:
+        os.close(lock_fd)
+
+
+def _render_tx_record(record):
+    """Validate one begin-time record and return its canonical line.
+
+    A mapping is rendered exactly as :func:`render_metrics` renders one;
+    a string is parsed and re-rendered the way :func:`append_metrics`
+    stores a line, so oversized counters stay exact integers, ``-0.0``
+    is preserved and keys keep their write order.
+    """
+    if isinstance(record, dict):
+        return render_metrics(record)
+    if isinstance(record, str):
+        return render_metrics(parse_metrics(record))
+    raise TypeError(
+        f"transaction record must be an object or a metrics line, got "
+        f"{type(record).__name__}"
+    )
+
+
+def _tx_count_members(path):
+    """Return ``(pruned, total_ordinal)`` for ``path`` after settling.
+
+    Called with the write lock held and pending work already settled;
+    the count walks exactly the records a recovery read yields, so the
+    ordinal stored for a prepared record is the write-order ordinal the
+    established read positions use.
+    """
+    pruned = _read_prune_state(path)[0]
+    count = 0
+    for member in _segment_members(path):
+        try:
+            for raw in _iter_raw_records(member):
+                count += 1
+        except FileNotFoundError:
+            # A rotation crashed after sealing and before recreating the
+            # live log: only the absent live member contributes nothing.
+            if member != path:
+                raise
+    return pruned, pruned + count
+
+
+def tx_begin_metrics(paths, records):
+    """Prepare one atomic write over several metric logs and return its id.
+
+    ``paths`` is a group of log paths and ``records`` the records staged
+    for each of them, in the same order (a mapping of path to records is
+    accepted too).  Every record is validated and rendered with the
+    established metrics-line rules before anything is staged, so a bad
+    record rejects the whole transaction with no sidecar left behind;
+    each log's whole batch is written to a private
+    ``path.txstage.<id>`` file that is invisible to every normal read.
+    The write ordinal stored for each record is the exact decimal
+    position it occupies from that log's write-order start at prepare
+    time (pruned records keep theirs), so the transaction carries its
+    participating log set and every record's ordinal as integers.
+    Publishing the coordinator state is the prepare point: until then a
+    crashed process leaves only unnamed debris the next write removes.
+
+    The returned integer is the persistable transaction identifier;
+    :func:`tx_commit_metrics` makes every participating log receive the
+    whole batch and :func:`tx_rollback_metrics` discards it.
+
+    Raises:
+        TypeError: a path is not a string, a record is neither an object
+            nor a string, or a path/record grouping is not iterable as
+            required.
+        ValueError: the group is empty or repeats a log, a record line
+            is not a metrics object, or the coordinator state is corrupt.
+        FileNotFoundError: a participating log is missing.
+        IsADirectoryError: a participating path is a directory.
+        OSError: locking or writing a staging file or the coordinator
+            state fails.  A failed prepare leaves no transaction behind.
+    """
+    if isinstance(paths, (str, bytes)):
+        raise TypeError("log paths must be a group of strings, not one path")
+    if isinstance(records, dict):
+        paths = list(records)
+        records = list(records.values())
+    try:
+        paths = list(paths)
+        records = [list(group) for group in records]
+    except TypeError as exc:
+        raise TypeError(f"paths and records must be iterables: {exc}") from exc
+    if not paths:
+        raise ValueError("a transaction needs at least one participating log")
+    if len(paths) != len(records):
+        raise ValueError(
+            f"log and record-group counts differ: {len(paths)} log(s) but "
+            f"{len(records)} record group(s)"
+        )
+    for path in paths:
+        if not isinstance(path, str):
+            raise OSError(
+                f"log path must be a string, got {type(path).__name__}"
+            )
+        if os.path.isdir(path):
+            raise IsADirectoryError(f"log path is a directory: {path!r}")
+    absolute = [os.path.abspath(path) for path in paths]
+    if len(set(absolute)) != len(absolute):
+        raise ValueError("a participating log may appear only once in a transaction")
+    # Render every record before any file is touched: validation failure
+    # must leave neither a coordinator entry nor a stage behind.
+    rendered = [[_render_tx_record(record) for record in group] for group in records]
+
+    txid = _mint_tx_id()
+    tx_directory = _tx_dir(txid)
+    os.makedirs(tx_directory, exist_ok=False)
+    staged = []
+    try:
+        # Deterministic order, by absolute path, also fixes the order the
+        # commit takes the per-log locks in.
+        order = sorted(range(len(paths)), key=lambda i: absolute[i])
+        entries = [None] * len(paths)
+        for i in order:
+            path = paths[i]
+            lines = rendered[i]
+            stage = path + _TX_STAGE_SUFFIX + str(txid)
+            fd = _mutation_lock(path, create=False)
+            tmp = None
+            try:
+                # A write-first entry settles residue exactly as an
+                # append would: a crashed committed transaction on this
+                # log is finished, a rolled-back one discarded, before
+                # the new batch is staged.
+                fd = _finish_pending(path, fd)
+                fd = _relock_after_settle(fd, path, create=False)
+                _pruned, base = _tx_count_members(path)
+                tmp = (
+                    path
+                    + _TX_STAGE_TMP_SUFFIX
+                    + str(txid)
+                    + "."
+                    + os.urandom(8).hex()
+                )
+                out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                try:
+                    _write_bytes(out, "".join(lines).encode("utf-8"))
+                    os.fsync(out)
+                finally:
+                    os.close(out)
+                os.replace(tmp, stage)
+                tmp = None
+                staged.append((path, stage))
+            finally:
+                if tmp is not None:
+                    _unlink_if_exists(tmp)
+                if fd is not None:
+                    os.close(fd)
+            entries[i] = {"path": absolute[i], "base": base, "lines": lines}
+        state = {
+            "version": 1,
+            "id": txid,
+            "status": "prepared",
+            "logs": entries,
+        }
+        _write_tx_state(txid, state)
+        return txid
+    except BaseException:
+        # The prepare never published: every stage is unnamed debris and
+        # the coordinator directory is removed, so no identifier dangles.
+        for path, stage in staged:
+            _unlink_if_exists(stage)
+        shutil.rmtree(tx_directory, ignore_errors=True)
+        raise
+
+
+def _tx_transition(txid, target):
+    """Flip a transaction's coordinator state to ``target`` under the coord lock.
+
+    Returns the loaded state of the transaction.  A forged identifier,
+    corrupt state, a second commit, a second rollback, or committing a
+    rolled-back transaction (and vice versa) raises :class:`ValueError`;
+    a non-integer identifier raises :class:`TypeError`.
+    """
+    lock_fd = _tx_coord_lock_fd()
+    try:
+        state = _load_tx_state(txid)
+        if state["status"] == target:
+            raise ValueError(
+                f"transaction {txid} is already {state['status']}"
+            )
+        if state["status"] != "prepared":
+            raise ValueError(
+                f"transaction {txid} is already {state['status']}; "
+                f"it cannot be {target}"
+            )
+        state["status"] = target
+        _write_tx_state(txid, state)
+        return state
+    finally:
+        os.close(lock_fd)
+
+
+def _tx_payload(entry):
+    return "".join(entry["lines"]).encode("utf-8")
+
+
+def tx_commit_metrics(txid):
+    """Commit prepared transaction ``txid`` across every participating log.
+
+    The coordinator status flip to ``committed`` is the single decision
+    point; afterwards each log receives its whole batch exactly once.
+    Per log the write lock is taken, the current live bytes followed by
+    the staged batch are built into one complete whole image at
+    ``path.txpub.<id>`` and that image is atomically swapped over the
+    live log, so a reader at any instant sees the log without the batch
+    or the log with the whole batch, never a half-written transaction.
+    The same identifier can never commit twice; committing an
+    already-committed or rolled-back identifier raises
+    :class:`ValueError`.
+
+    A crash after the decision leaves a determinate state: the next
+    write to a log finishes its swap (idempotently) or, until then,
+    readers see the complete pre-commit view; the batch never mixes in
+    record by record.
+
+    Raises:
+        TypeError: ``txid`` is not an integer (booleans do not count).
+        ValueError: ``txid`` is forged or corrupt, already committed or
+            rolled back, or a participating log's transaction state is
+            damaged so the batch cannot be applied whole.
+        FileNotFoundError: a participating log's directory is missing.
+        IsADirectoryError: a participating path is a directory.
+        OSError: locking or writing a participating log fails.
+    """
+    if isinstance(txid, bool) or not isinstance(txid, int):
+        raise TypeError(
+            f"transaction identifier must be an integer, got {type(txid).__name__}"
+        )
+    # Acquire the apply ownership BEFORE the decision is published:
+    # once the state says "committed", every foreign writer must be
+    # able to tell a still-running committer (lock held -- leave the
+    # batch to it) from a crashed one (lock free -- recover it).  The
+    # check and the status flip share the coordinator lock.
+    coord_fd = _tx_coord_lock_fd()
+    apply_guard = None
+    try:
+        state = _load_tx_state(txid)
+        if state["status"] != "prepared":
+            raise ValueError(
+                f"transaction {txid} is already {state['status']}"
+            )
+        if fcntl is not None:
+            apply_guard = os.open(
+                _tx_apply_lock_path(txid), os.O_RDWR | os.O_CREAT, 0o666
+            )
+            fcntl.flock(apply_guard, fcntl.LOCK_EX)
+        state["status"] = "committed"
+        _write_tx_state(txid, state)
+    finally:
+        os.close(coord_fd)
+    _TX_ACTIVE.add(txid)
+    try:
+        for entry in state["logs"]:
+            target = entry["path"]
+            stage = target + _TX_STAGE_SUFFIX + str(txid)
+            payload = _tx_payload(entry)
+            fd = _mutation_lock(target, create=False)
+            try:
+                if payload and not os.path.exists(stage):
+                    # The stage vanished outside the protocol.  When a
+                    # previous application already finished this log the
+                    # live tail proves it; otherwise rebuild the batch
+                    # from the coordinator's own copy so it applies whole.
+                    if not _file_ends_with(target, payload):
+                        tmp = (
+                            target
+                            + _TX_STAGE_TMP_SUFFIX
+                            + str(txid)
+                            + "."
+                            + os.urandom(8).hex()
+                        )
+                        out = os.open(
+                            tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666
+                        )
+                        try:
+                            _write_bytes(out, payload)
+                            os.fsync(out)
+                        finally:
+                            os.close(out)
+                        os.replace(tmp, stage)
+                # Settling applies this transaction -- recognised as our
+                # own via _TX_ACTIVE -- through the same whole-image swap
+                # crash recovery uses; the lock may move with the inode.
+                fd = _finish_pending(target, fd)
+                fd = _relock_after_settle(fd, target, create=False)
+                # Applied means the stage was consumed whole; a later
+                # committed batch may already follow it in the live log.
+                if os.path.exists(stage):
+                    raise ValueError(
+                        f"transaction {txid} did not apply whole to "
+                        f"{target!r}"
+                    )
+                _sync_audit_for_write(target)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+    finally:
+        _TX_ACTIVE.discard(txid)
+        if apply_guard is not None:
+            os.close(apply_guard)
+
+
+def tx_rollback_metrics(txid):
+    """Roll prepared transaction ``txid`` back; none of its records lands.
+
+    The coordinator status flip to ``rolledback`` is the single decision
+    point; afterwards every per-log stage and image is removed.  Staging
+    files never participate in normal reads, so before, during and after
+    the rollback no participating log shows a record of the batch.
+    Rolling back a committed transaction, or rolling back the same
+    identifier twice, raises :class:`ValueError`.  A crashed rollback
+    leaves only the removal to finish, which the next write or a retry
+    of the cleanup completes; a half-batch never joins recovery.
+
+    Raises:
+        TypeError: ``txid`` is not an integer (booleans do not count).
+        ValueError: ``txid`` is forged or corrupt, already committed or
+            already rolled back.
+        OSError: removing a staging file fails.
+    """
+    if isinstance(txid, bool) or not isinstance(txid, int):
+        raise TypeError(
+            f"transaction identifier must be an integer, got {type(txid).__name__}"
+        )
+    state = _tx_transition(txid, "rolledback")
+    for entry in state["logs"]:
+        target = entry["path"]
+        # The status decision already makes the batch uncommittable; the
+        # per-log files are this transaction's private sidecars, so their
+        # removal needs no log lock and cannot interleave any record.
+        # Private staging temps, if a crashed prepare left any, are swept
+        # by the next write's settling pass.
+        _unlink_if_exists(target + _TX_STAGE_SUFFIX + str(txid))
+        _unlink_if_exists(target + _TX_PUB_SUFFIX + str(txid))
+
+
+def tx_read_metrics(path, txid):
+    """Stream ``path``'s records from transaction ``txid``'s point of view.
+
+    The settled segment set is pinned for the read exactly the way an
+    incremental pull pins it (a brief lock to settle and capture the
+    members, then a lock-free walk), and the transaction's own prepared
+    batch is produced after it while the batch is not yet part of the
+    set:
+
+    * a prepared transaction always reads its own staged records after
+      the pinned set, so the reader sees the complete view even though
+      the batch is invisible to every normal read;
+    * a committed transaction whose swap has not yet been finished (a
+      crashed committer) likewise reads its batch -- the complete
+      post-commit view; once the swap has landed the batch is already in
+      the pinned set and is not produced twice;
+    * a rolled-back transaction reads the plain set; none of its batch
+      is ever produced.
+
+    A stage file is never itself a segment-set member, so a normal
+    recovery never produces a prepared batch; reading takes the write
+    lock only for the constant-sized capture and never blocks a
+    same-process writer or reports a spurious locking failure.
+
+    Raises:
+        TypeError: ``txid`` is not an integer (booleans do not count).
+        ValueError: ``txid`` is forged or corrupt, or ``path`` does not
+            belong to the transaction; a non-metrics line raises while
+            iterating.
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if isinstance(txid, bool) or not isinstance(txid, int):
+        raise TypeError(
+            f"transaction identifier must be an integer, got {type(txid).__name__}"
+        )
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    state = _load_tx_state(txid)
+    absolute = os.path.abspath(path)
+    own = next(
+        (entry for entry in state["logs"] if entry["path"] == absolute), None
+    )
+    if own is None:
+        raise ValueError(
+            f"log {path!r} does not participate in transaction {txid}"
+        )
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+    status = state["status"]
+    stage = path + _TX_STAGE_SUFFIX + str(txid)
+    # Capture the members and the stage's presence in ONE locked
+    # section: a commit replaces the live inode and removes the stage
+    # while holding this same lock, so the pinned member set and the
+    # "is the batch still outside the set" decision can never straddle
+    # that swap (which could otherwise miss or duplicate the batch).
+    pruned, pins, include_own = _tx_pin_read_view(path, status, stage)
+
+    def _generate():
+        try:
+            for descriptor, size, member in pins:
+                if descriptor is None:
+                    # Lock-less platform: members are read by path.
+                    records = _parse_file(member, member)
+                else:
+                    records = _parse_lined(
+                        _iter_fd_lines(descriptor, size), member
+                    )
+                for record in records:
+                    yield record
+            if include_own:
+                for line in own["lines"]:
+                    yield parse_metrics(line)
+        finally:
+            # Pinned descriptors -- the anonymous live copy included --
+            # die with the generator, whether it ran out or was closed.
+            _close_pins(pins)
+
+    return _generate()
+
+
+def _tx_pin_read_view(path, status, stage):
+    """Pin the settled member set and decide on the own batch atomically.
+
+    Returns ``(pruned, pins, include_own)``.  The live log is copied
+    under the write lock so the stage-existence test and the live bytes
+    describe one instant; numbered segments are pinned by descriptor as
+    usual.  ``include_own`` says the transaction's own batch still sits
+    outside the pinned set and must be produced after it.
+    """
+    if fcntl is None:
+        members, pruned = _resolve_members(path)
+        include = status == "prepared" or (
+            status == "committed" and os.path.exists(stage)
+        )
+        return pruned, [(None, None, member) for member in members], include
+    if not os.path.exists(path):
+        # A rotation crashed after sealing and before recreating the
+        # live log: only numbered members exist, none truncatable; pin
+        # them without the write lock the delta capture normally takes.
+        members, pruned = _resolve_members(path)
+        include = status == "prepared" or (
+            status == "committed" and os.path.exists(stage)
+        )
+        pins = []
+        for member in members:
+            descriptor = os.open(member, os.O_RDONLY)
+            pins.append((descriptor, os.fstat(descriptor).st_size, member))
+        return pruned, pins, include
+    lock_fd, pruned, captured = _capture_delta_members(path)
+    pins = []
+    try:
+        include = status == "prepared" or (
+            status == "committed" and os.path.exists(stage)
+        )
+        for descriptor, size, is_live, member in captured:
+            if is_live:
+                # Copy the live bytes while the lock is held: bounded to
+                # the instant the stage was tested, and immune to the
+                # in-place truncation a compaction or a later swap does.
+                descriptor = _anonymous_copy(
+                    descriptor, size, path, allow_short=False
+                )
+            pins.append((descriptor, size, member))
+    except BaseException:
+        _close_pins(pins)
+        os.close(lock_fd)
+        raise
+    os.close(lock_fd)
+    return pruned, pins, include

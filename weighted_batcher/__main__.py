@@ -23,6 +23,10 @@
     python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]
     python3 -m weighted_batcher audit FILE
     python3 -m weighted_batcher verify FILE
+    python3 -m weighted_batcher tx-begin FILE RECORDS_JSON [FILE RECORDS_JSON ...]
+    python3 -m weighted_batcher tx-commit TXID
+    python3 -m weighted_batcher tx-rollback TXID
+    python3 -m weighted_batcher tx-read FILE TXID
 """
 
 from __future__ import annotations
@@ -56,6 +60,10 @@ from . import (
     snapshot_metrics,
     takeover_group_metrics,
     verify_metrics,
+    tx_begin_metrics,
+    tx_commit_metrics,
+    tx_read_metrics,
+    tx_rollback_metrics,
 )
 
 _USAGE = (
@@ -82,7 +90,11 @@ _USAGE = (
     "  python3 -m weighted_batcher group-advance FILE GROUP TOKEN POSITION\n"
     "  python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]\n"
     "  python3 -m weighted_batcher audit FILE\n"
-    "  python3 -m weighted_batcher verify FILE"
+    "  python3 -m weighted_batcher verify FILE\n"
+    "  python3 -m weighted_batcher tx-begin FILE RECORDS_JSON [FILE RECORDS_JSON ...]\n"
+    "  python3 -m weighted_batcher tx-commit TXID\n"
+    "  python3 -m weighted_batcher tx-rollback TXID\n"
+    "  python3 -m weighted_batcher tx-read FILE TXID"
 )
 
 
@@ -333,6 +345,48 @@ def _verify(path):
     # Compare the segment set against the audit chain; a mismatch
     # raises ValueError, reported as a failure with status 1.
     verify_metrics(path)
+    return 0
+
+
+def _tx_begin(pairs):
+    # Prepare one transaction over FILE/RECORDS_JSON pairs; each
+    # RECORDS_JSON is a JSON array of the records staged for its file
+    # (an object or a metrics line per element).  The persistable
+    # transaction identifier prints as one exact decimal integer.
+    paths = [path for path, _group in pairs]
+    groups = []
+    for _path, raw in pairs:
+        try:
+            group = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"invalid records JSON: {exc}") from exc
+        if not isinstance(group, list):
+            raise ValueError("records argument must be a JSON array")
+        groups.append(group)
+    txid = tx_begin_metrics(paths, groups)
+    sys.stdout.write(str(txid) + "\n")
+    return 0
+
+
+def _tx_commit(txid):
+    # Commit across every participating log; the identifier alone
+    # addresses the transaction.
+    tx_commit_metrics(txid)
+    return 0
+
+
+def _tx_rollback(txid):
+    # Discard the prepared batch; the identifier alone addresses it.
+    tx_rollback_metrics(txid)
+    return 0
+
+
+def _tx_read(path, txid):
+    # Stream the transaction's view one canonical JSON object per line:
+    # the settled set plus the transaction's own prepared batch while it
+    # is not yet part of the set.
+    for metrics in tx_read_metrics(path, txid):
+        sys.stdout.write(render_metrics(metrics))
     return 0
 
 
@@ -607,6 +661,49 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(_verify, args[1])
+    if args and args[0] == "tx-begin":
+        # One or more FILE RECORDS_JSON pairs; an odd tail or no pair is
+        # a usage error.
+        rest = args[1:]
+        if len(rest) < 2 or len(rest) % 2 != 0:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda _path: _tx_begin(
+                [(rest[i], rest[i + 1]) for i in range(0, len(rest), 2)]
+            ),
+            rest[0],
+        )
+    if args and args[0] == "tx-commit":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            txid = int(args[1])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda _path: _tx_commit(txid), args[1])
+    if args and args[0] == "tx-rollback":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            txid = int(args[1])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda _path: _tx_rollback(txid), args[1])
+    if args and args[0] == "tx-read":
+        if len(args) != 3:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            txid = int(args[2])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda path: _tx_read(path, txid), args[1])
     print(_USAGE, file=sys.stderr)
     return 2
 
