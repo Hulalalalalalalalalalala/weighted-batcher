@@ -40,6 +40,7 @@ __all__ = [
     "tx_read_metrics",
     "tx_adjudicate_metrics",
     "tx_conflicts_metrics",
+    "tx_replay_metrics",
     "sample_batch_metrics",
     "resume_batch_metrics",
 ]
@@ -197,6 +198,7 @@ from .persistence import (  # noqa: E402
     tx_commit_metrics,
     tx_conflicts_metrics,
     tx_read_metrics,
+    tx_replay_metrics,
     tx_rollback_metrics,
     verify_metrics,
 )

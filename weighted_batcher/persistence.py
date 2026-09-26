@@ -179,6 +179,7 @@ __all__ = [
     "tx_read_metrics",
     "tx_adjudicate_metrics",
     "tx_conflicts_metrics",
+    "tx_replay_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -4837,3 +4838,196 @@ def tx_conflicts_metrics(path):
         for txid in txids
         if overlaps[txid]
     ]
+
+
+# Final transaction statuses as the replay report spells them; the
+# coordinator record's internal ``rolled_back`` is the only word that
+# changes shape.
+_TX_REPLAY_STATUS_WORDS = {
+    _TX_STATUS_PREPARED: "prepared",
+    _TX_STATUS_COMMITTED: "committed",
+    _TX_STATUS_REJECTED: "rejected",
+    _TX_STATUS_ROLLED_BACK: "rolled-back",
+}
+
+
+def _tx_replay_candidate(txid, absolute):
+    """Probe whether registry record ``txid`` joins a replay group.
+
+    Returns True only when the record parses and carries a well-formed
+    log set naming at least one replayed log; the validated read that
+    follows then reports any remaining corruption as
+    :class:`ValueError`.  Anything else -- a foreign transaction, a
+    document that does not decode, one naming no decidable log set --
+    is skipped: the coordinator registry is shared by every log group,
+    so a record that cannot be attributed to this group never fails its
+    replay, and a corrupt record a group sidecar still references has
+    already been reported while that log was settled.
+    """
+    try:
+        raw = _tx_read_json(_tx_record_path(txid), "transaction record")
+    except (FileNotFoundError, ValueError):
+        # Vanished between the directory listing and the read, or not
+        # decodable as one JSON document: either way the record names no
+        # log of the group.
+        return False
+    return (
+        isinstance(raw, dict)
+        and isinstance(raw.get("logs"), list)
+        and all(isinstance(one, str) for one in raw["logs"])
+        and any(log in absolute for log in raw["logs"])
+    )
+
+
+def _tx_replay_entries(absolute):
+    """Build the replay report lines for an already settled log group.
+
+    Every transaction whose coordinator record names at least one log of
+    the group contributes one line; a group with no transactions yields
+    nothing at all.  Transaction metadata is collected once -- the
+    report is ordered by ascending identifier and each ``rejected`` list
+    cross-references every conflicting transaction -- then produced one
+    line at a time; log records themselves are never materialised.
+    """
+    try:
+        names = os.listdir(_tx_registry_dir())
+    except FileNotFoundError:
+        names = []
+    txids = []
+    for name in names:
+        stem, dot, suffix = name.partition(".")
+        if dot and suffix == "json" and stem.isascii() and stem.isdigit():
+            txids.append(int(stem))
+    txids.sort()
+    # txid -> (status, {log: (start, count)}); ranges with no records
+    # carry no write serial and are dropped.
+    summaries = {}
+    for txid in txids:
+        if not _tx_replay_candidate(txid, absolute):
+            continue
+        record = _tx_read_coordinator(txid)
+        if record is None or record["s"] == _TX_STATUS_PREPARING:
+            # Gone between listing and read, or a begin still mid-flight
+            # (or dead before its terminal prepare status landed): not
+            # yet a transaction the replay reports.
+            continue
+        ranges = {}
+        for index, abspath in enumerate(record["logs"]):
+            count = len(record["records"][index])
+            if count:
+                ranges[abspath] = (record["serials"][index], count)
+        summaries[txid] = (record["s"], ranges)
+    # Two transactions conflict when their write-serial ranges overlap
+    # on a shared log -- the same ordering rule adjudication uses.  Only
+    # pairs involving a rejected transaction feed the report, so the
+    # cross-reference stays proportional to what is reported.
+    per_log = {}
+    for txid, (_status, ranges) in summaries.items():
+        for abspath, (start, count) in ranges.items():
+            per_log.setdefault(abspath, []).append(
+                (start, start + count, txid)
+            )
+    rejected = {txid: set() for txid in summaries}
+    for txid, (status, ranges) in summaries.items():
+        if status != _TX_STATUS_REJECTED:
+            continue
+        for abspath, (start, count) in ranges.items():
+            end = start + count
+            for other_start, other_end, other in per_log[abspath]:
+                if (
+                    other != txid
+                    and other_start < end
+                    and other_end > start
+                ):
+                    rejected[other].add(txid)
+    entries = []
+    for txid in sorted(summaries):
+        status, ranges = summaries[txid]
+        serials = sorted(
+            serial
+            for start, count in ranges.values()
+            for serial in range(start, start + count)
+        )
+        entries.append(
+            {
+                "id": txid,
+                "status": _TX_REPLAY_STATUS_WORDS[status],
+                "rejected": sorted(rejected[txid]),
+                "serials": serials,
+            }
+        )
+    return iter(entries)
+
+
+def tx_replay_metrics(logs):
+    """Replay one group of logs and report every transaction's final state.
+
+    ``logs`` is a sequence of log paths; the group is rebuilt and
+    reconciled as one deterministic serialised pass.  Each log is
+    guarded, locked and settled in lexicographic path order, one lock at
+    a time and never two held at once, in the established recovery order
+    -- unfinished compaction, prune, snapshot-copy and transaction
+    residue resolve first, so a crash that stopped before or after an
+    adjudication leaves its pre- or post-state, never half a state file
+    in the reconstruction.  Settling lands every committed batch whole
+    at its recorded write serial (an adjudicated winner's batch
+    included) and sweeps rejected and rolled-back residue, so those
+    batches never join the rebuilt logs; concurrent appends, commits,
+    adjudications, rollbacks and replays neither tear a record nor lose
+    an update, and same-process reads and writes interleaved with the
+    replay neither self-deadlock nor report spurious locking failures.
+
+    Returns an iterator producing one mapping per transaction known on
+    the group, ordered by ascending transaction identifier, with keys in
+    the fixed order ``id``, ``status``, ``rejected``, ``serials``:
+    the exact decimal integer identifier; the final status, one of
+    ``"committed"``, ``"prepared"``, ``"rejected"`` or ``"rolled-back"``;
+    the ascending identifiers of the conflicting transactions that were
+    adjudicated losers (empty when the transaction has no such
+    conflict); and the transaction's own write serials in ascending
+    order.  Every identifier and serial is an exact decimal integer,
+    never a float, however large.  A group with no transactions produces
+    no lines at all.
+
+    Raises:
+        TypeError: ``logs`` is not a sequence of paths.
+        ValueError: a transaction identifier is forged or foreign, or
+            the transaction state is corrupt.
+        FileNotFoundError: a log does not exist (neither the current
+            log nor any segment).
+        IsADirectoryError: a path is a directory.
+        OSError: a path is not a string, or locking or writing fails;
+            a failed replay leaves no half-written state behind.
+    """
+    if isinstance(logs, str) or not isinstance(logs, (list, tuple)):
+        raise TypeError(
+            f"logs must be a sequence of paths, got {type(logs).__name__}"
+        )
+    paths = list(logs)
+    for path in paths:
+        if not isinstance(path, str):
+            raise OSError(
+                f"log path must be a string, got {type(path).__name__}"
+            )
+    for path in paths:
+        if os.path.isdir(path):
+            raise IsADirectoryError(f"log path is a directory: {path!r}")
+    absolute = sorted({os.path.abspath(path) for path in paths})
+    for abspath in absolute:
+        if not os.path.exists(abspath) and not _segment_numbers(abspath):
+            raise FileNotFoundError(
+                f"metrics log does not exist: {abspath!r}"
+            )
+    # Every path is validated before any log is settled, so a failing
+    # replay never leaves a half-rebuilt group behind.
+    for abspath in absolute:
+        with _tx_log_guard(abspath):
+            fd = _tx_lock_existing_set(abspath)
+            try:
+                _finish_pending(abspath)
+                fd = _relock_after_settle(fd, abspath, create=True)
+                _sync_audit_for_write(abspath)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+    return _tx_replay_entries(frozenset(absolute))
