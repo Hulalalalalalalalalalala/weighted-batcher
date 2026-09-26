@@ -36,6 +36,8 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher tx-commit TRANSACTION_ID
     python3 -m weighted_batcher tx-rollback TRANSACTION_ID
     python3 -m weighted_batcher tx-read FILE TRANSACTION_ID
+    python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
+    python3 -m weighted_batcher tx-conflicts FILE
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -93,6 +95,22 @@ effect on only some logs, or commit after a rollback; those cases raise
 four subcommands print usage on stderr and exit 2 on a wrong argument
 count (or a transaction id that is not an integer), and otherwise exit 1
 on failure.
+
+`tx-adjudicate TRANSACTION_ID` decides one prepared transaction against
+the other undecided transactions whose write serial ranges overlap its
+own on a shared log: the smaller identifier wins first, and every
+conflicting later transaction loses and is rejected. The verdict prints
+as one JSON line carrying the outcome, the conflict count, the rejected
+identifiers and the transaction's write serials, all exact decimal
+integers. A won transaction stays committable with its write ordering
+fixed; a rejected one can no longer commit, and re-adjudicating it or
+any already-decided identifier fails with `ValueError` and exit 1.
+`tx-conflicts FILE` prints the undecided write-write conflicts on one
+log, one JSON object per line with the transaction identifier and the
+overlapping write serials as exact decimal integers. Both subcommands
+exit 0 on success and 1 on failure, and print usage on stderr and exit
+2 on a wrong argument count (or a transaction id that is not an
+integer).
 
 ## Public interface
 
@@ -364,6 +382,44 @@ on failure.
   `FileNotFoundError` if neither the log nor any segment exists,
   `IsADirectoryError` for a directory, and `OSError` for a non-string
   path.
+- `weighted_batcher.tx_adjudicate_metrics(txid) -> dict` adjudicates one
+  prepared transaction against the other undecided transactions whose
+  write serial ranges overlap its own on a shared log: adjudication
+  orders the conflicting transactions by ascending identifier, the
+  smaller identifier wins first, and every conflicting later transaction
+  loses and is rejected. The verdict is returned as a mapping with the
+  outcome (`"won"` or `"lost"`), the conflict count, the identifiers
+  this adjudication rejected and the transaction's write serial per
+  participating log, every count and serial an exact decimal integer,
+  never a float. A won transaction's status becomes `adjudicated` — its
+  write ordering is fixed and it stays committable like a prepared one,
+  a consistent read still seeing its whole batch in write order, never
+  interleaved and never half a batch; a lost transaction's status
+  becomes `rejected`, and committing it, adjudicating it again, or
+  adjudicating any already-decided identifier raises `ValueError`. Each
+  verdict is published atomically in the transaction's own coordinator
+  record, so a crash leaves each transaction either undecided or
+  decided, never half a verdict file, and a rejected transaction's
+  staged residue is swept log by log in canonical path order (locks
+  never held across logs) or settled transparently by the next write.
+  Concurrent adjudications and commits serialise on the per-transaction
+  coordinator locks in ascending identifier order, so they neither tear
+  records nor lose updates, and same-process readers interleaved with
+  them neither deadlock nor report spurious locking failures. Raises
+  `TypeError` if `txid` is not an integer (booleans do not count),
+  `ValueError` if it is negative, forged, or already decided,
+  `FileNotFoundError` if a participating log is missing,
+  `IsADirectoryError` for a directory, and `OSError` for a
+  locking/write failure.
+- `weighted_batcher.tx_conflicts_metrics(path) -> list` lists the
+  write-write conflicts among the undecided transactions staged on one
+  log: one mapping per conflicting transaction with its identifier and
+  the overlapping write serials in ascending order, the list ordered by
+  ascending identifier and every serial an exact decimal integer.
+  Reading is lock free and changes no state. Raises `OSError` for a
+  non-string path, `FileNotFoundError` when neither the log nor any
+  segment exists, `IsADirectoryError` for a directory, and `ValueError`
+  for corrupt transaction state.
 
 ## Tests
 
