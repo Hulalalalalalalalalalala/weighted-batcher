@@ -177,6 +177,8 @@ __all__ = [
     "tx_commit_metrics",
     "tx_rollback_metrics",
     "tx_read_metrics",
+    "tx_adjudicate_metrics",
+    "tx_conflicts_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -3451,6 +3453,12 @@ _TX_STATUS_PREPARING = "preparing"
 _TX_STATUS_PREPARED = "prepared"
 _TX_STATUS_COMMITTED = "committed"
 _TX_STATUS_ROLLED_BACK = "rolled_back"
+# A transaction that lost adjudication: decided, never committable.
+_TX_STATUS_REJECTED = "rejected"
+# Adjudication verdicts recorded in the coordinator record's optional
+# "a" field; the field's presence means the transaction was adjudicated.
+_TX_VERDICT_WINNER = "winner"
+_TX_VERDICT_REJECTED = "rejected"
 _TX_REGISTRY_DIRNAME = "weighted_batcher_tx"
 _TX_SIDECAR_SUFFIX = ".tx"
 _TX_SIDECAR_TMP_SUFFIX = ".tx.tmp"
@@ -3645,9 +3653,11 @@ def _tx_read_coordinator(txid):
         record = _tx_read_json(target, "transaction record")
     except FileNotFoundError:
         return None
-    if not isinstance(record, dict) or set(record) != {
-        "v", "id", "s", "logs", "records", "serials"
-    }:
+    if not isinstance(record, dict) or not (
+        {"v", "id", "s", "logs", "records", "serials"}
+        <= set(record)
+        <= {"v", "id", "s", "logs", "records", "serials", "a"}
+    ):
         raise ValueError(
             f"corrupt transaction record {target!r}: unexpected fields"
         )
@@ -3668,9 +3678,23 @@ def _tx_read_coordinator(txid):
         _TX_STATUS_PREPARED,
         _TX_STATUS_COMMITTED,
         _TX_STATUS_ROLLED_BACK,
+        _TX_STATUS_REJECTED,
     ):
         raise ValueError(
             f"corrupt transaction record {target!r}: bad status"
+        )
+    if "a" in record and record["a"] not in (
+        _TX_VERDICT_WINNER, _TX_VERDICT_REJECTED
+    ):
+        raise ValueError(
+            f"corrupt transaction record {target!r}: bad adjudication"
+        )
+    if (record["s"] == _TX_STATUS_REJECTED) != (
+        record.get("a") == _TX_VERDICT_REJECTED
+    ):
+        raise ValueError(
+            f"corrupt transaction record {target!r}: inconsistent "
+            f"adjudication"
         )
     logs, records, serials = record["logs"], record["records"], record["serials"]
     if (
@@ -3949,7 +3973,9 @@ def _tx_settle_log(path):
             index = record["logs"].index(abspath)
             committed.append((record["serials"][index], txid_text, record))
             continue
-        if record is not None and record["s"] == _TX_STATUS_ROLLED_BACK:
+        if record is not None and record["s"] in (
+            _TX_STATUS_ROLLED_BACK, _TX_STATUS_REJECTED
+        ):
             discard.append(txid_text)
             continue
         if record is not None and record["s"] == _TX_STATUS_PREPARED:
@@ -3967,7 +3993,9 @@ def _tx_settle_log(path):
             record = _tx_read_coordinator(txid)
             if record is None or record["s"] == _TX_STATUS_PREPARING:
                 discard.append(txid_text)
-            elif record["s"] == _TX_STATUS_ROLLED_BACK:
+            elif record["s"] in (
+                _TX_STATUS_ROLLED_BACK, _TX_STATUS_REJECTED
+            ):
                 discard.append(txid_text)
             elif record["s"] == _TX_STATUS_COMMITTED:
                 index = record["logs"].index(abspath)
@@ -4350,6 +4378,8 @@ def tx_commit_metrics(txid):
                 raise ValueError(f"transaction {txid} was already committed")
             if record["s"] == _TX_STATUS_ROLLED_BACK:
                 raise ValueError(f"transaction {txid} was already rolled back")
+            if record["s"] == _TX_STATUS_REJECTED:
+                raise ValueError(f"transaction {txid} was rejected")
             if record["s"] == _TX_STATUS_PREPARING:
                 # Still staging, or a begin that crashed.  Probe the
                 # prepare lock and re-read under it; a transaction that
@@ -4432,6 +4462,8 @@ def tx_rollback_metrics(txid):
                 raise ValueError(f"forged or finished transaction id: {txid}")
             if record["s"] == _TX_STATUS_COMMITTED:
                 raise ValueError(f"transaction {txid} was already committed")
+            if record["s"] == _TX_STATUS_REJECTED:
+                raise ValueError(f"transaction {txid} was rejected")
             if record["s"] == _TX_STATUS_PREPARING:
                 prep_fd = _tx_prepare_lock_try(txid)
                 if prep_fd is None or prep_fd is False:
@@ -4477,7 +4509,7 @@ def _tx_read_extra(path, candidate, record, sidecar):
         # Open transaction (a begin mid-flight included): its own view
         # contains its whole staged batch.
         return list(candidate)
-    if record["s"] == _TX_STATUS_ROLLED_BACK:
+    if record["s"] in (_TX_STATUS_ROLLED_BACK, _TX_STATUS_REJECTED):
         return []
     # Committed.  A missing sidecar entry means the finalise finished and
     # removed it; the ordinary walk already holds the whole batch.
@@ -4553,3 +4585,255 @@ def tx_read_metrics(path, txid):
             yield parse_metrics(line)
 
     return _generate()
+
+
+def _tx_log_range(record, abspath):
+    """``(start, count)`` write-serial range of one log's staged batch."""
+    index = _tx_log_index(record, abspath)
+    return record["serials"][index], len(record["records"][index])
+
+
+def _tx_ranges_overlap(a_start, a_count, b_start, b_count):
+    """True when two write-serial ranges share at least one serial."""
+    return max(a_start, b_start) < min(
+        a_start + a_count, b_start + b_count
+    )
+
+
+def _tx_peer_states(abspath, registry):
+    """Classify one log's sidecar peers for conflict adjudication.
+
+    Returns ``{txid: (state, start, count)}`` with ``state`` either
+    ``"undecided"`` (prepared and not yet adjudicated) or ``"winner"``
+    (adjudicated winner whose batch may still land).  Rejected,
+    rolled-back, already-committed and crash-residue entries are
+    omitted: only undecided transactions and standing winners bear on a
+    verdict, exactly the transactions a later adjudication must order
+    itself against.
+    """
+    peers = {}
+    for txid_text in registry:
+        txid = int(txid_text)
+        record = _tx_read_coordinator(txid)
+        if record is None or abspath not in record["logs"]:
+            # Crash residue of a dead begin, or an entry the next settle
+            # sweeps away; it carries no decidable range.
+            continue
+        start, count = _tx_log_range(record, abspath)
+        if record.get("a") == _TX_VERDICT_WINNER and record["s"] in (
+            _TX_STATUS_PREPARED, _TX_STATUS_COMMITTED
+        ):
+            peers[txid] = (_TX_VERDICT_WINNER, start, count)
+        elif "a" not in record and record["s"] == _TX_STATUS_PREPARED:
+            peers[txid] = ("undecided", start, count)
+    return peers
+
+
+def _tx_locked_sidecar(abspath):
+    """Read one log's transaction registry under its mutation lock.
+
+    The log is guarded, locked and settled first, so the registry comes
+    from a quiescent state with every half-finished compaction, prune,
+    snapshot or transaction resolved.  Only this one log's lock is held
+    at any moment -- callers never hold a second log's lock across it.
+    """
+    with _tx_log_guard(abspath):
+        fd = _tx_lock_existing_set(abspath)
+        try:
+            _finish_pending(abspath)
+            fd = _relock_after_settle(fd, abspath, create=True)
+            return _tx_read_sidecar(abspath)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def tx_adjudicate_metrics(txid):
+    """Adjudicate prepared transaction ``txid`` against its conflicts.
+
+    Two still-undecided transactions whose write-serial ranges overlap
+    on the same log are in write-write conflict.  Adjudication orders
+    conflicting transactions by ascending identifier -- the smaller
+    identifier wins first and the conflicting later one loses and is
+    rejected.  This call decides ``txid`` exactly once:
+
+    * it loses when a conflicting transaction already stands as a winner
+      or a conflicting transaction with a smaller identifier is still
+      undecided; the coordinator record is atomically published with
+      status ``rejected``, and committing it, rolling it back or
+      adjudicating it (or any already-decided identifier) again raises
+      :class:`ValueError`;
+    * otherwise it wins: the verdict is recorded and the transaction
+      stays prepared, so :func:`tx_commit_metrics` appends its batches
+      whole in write-serial order -- a consistent read sees every batch
+      complete and ordered by write serial, never interleaved and never
+      half a batch, exactly as for an unadjudicated commit.
+
+    The verdict is the single atomic coordinator-record publication, so
+    a crash mid-adjudication leaves either the pre- or the
+    post-adjudication state, never half an adjudication state file; a
+    rejected transaction's staged residue is swept transparently by the
+    next write on each log, in the same deterministic order as
+    compaction, prune and snapshot-copy residue.  Participating logs are
+    locked one at a time in lexicographic path order and no two log
+    locks are ever held at once, so overlapping adjudications and
+    commits cannot deadlock, tear a record or lose an update, and
+    same-process reads and writes interleaved with adjudication neither
+    self-deadlock nor report spurious locking failures.
+
+    Returns the verdict as a mapping ``{"txid": ..., "verdict": ...,
+    "conflicts": ..., "serials": [...]}``: the transaction identifier,
+    ``"winner"`` or ``"rejected"``, the number of conflicting
+    transactions found, and the transaction's own write serials in
+    ascending order -- every count and serial an exact decimal integer,
+    never a float.
+
+    Raises:
+        TypeError: ``txid`` is not an integer (booleans do not count).
+        ValueError: ``txid`` is negative, forged, still being prepared,
+            or already decided (committed, rolled back, rejected or
+            already adjudicated); or the transaction state is corrupt.
+        FileNotFoundError: the coordinator record or a participating
+            log is missing.
+        IsADirectoryError: a participating path is a directory.
+        OSError: locking or writing fails.
+    """
+    _tx_check_identifier(txid)
+    with _tx_coord_guard(txid):
+        lock_fd = _tx_coord_flock(txid)
+        try:
+            record = _tx_read_coordinator(txid)
+            if record is None:
+                raise ValueError(
+                    f"forged or finished transaction id: {txid}"
+                )
+            if "a" in record:
+                raise ValueError(
+                    f"transaction {txid} was already adjudicated"
+                )
+            if record["s"] == _TX_STATUS_COMMITTED:
+                raise ValueError(
+                    f"transaction {txid} was already committed"
+                )
+            if record["s"] == _TX_STATUS_ROLLED_BACK:
+                raise ValueError(
+                    f"transaction {txid} was already rolled back"
+                )
+            if record["s"] == _TX_STATUS_PREPARING:
+                # Still staging, or a begin that crashed.  Probe the
+                # prepare lock and re-read under it; only a finished
+                # preparation is adjudicable.
+                prep_fd = _tx_prepare_lock_try(txid)
+                if prep_fd is None or prep_fd is False:
+                    raise ValueError(
+                        f"transaction {txid} is still being prepared"
+                    )
+                try:
+                    refreshed = _tx_read_coordinator(txid)
+                finally:
+                    os.close(prep_fd)
+                if (
+                    refreshed is not None
+                    and refreshed["s"] == _TX_STATUS_PREPARED
+                    and "a" not in refreshed
+                ):
+                    record = refreshed
+                else:
+                    raise ValueError(
+                        f"transaction {txid} preparation never finished"
+                    )
+            conflicts = set()
+            loses = False
+            for abspath in record["logs"]:
+                registry = _tx_locked_sidecar(abspath)
+                own_start, own_count = _tx_log_range(record, abspath)
+                for other, (state, start, count) in _tx_peer_states(
+                    abspath, registry
+                ).items():
+                    if other == txid:
+                        continue
+                    if not _tx_ranges_overlap(
+                        own_start, own_count, start, count
+                    ):
+                        continue
+                    conflicts.add(other)
+                    if state == _TX_VERDICT_WINNER or other < txid:
+                        loses = True
+            verdict = (
+                _TX_VERDICT_REJECTED if loses else _TX_VERDICT_WINNER
+            )
+            record["a"] = verdict
+            if loses:
+                record["s"] = _TX_STATUS_REJECTED
+            # The single adjudication commit point: one atomic
+            # coordinator-record publication carries the whole verdict.
+            _tx_write_coordinator(record)
+            serials = []
+            for abspath in record["logs"]:
+                start, count = _tx_log_range(record, abspath)
+                serials.extend(range(start, start + count))
+            return {
+                "txid": txid,
+                "verdict": verdict,
+                "conflicts": len(conflicts),
+                "serials": sorted(serials),
+            }
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+
+def tx_conflicts_metrics(path):
+    """List the write-write conflicts of undecided transactions on one log.
+
+    Two still-undecided (prepared, not yet adjudicated) transactions
+    whose write-serial ranges overlap on this log are in write-write
+    conflict.  Returns one ``{"txid": ..., "serials": [...]}`` mapping
+    per undecided transaction that overlaps at least one other, ordered
+    by ascending transaction identifier; ``serials`` holds the
+    transaction's overlapping write serials in ascending order.  Every
+    identifier and serial is an exact decimal integer, never a float.
+
+    The log is locked, settled and read one at a time with no other
+    log's lock held, so listing never deadlocks against concurrent
+    adjudication or commit, and a corrupt registry or coordinator
+    record is reported rather than half read.
+
+    Raises:
+        FileNotFoundError: neither ``path`` nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string, or locking fails.
+        ValueError: the transaction registry or a coordinator record is
+            corrupt.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    abspath = os.path.abspath(path)
+    registry = _tx_locked_sidecar(abspath)
+    undecided = {
+        txid: (start, count)
+        for txid, (state, start, count) in _tx_peer_states(
+            abspath, registry
+        ).items()
+        if state == "undecided"
+    }
+    txids = sorted(undecided)
+    overlaps = {txid: set() for txid in txids}
+    for position, first in enumerate(txids):
+        first_start, first_count = undecided[first]
+        for second in txids[position + 1:]:
+            second_start, second_count = undecided[second]
+            low = max(first_start, second_start)
+            high = min(
+                first_start + first_count, second_start + second_count
+            )
+            for serial in range(low, high):
+                overlaps[first].add(serial)
+                overlaps[second].add(serial)
+    return [
+        {"txid": txid, "serials": sorted(overlaps[txid])}
+        for txid in txids
+        if overlaps[txid]
+    ]

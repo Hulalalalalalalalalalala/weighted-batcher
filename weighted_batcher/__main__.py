@@ -27,6 +27,8 @@
     python3 -m weighted_batcher tx-commit TRANSACTION_ID
     python3 -m weighted_batcher tx-rollback TRANSACTION_ID
     python3 -m weighted_batcher tx-read FILE TRANSACTION_ID
+    python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
+    python3 -m weighted_batcher tx-conflicts FILE
 """
 
 from __future__ import annotations
@@ -59,8 +61,10 @@ from . import (
     snapshot_diff_metrics,
     snapshot_metrics,
     takeover_group_metrics,
+    tx_adjudicate_metrics,
     tx_begin_metrics,
     tx_commit_metrics,
+    tx_conflicts_metrics,
     tx_read_metrics,
     tx_rollback_metrics,
     verify_metrics,
@@ -94,7 +98,9 @@ _USAGE = (
     "  python3 -m weighted_batcher tx-begin FILE RECORDS_JSON [FILE RECORDS_JSON ...]\n"
     "  python3 -m weighted_batcher tx-commit TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-rollback TRANSACTION_ID\n"
-    "  python3 -m weighted_batcher tx-read FILE TRANSACTION_ID"
+    "  python3 -m weighted_batcher tx-read FILE TRANSACTION_ID\n"
+    "  python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID\n"
+    "  python3 -m weighted_batcher tx-conflicts FILE"
 )
 
 
@@ -394,6 +400,24 @@ def _tx_read(path, txid):
     # view, streamed exactly like recover/stream.
     for metrics in tx_read_metrics(path, txid):
         sys.stdout.write(render_metrics(metrics))
+    return 0
+
+
+def _tx_adjudicate(txid):
+    # The identifier is already an integer (usage error otherwise); a
+    # forged, already-decided or already-adjudicated identifier raises
+    # ValueError.  The verdict prints as one JSON line whose counts and
+    # write serials are exact decimal integers.
+    result = tx_adjudicate_metrics(txid)
+    sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+    return 0
+
+
+def _tx_conflicts(path):
+    # One JSON line per conflicting undecided transaction: its identifier
+    # and its overlapping write serials, all exact decimal integers.
+    for entry in tx_conflicts_metrics(path):
+        sys.stdout.write(json.dumps(entry, separators=(",", ":")) + "\n")
     return 0
 
 
@@ -716,6 +740,21 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(lambda path: _tx_read(path, txid), args[1])
+    if args and args[0] == "tx-adjudicate":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            txid = int(args[1])
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda _path: _tx_adjudicate(txid), "")
+    if args and args[0] == "tx-conflicts":
+        if len(args) != 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(_tx_conflicts, args[1])
     print(_USAGE, file=sys.stderr)
     return 2
 

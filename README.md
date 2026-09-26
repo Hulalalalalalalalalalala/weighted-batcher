@@ -36,6 +36,8 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher tx-commit TRANSACTION_ID
     python3 -m weighted_batcher tx-rollback TRANSACTION_ID
     python3 -m weighted_batcher tx-read FILE TRANSACTION_ID
+    python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
+    python3 -m weighted_batcher tx-conflicts FILE
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -93,6 +95,25 @@ effect on only some logs, or commit after a rollback; those cases raise
 four subcommands print usage on stderr and exit 2 on a wrong argument
 count (or a transaction id that is not an integer), and otherwise exit 1
 on failure.
+
+`tx-conflicts FILE` lists the write-write conflicts among undecided
+transactions on one log — two still-undecided transactions whose
+write-serial ranges overlap on the log conflict — printing one JSON
+object per line, `{"txid":N,"serials":[...]}` with the transaction
+identifier and its overlapping write serials, all exact decimal
+integers, ordered by ascending identifier. `tx-adjudicate
+TRANSACTION_ID` decides a prepared transaction once: conflicting
+transactions are ordered by ascending identifier, the smaller identifier
+wins first and the conflicting later one loses; the verdict prints as
+one JSON line, `{"txid":N,"verdict":"winner"|"rejected","conflicts":M,"serials":[...]}`
+whose counts and serials are exact decimal integers. A rejected
+transaction's status becomes `rejected`; committing it, rolling it back,
+re-adjudicating it or adjudicating any already-decided identifier
+raises `ValueError` and exits 1. A winner stays prepared and commits
+normally, its batch landing whole in write-serial order. Both
+subcommands exit 0 on success and 1 on failure, and print usage on
+stderr and exit 2 on a wrong argument count (or a transaction id that
+is not an integer).
 
 ## Public interface
 
@@ -364,6 +385,39 @@ on failure.
   `FileNotFoundError` if neither the log nor any segment exists,
   `IsADirectoryError` for a directory, and `OSError` for a non-string
   path.
+- `weighted_batcher.tx_adjudicate_metrics(txid) -> dict` adjudicates the
+  prepared transaction `txid` against its write-write conflicts once:
+  two still-undecided transactions whose write-serial ranges overlap on
+  the same log conflict, conflicting transactions are ordered by
+  ascending identifier, the smaller identifier wins first and the
+  conflicting later one loses. A loser is atomically published with
+  status `rejected` — committing it, rolling it back or adjudicating it
+  again raises `ValueError`, as does adjudicating any already-decided
+  identifier — while a winner stays prepared and commits normally, its
+  batches landing whole in write-serial order. Returns the verdict
+  mapping `{"txid": ..., "verdict": "winner"|"rejected", "conflicts":
+  ..., "serials": [...]}` with the number of conflicting transactions
+  and the transaction's own write serials, every count and serial an
+  exact decimal integer. The verdict is one atomic coordinator-record
+  publication, so a crash leaves the pre- or post-adjudication state,
+  never half an adjudication state file, and a rejected transaction's
+  residue is swept by the next write on each log. Participating logs are
+  locked one at a time in lexicographic path order with never two log
+  locks held at once. Raises `TypeError` if `txid` is not an integer
+  (booleans do not count), `ValueError` if it is negative, forged,
+  still being prepared or already decided, `FileNotFoundError` if the
+  record or a participating log is missing, `IsADirectoryError` for a
+  directory, and `OSError` for a locking/write failure.
+- `weighted_batcher.tx_conflicts_metrics(path) -> list[dict]` lists the
+  write-write conflicts among undecided transactions on one log: one
+  `{"txid": ..., "serials": [...]}` mapping per undecided transaction
+  whose write-serial range overlaps another undecided transaction's,
+  ordered by ascending identifier, with the overlapping write serials in
+  ascending order — every identifier and serial an exact decimal
+  integer. Raises `FileNotFoundError` if neither the log nor any
+  segment exists, `IsADirectoryError` for a directory, `OSError` for a
+  non-string path or a locking failure, and `ValueError` for corrupt
+  transaction state.
 
 ## Tests
 
