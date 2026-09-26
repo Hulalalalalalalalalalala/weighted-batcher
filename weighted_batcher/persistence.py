@@ -135,10 +135,12 @@ longer raise ``PermissionError`` there.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 
 from . import parse_metrics, render_metrics
@@ -171,6 +173,10 @@ __all__ = [
     "takeover_group_metrics",
     "audit_metrics",
     "verify_metrics",
+    "tx_begin_metrics",
+    "tx_commit_metrics",
+    "tx_rollback_metrics",
+    "tx_read_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -238,7 +244,6 @@ _AUDIT_TMP_SUFFIX = ".audit.tmp"
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
 _LIVE_LABEL = -1
-
 
 def _segment_numbers(path):
     """Return the already-used segment numbers for ``path`` as a set.
@@ -833,10 +838,16 @@ def _finish_staged_compact(path):
 
 
 def _finish_pending(path):
-    """Settle any half-finished compaction, prune or snapshot before a mutation."""
+    """Settle any half-finished compaction, prune, snapshot or transaction."""
     _finish_staged_compact(path)
     _finish_staged_prune(path)
     _finish_snapshot_orphans(path)
+    # After the log's own staged mutations are settled and before the
+    # audit chain is caught up, resolve transaction residue: a committed
+    # transaction a crash left unfinished joins its batch whole here, and
+    # a rolled-back or never-published preparation is swept away, so a
+    # half-finished transaction never mixes into a settled read.
+    _tx_settle_log(path)
     # A chain publication that crashed mid-way leaves only its staging
     # file; the next mutation removes it transparently.
     _unlink_if_exists(path + _AUDIT_TMP_SUFFIX)
@@ -3371,3 +3382,1174 @@ def verify_metrics(path):
             f"audit mismatch: no record matches write ordinal "
             f"{first_mismatch[2]} in the audit chain"
         )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Cross-log atomic transactions
+#
+# Four entry points only: :func:`tx_begin_metrics`,
+# :func:`tx_commit_metrics`, :func:`tx_rollback_metrics` and
+# :func:`tx_read_metrics`.  A transaction appends one batch of metric
+# records to each of several independent logs so that commit makes every
+# participating log gain its whole batch and rollback makes none gain
+# anything.  Old segment sets need no migration and keep their format;
+# all transaction state lives in new sidecars that the numeric-segment
+# walk and every established read ignore.
+#
+# The transaction identifier is an exact decimal integer.  Its
+# coordinator record is one JSON document in a process-shared registry
+# directory under the system temporary directory
+# (``<tmp>/weighted_batcher_tx/<id>.json``) binding the id, its status,
+# the participating logs (absolute paths in canonical order), one list
+# of canonical record lines per log and that log's exact decimal write
+# serial.  ``<id>.lock`` is a never-renamed flock anchor serialising
+# commit and rollback across processes.
+#
+# Each participating log carries two private non-numeric sidecars:
+# ``path.tx`` is a JSON registry of transactions currently prepared
+# against the log (id -> rendered lines), and ``path.txstage.<id>``
+# holds the exact bytes -- every canonical line with its own newline --
+# that commit appends as a single whole write.
+#
+# The phase order is the crash-consistent one:
+#
+# * prepare: the begin first publishes a ``preparing`` coordinator record
+#   and holds a ``<id>.preplock`` flock for the whole staging window; each
+#   log is then locked in canonical order, one at a time, its
+#   half-finished compaction/prune/snapshot is settled, its batch is
+#   staged byte for byte, fsynced and atomically renamed, and a prepared
+#   sidecar entry is atomically published.  Publishing the terminal
+#   ``prepared`` status before releasing the flock -- plus a settler's
+#   lock-first re-read of the record -- is what lets a concurrent write
+#   tell a still-staging begin (retain) from a crashed one (sweep)
+#   without a time-of-check race.  No live-log byte changes, so an open
+#   transaction neither blocks nor disturbs ordinary appends, rotations,
+#   compactions or prunes.
+# * commit: every participating log is locked in canonical order and
+#   settled, and each log's exact write serial (its settled record
+#   total, pruned records included) is read under its lock; only then is
+#   the coordinator record atomically flipped to ``committed`` with the
+#   serials -- the single commit point.  Each log then appends its staged
+#   bytes in one whole write (every line newline terminated), fsyncs, and
+#   removes the stage file and sidecar entry, still under lock.  A crash
+#   in the append leaves a torn prefix no read acknowledges; the next
+#   write truncates back to the recorded serial boundary and rewrites the
+#   batch whole.
+# * rollback: the coordinator record is flipped to ``rolled_back``; each
+#   log discards residue, removes staging and sidecar entry.  Nothing
+#   readable existed before the commit point.
+#
+# Transaction residue is settled from :func:`_finish_pending` after an
+# unfinished compaction or prune and before the audit chain catches up,
+# giving it one fixed, checkable place in the recovery order.
+# ---------------------------------------------------------------------------
+
+_TX_VERSION = 1
+_TX_STATUS_PREPARING = "preparing"
+_TX_STATUS_PREPARED = "prepared"
+_TX_STATUS_COMMITTED = "committed"
+_TX_STATUS_ROLLED_BACK = "rolled_back"
+_TX_REGISTRY_DIRNAME = "weighted_batcher_tx"
+_TX_SIDECAR_SUFFIX = ".tx"
+_TX_SIDECAR_TMP_SUFFIX = ".tx.tmp"
+_TX_STAGE_SUFFIX = ".txstage."
+_TX_STAGE_TMP_SUFFIX = ".txstage.tmp."
+# Suffix of the flock a live begin holds while it stages every log, so a
+# settle racing that window can tell an in-flight begin from a crashed
+# one: the lock is tried non-blocking and a busy lock retains the entry.
+_TX_PREP_LOCK_SUFFIX = ".preplock"
+
+# fcntl flock is per open file description: even inside one process a
+# second open of a locked inode is denied while another thread holds it.
+# These reentrant per-key guards order same-process threads before the
+# flock is touched, so read/write interleaving neither self-deadlocks
+# nor reports a spurious locking failure.
+_tx_guard_table_lock = threading.Lock()
+_tx_path_guards = {}
+_tx_path_guard_refs = {}
+_tx_coord_guards = {}
+_tx_coord_guard_refs = {}
+
+
+class _TxGuard:
+    """Reentrant in-process mutual exclusion keyed by one string."""
+
+    def __init__(self, table, refs, key):
+        self._table = table
+        self._refs = refs
+        self._key = key
+        with _tx_guard_table_lock:
+            guard = table.get(key)
+            if guard is None:
+                guard = threading.RLock()
+                table[key] = guard
+                refs[key] = 0
+            self._guard = guard
+            refs[key] += 1
+
+    def __enter__(self):
+        self._guard.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._guard.release()
+        with _tx_guard_table_lock:
+            self._refs[self._key] -= 1
+            if self._refs[self._key] == 0:
+                del self._table[self._key]
+                del self._refs[self._key]
+        return False
+
+
+def _tx_log_guard(path):
+    return _TxGuard(_tx_path_guards, _tx_path_guard_refs, os.path.abspath(path))
+
+
+def _tx_coord_guard(txid):
+    return _TxGuard(
+        _tx_coord_guards, _tx_coord_guard_refs, _tx_lock_path(txid)
+    )
+
+
+def _tx_registry_dir():
+    return os.path.join(tempfile.gettempdir(), _TX_REGISTRY_DIRNAME)
+
+
+def _tx_record_path(txid):
+    return os.path.join(_tx_registry_dir(), f"{txid}.json")
+
+
+def _tx_lock_path(txid):
+    return os.path.join(_tx_registry_dir(), f"{txid}.lock")
+
+
+def _tx_prep_lock_path(txid):
+    return os.path.join(_tx_registry_dir(), f"{txid}{_TX_PREP_LOCK_SUFFIX}")
+
+
+def _tx_stage_path(path, txid):
+    return f"{path}{_TX_STAGE_SUFFIX}{txid}"
+
+
+def _tx_sidecar_path(path):
+    return path + _TX_SIDECAR_SUFFIX
+
+
+def _tx_check_identifier(txid):
+    """Validate the public type of a transaction identifier.
+
+    Booleans do not count as integers (:class:`TypeError`); a negative
+    identifier cannot name an issued transaction (:class:`ValueError`).
+    """
+    if isinstance(txid, bool) or not isinstance(txid, int):
+        raise TypeError(
+            f"transaction id must be an integer, got {type(txid).__name__}"
+        )
+    if txid < 0:
+        raise ValueError(f"forged transaction id: {txid}")
+
+
+def _tx_publish_json(tmp, target, payload):
+    """Stage ``payload``, fsync it and atomically rename it into place."""
+    try:
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            _write_bytes(out, payload)
+            os.fsync(out)
+        finally:
+            os.close(out)
+        os.replace(tmp, target)
+    except BaseException:
+        _unlink_if_exists(tmp)
+        raise
+
+
+def _tx_read_json(path, what):
+    """Read and decode a JSON transaction document at ``path``."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"corrupt {what} {path!r}: {exc}") from exc
+
+
+def _tx_entry_lines_valid(entry):
+    """Validate one sidecar entry: an object holding a list of strings."""
+    if not isinstance(entry, dict) or set(entry) != {"r"}:
+        return False
+    lines = entry["r"]
+    return isinstance(lines, list) and all(isinstance(line, str) for line in lines)
+
+
+def _tx_read_sidecar(path):
+    """Read the per-log transaction registry; a missing one is empty.
+
+    Anything present but not one JSON object mapping decimal transaction
+    ids to ``{"r": [lines]}`` entries is corrupt state and raises
+    :class:`ValueError`.
+    """
+    target = _tx_sidecar_path(path)
+    try:
+        registry = _tx_read_json(target, "transaction registry")
+    except FileNotFoundError:
+        return {}
+    if not isinstance(registry, dict):
+        raise ValueError(
+            f"corrupt transaction registry {target!r}: state must be a "
+            f"JSON object"
+        )
+    for txid_text, entry in registry.items():
+        if not (txid_text.isascii() and txid_text.isdigit()):
+            raise ValueError(
+                f"corrupt transaction registry {target!r}: bad transaction id"
+            )
+        if not _tx_entry_lines_valid(entry):
+            raise ValueError(
+                f"corrupt transaction registry {target!r}: bad entry for "
+                f"transaction {txid_text}"
+            )
+    return registry
+
+
+def _tx_write_sidecar(path, registry):
+    """Atomically publish the per-log registry; an empty one is removed."""
+    if not registry:
+        _unlink_if_exists(path + _TX_SIDECAR_TMP_SUFFIX)
+        _unlink_if_exists(_tx_sidecar_path(path))
+        return
+    payload = json.dumps(registry, separators=(",", ":")).encode("utf-8")
+    _tx_publish_json(
+        path + _TX_SIDECAR_TMP_SUFFIX, _tx_sidecar_path(path), payload
+    )
+
+
+def _tx_read_coordinator(txid):
+    """Read a coordinator record; ``None`` when no record exists.
+
+    Any present document that is not exactly one well-formed coordinator
+    record is corrupt transaction state and raises :class:`ValueError`.
+    """
+    target = _tx_record_path(txid)
+    try:
+        record = _tx_read_json(target, "transaction record")
+    except FileNotFoundError:
+        return None
+    if not isinstance(record, dict) or set(record) != {
+        "v", "id", "s", "logs", "records", "serials"
+    }:
+        raise ValueError(
+            f"corrupt transaction record {target!r}: unexpected fields"
+        )
+    if record["v"] != _TX_VERSION:
+        raise ValueError(
+            f"corrupt transaction record {target!r}: bad version"
+        )
+    if (
+        isinstance(record["id"], bool)
+        or not isinstance(record["id"], int)
+        or record["id"] != txid
+    ):
+        raise ValueError(
+            f"corrupt transaction record {target!r}: id mismatch"
+        )
+    if record["s"] not in (
+        _TX_STATUS_PREPARING,
+        _TX_STATUS_PREPARED,
+        _TX_STATUS_COMMITTED,
+        _TX_STATUS_ROLLED_BACK,
+    ):
+        raise ValueError(
+            f"corrupt transaction record {target!r}: bad status"
+        )
+    logs, records, serials = record["logs"], record["records"], record["serials"]
+    if (
+        not isinstance(logs, list)
+        or not all(isinstance(one, str) for one in logs)
+        or not isinstance(records, list)
+        or len(records) != len(logs)
+        or not isinstance(serials, list)
+        or len(serials) != len(logs)
+    ):
+        raise ValueError(
+            f"corrupt transaction record {target!r}: bad log set"
+        )
+    for lines, serial in zip(records, serials):
+        if not isinstance(lines, list) or not all(
+            isinstance(line, str) for line in lines
+        ):
+            raise ValueError(
+                f"corrupt transaction record {target!r}: bad records"
+            )
+        if isinstance(serial, bool) or not isinstance(serial, int) or serial < 0:
+            raise ValueError(
+                f"corrupt transaction record {target!r}: bad write serial"
+            )
+    return record
+
+
+def _tx_write_coordinator(record):
+    """Atomically publish a coordinator record, creating the registry dir."""
+    directory = _tx_registry_dir()
+    os.makedirs(directory, exist_ok=True)
+    txid = record["id"]
+    payload = json.dumps(record, separators=(",", ":")).encode("utf-8")
+    _tx_publish_json(
+        os.path.join(directory, f"{txid}.json.tmp"),
+        _tx_record_path(txid),
+        payload,
+    )
+
+
+def _tx_batch_payload(lines):
+    """Exact bytes appended for one log's canonical lines.
+
+    Every record keeps its own terminating newline and the whole batch
+    goes out in a single write, so a crash either leaves every line
+    complete or only a torn prefix -- never the batch half joined.
+    """
+    return b"".join(line.encode("utf-8") + b"\n" for line in lines)
+
+
+def _tx_write_stage(path, txid, payload):
+    """Stage one log's whole batch, fsynced and atomically named."""
+    if payload:
+        _tx_publish_json(
+            f"{path}{_TX_STAGE_TMP_SUFFIX}{txid}",
+            _tx_stage_path(path, txid),
+            payload,
+        )
+
+
+def _tx_remove_stage(path, txid):
+    _unlink_if_exists(_tx_stage_path(path, txid))
+    _unlink_if_exists(f"{path}{_TX_STAGE_TMP_SUFFIX}{txid}")
+
+
+def _tx_record_total(path):
+    """The settled record total of one log, pruned records included."""
+    pruned = _read_prune_state(path)[0]
+    surviving = 0
+    for member in _segment_members(path):
+        for _ in _iter_raw_records(member):
+            surviving += 1
+    return pruned + surviving
+
+
+def _tx_truncate(path, cut):
+    """Shrink the live log to exactly ``cut`` bytes and flush."""
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.ftruncate(fd, cut)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _tx_append_whole(path, payload):
+    """Append one whole batch in a single write and flush it."""
+    out = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
+    try:
+        _write_bytes(out, payload)
+        os.fsync(out)
+    finally:
+        os.close(out)
+
+
+def _tx_live_record_count(path):
+    """Count complete non-blank records currently in the live log."""
+    try:
+        return sum(1 for _ in _iter_raw_records(path))
+    except FileNotFoundError:
+        return 0
+
+
+def _tx_offset_after_record(path, keep):
+    """Byte offset just past the newline of the live log's ``keep``-th record.
+
+    Records are counted the way recovery counts them (blank lines
+    skipped, torn tail ignored); ``keep`` of 0 is the start of the file.
+    The result is a clean record boundary at which the log may be
+    truncated to drop every later record and any torn tail.  Reading is
+    chunked and streamed, with the cursor advanced over every emitted
+    line so the boundary stays correct across chunk splits.
+    """
+    if keep == 0:
+        return 0
+    fd = os.open(path, os.O_RDONLY)
+    cursor = 0
+    seen = 0
+    boundary = 0
+    pending = b""
+    try:
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            combined = pending + chunk
+            *complete, pending = combined.split(b"\n")
+            for raw in complete:
+                cursor += len(raw) + 1
+                if raw and raw != b"\r":
+                    seen += 1
+                    if seen == keep:
+                        boundary = cursor
+                        return boundary
+    finally:
+        os.close(fd)
+    return boundary
+
+
+def _tx_log_index(record, abspath):
+    """Index of one participating log in the sorted coordinator record."""
+    return record["logs"].index(abspath)
+
+
+def _tx_member_counts(path):
+    """``(pruned, numbered, live)`` complete-record counts for one log."""
+    pruned = _read_prune_state(path)[0]
+    numbered = 0
+    members = _segment_members(path)
+    for member in members[:-1]:
+        numbered += sum(1 for _ in _iter_raw_records(member))
+    live = sum(1 for _ in _iter_raw_records(members[-1]))
+    return pruned, numbered, live, members[-1]
+
+
+def _tx_live_batch_start(path, record, index):
+    """Count of live-log records preceding this transaction's batch.
+
+    The batch was appended to the live log, and its write serial was the
+    settled record total (pruned included) read under the log lock, so the
+    count is exact -- no byte guessing.
+    """
+    pruned, numbered, _live, _live_path = _tx_member_counts(path)
+    serial = record["serials"][index]
+    keep = serial - pruned - numbered
+    if keep < 0:
+        raise ValueError(
+            f"corrupt transaction {record['id']} state at {path!r}: write "
+            f"serial {serial} precedes the numbered segments"
+        )
+    return keep
+
+
+def _tx_finish_one(path, record):
+    """Drive one committed log to its finished state under the write lock.
+
+    The recorded write serial pins the exact live-log record boundary at
+    which the batch begins.  A crash mid-finalise leaves some whole batch
+    records and possibly one torn last line past that boundary; either
+    the full batch is already complete (only a trailing torn line is
+    dropped) or the log is returned to the boundary and the batch is
+    appended in one whole write, so no record is duplicated and no
+    half-written transaction line survives.
+    """
+    index = _tx_log_index(record, os.path.abspath(path))
+    lines = record["records"][index]
+    if not lines:
+        return
+    keep = _tx_live_batch_start(path, record, index)
+    _pruned, _numbered, live, _ = _tx_member_counts(path)
+    if live < keep:
+        raise ValueError(
+            f"corrupt transaction {record['id']} state at {path!r}: live "
+            f"log holds {live} records but the batch starts at {keep}"
+        )
+    if live > keep + len(lines):
+        raise ValueError(
+            f"corrupt transaction {record['id']} state at {path!r}: records "
+            f"already run past the batch end"
+        )
+    if live == keep + len(lines):
+        # Every batch record is complete; only a possible torn trailing
+        # line needs removing (it sits past the last counted record).
+        complete_end = _tx_offset_after_record(path, keep + len(lines))
+        if os.path.getsize(path) != complete_end:
+            _tx_truncate(path, complete_end)
+        return
+    # A prefix of the batch (zero or more whole records, possibly with a
+    # torn last line) landed: return to the clean boundary and rewrite
+    # the batch whole.
+    boundary = _tx_offset_after_record(path, keep)
+    if os.path.getsize(path) != boundary:
+        _tx_truncate(path, boundary)
+    _tx_append_whole(path, _tx_batch_payload(lines))
+
+
+def _tx_prepare_lock_try(txid):
+    """Acquire the prepare flock non-blocking.
+
+    Returns a held descriptor when no begin is running for ``txid``;
+    returns ``None`` when a live begin still holds the lock (the caller
+    retains the transaction).  The begin publishes its terminal prepare
+    status (``prepared`` on success, ``rolled_back`` on failure) *before*
+    releasing this lock, so a caller that acquires the lock gets a stable
+    answer by re-reading the coordinator record while holding it: a stuck
+    ``preparing`` or missing record is a dead begin, a ``prepared`` one a
+    finished begin.
+
+    On platforms without :mod:`fcntl` this returns a sentinel ``False``
+    meaning "treat the begin as live"; a same-process failure is cleaned
+    by the begin's own failure path.
+    """
+    if fcntl is None:
+        return False
+    os.makedirs(_tx_registry_dir(), exist_ok=True)
+    fd = os.open(_tx_prep_lock_path(txid), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                os.close(fd)
+                return None
+            os.close(fd)
+            raise
+    except OSError:
+        raise
+    return fd
+
+
+def _tx_settle_log(path):
+    """Resolve every transaction sidecar entry of one log.
+
+    Called with the live-log lock held from :func:`_finish_pending`,
+    after an unfinished compaction or prune is settled and before the
+    audit chain catches up -- one fixed place in the recovery order.
+    The coordinator record is the authority:
+
+    * no record yet, or ``preparing`` -- a begin is mid-flight; its
+      prepare flock is the liveness probe, so a still-live begin keeps
+      its entry and a dead begin's residue is discarded;
+    * ``rolled_back`` discards the residue;
+    * ``committed`` forces the batch to completion in ascending serial;
+    * ``prepared`` is an open transaction, left exactly as staged.
+    """
+    registry = _tx_read_sidecar(path)
+    if not registry:
+        return
+    abspath = os.path.abspath(path)
+    committed = []
+    discard = []
+    for txid_text, entry in registry.items():
+        txid = int(txid_text)
+        record = _tx_read_coordinator(txid)
+        if record is not None and record["s"] == _TX_STATUS_COMMITTED:
+            index = record["logs"].index(abspath)
+            committed.append((record["serials"][index], txid_text, record))
+            continue
+        if record is not None and record["s"] == _TX_STATUS_ROLLED_BACK:
+            discard.append(txid_text)
+            continue
+        if record is not None and record["s"] == _TX_STATUS_PREPARED:
+            # A finished, still-open transaction: retain as staged.
+            continue
+        # Coordinator missing or stuck preparing.  Take the prepare
+        # flock first; a live begin denies it (retain).  With the lock
+        # held, re-read the record -- the begin only ever publishes its
+        # terminal prepare status before releasing, so the answer is now
+        # stable.
+        prep_fd = _tx_prepare_lock_try(txid)
+        if prep_fd is None or prep_fd is False:
+            continue
+        try:
+            record = _tx_read_coordinator(txid)
+            if record is None or record["s"] == _TX_STATUS_PREPARING:
+                discard.append(txid_text)
+            elif record["s"] == _TX_STATUS_ROLLED_BACK:
+                discard.append(txid_text)
+            elif record["s"] == _TX_STATUS_COMMITTED:
+                index = record["logs"].index(abspath)
+                committed.append(
+                    (record["serials"][index], txid_text, record)
+                )
+            # Prepared while the lock was acquired: a finished open
+            # transaction -- retain.
+        finally:
+            os.close(prep_fd)
+    # Finish committed transactions in ascending write serial so each
+    # batch boundary still holds when the next one is recovered.
+    committed.sort(key=lambda item: item[0])
+    for _serial, txid_text, record in committed:
+        _tx_finish_one(path, record)
+        discard.append(txid_text)
+    for txid_text in discard:
+        _tx_remove_stage(path, int(txid_text))
+        registry.pop(txid_text, None)
+    if discard:
+        _tx_write_sidecar(path, registry)
+
+
+def _tx_validate_inputs(logs, records):
+    """Validate shapes and render every record to one canonical line."""
+    if isinstance(logs, str) or not isinstance(logs, (list, tuple)):
+        raise TypeError(
+            f"logs must be a sequence of paths, got {type(logs).__name__}"
+        )
+    if isinstance(records, str) or not isinstance(records, (list, tuple)):
+        raise TypeError(
+            f"records must be a sequence of record batches, got "
+            f"{type(records).__name__}"
+        )
+    if len(logs) != len(records):
+        raise ValueError(
+            f"log and record batch counts differ: {len(logs)} log(s) but "
+            f"{len(records)} batch(es)"
+        )
+    if len(logs) == 0:
+        raise ValueError("a transaction needs at least one participating log")
+    for path in logs:
+        if not isinstance(path, str):
+            raise OSError(
+                f"log path must be a string, got {type(path).__name__}"
+            )
+    groups = []
+    payloads = []
+    for batch in records:
+        if isinstance(batch, str) or not isinstance(batch, (list, tuple)):
+            raise TypeError(
+                f"each record batch must be a list of metric mappings, got "
+                f"{type(batch).__name__}"
+            )
+        lines = []
+        for metrics in batch:
+            if isinstance(metrics, dict):
+                # A metric mapping is rendered canonically.
+                line = render_metrics(metrics)[:-1]
+            elif isinstance(metrics, str):
+                # A single already-rendered metrics line is accepted the
+                # way append_metrics accepts one, then canonicalised so
+                # every staged record shares one exact line form.
+                line = render_metrics(parse_metrics(metrics))[:-1]
+            else:
+                raise TypeError(
+                    f"each transaction record must be a metrics mapping "
+                    f"or metrics line, got {type(metrics).__name__}"
+                )
+            # render_metrics enforces string keys, int/float values
+            # (booleans rejected), no NaN/Infinity, exact big integers,
+            # -0.0 and insertion key order.
+            lines.append(line)
+        groups.append(lines)
+        payloads.append(_tx_batch_payload(lines))
+    absolute = [os.path.abspath(path) for path in logs]
+    if len(set(absolute)) != len(absolute):
+        raise ValueError("a participating log path is repeated")
+    return groups, payloads, absolute
+
+
+def _tx_prepare_one(path, txid, lines, payload):
+    """Stage one log's batch and publish its prepared sidecar entry."""
+    with _tx_log_guard(path):
+        fd = _mutation_lock(path, create=False)
+        try:
+            _finish_pending(path)
+            fd = _relock_after_settle(fd, path, create=False)
+            serial = _tx_record_total(path)
+            _tx_write_stage(path, txid, payload)
+            registry = _tx_read_sidecar(path)
+            registry[str(txid)] = {"r": lines}
+            _tx_write_sidecar(path, registry)
+            return serial
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def _tx_discard_prepare(path, txid):
+    """Undo one preparation when a later prepare in the same begin fails."""
+    with _tx_log_guard(path):
+        fd = _mutation_lock(path, create=False)
+        try:
+            _finish_pending(path)
+            registry = _tx_read_sidecar(path)
+            if registry.pop(str(txid), None) is not None:
+                _tx_write_sidecar(path, registry)
+            _tx_remove_stage(path, txid)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def tx_begin_metrics(logs, records):
+    """Begin an atomic write over several logs and return its integer id.
+
+    ``logs`` is the sequence of participating log paths and ``records``
+    the matching per-log batches -- one list per log, in the exact order
+    the records must appear, of metric mappings or already-rendered
+    single-line metric strings (the latter are accepted like an
+    :func:`append_metrics` line and canonicalised).  The sequences have
+    the same length and no log path may repeat.  Records obey the
+    established metric-line rules exactly: they are rendered
+    canonically, so oversized integer counters stay exact decimal
+    integers, ``-0.0`` is preserved and key order follows each mapping.
+    The returned identifier and its coordinator record persist the
+    integer id, the participating log set and every record's exact
+    decimal write serial.
+
+    Preparation writes no live-log byte: each batch lands in that log's
+    private staging file and a private sidecar entry, both invisible to
+    every established read, so concurrent appends, rotations,
+    compactions and prunes proceed while the transaction is open.
+    Logs are locked in canonical path order one at a time -- an acyclic
+    graph for any two overlapping transactions -- and every input is
+    validated and every log staged before the identifier exists, so a
+    failure discards all partial preparations and leaves not one
+    readable record behind.
+
+    Raises:
+        TypeError: ``logs`` or ``records`` is not a sequence, a record is
+            not a mapping, a metric key is not a string or a metric value
+            is not an int or float (booleans do not count).
+        ValueError: the lengths differ, a path repeats, or a metric value
+            is NaN or Infinity.
+        FileNotFoundError: a participating log does not exist.
+        IsADirectoryError: a participating path is a directory.
+        OSError: a path is not a string, or locking or writing staging
+            state fails; nothing readable is left behind.
+    """
+    groups, payloads, absolute = _tx_validate_inputs(logs, records)
+    paths = list(logs)
+    for path in paths:
+        if os.path.isdir(path):
+            raise IsADirectoryError(f"log path is a directory: {path!r}")
+    for path in paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"metrics log does not exist: {path!r}")
+
+    order = sorted(range(len(paths)), key=lambda index: absolute[index])
+
+    while True:
+        txid = int.from_bytes(os.urandom(8), "big")
+        if txid and not os.path.exists(_tx_record_path(txid)):
+            break
+
+    # Hold the prepare flock for the whole staging window, including the
+    # failure path: a concurrent settler probes this lock non-blocking
+    # and retains the entry while the begin is alive, discarding it only
+    # once a dead begin has released it.
+    os.makedirs(_tx_registry_dir(), exist_ok=True)
+    prep_fd = os.open(_tx_prep_lock_path(txid), os.O_RDWR | os.O_CREAT, 0o666)
+    if fcntl is not None:
+        fcntl.flock(prep_fd, fcntl.LOCK_EX)
+    prepared = []
+    try:
+        # Publish before the first sidecar byte, so a racing settler
+        # always sees either nothing or a coordinator record whose
+        # liveness flock answers authoritatively.
+        record = {
+            "v": _TX_VERSION,
+            "id": txid,
+            "s": _TX_STATUS_PREPARING,
+            "logs": [absolute[index] for index in order],
+            "records": [groups[index] for index in order],
+            "serials": [0 for _index in order],
+        }
+        _tx_write_coordinator(record)
+        serials = [0] * len(paths)
+        for index in order:
+            serials[index] = _tx_prepare_one(
+                paths[index], txid, groups[index], payloads[index]
+            )
+            prepared.append(index)
+        record = {
+            "v": _TX_VERSION,
+            "id": txid,
+            "s": _TX_STATUS_PREPARED,
+            "logs": [absolute[index] for index in order],
+            "records": [groups[index] for index in order],
+            "serials": [serials[index] for index in order],
+        }
+        _tx_write_coordinator(record)
+    except BaseException:
+        # The commit point was never reached; undo every preparation and
+        # mark the record rolled back so any residue a settler observes
+        # after this lock is released is discarded rather than retained.
+        for index in prepared:
+            try:
+                _tx_discard_prepare(paths[index], txid)
+            except OSError:
+                pass
+        try:
+            failed = _tx_read_coordinator(txid)
+            if failed is not None and failed["s"] == _TX_STATUS_PREPARING:
+                failed["s"] = _TX_STATUS_ROLLED_BACK
+                _tx_write_coordinator(failed)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(prep_fd)
+        # The begin is over; the terminal prepare status is durable, so
+        # the liveness lock has no further reader and its anchor is
+        # removed rather than left to accumulate.  Any settler that
+        # already opened it keeps its own (non-blocking) probe unaffected
+        # by the unlink.
+        _unlink_if_exists(_tx_prep_lock_path(txid))
+    return txid
+
+
+def _tx_lock_existing_set(abspath):
+    """Lock a participating log for a transaction write, creating the live.
+
+    The log set must exist -- the current log or at least one numbered
+    segment -- so a genuinely missing participating log still raises
+    :class:`FileNotFoundError`; but a live log a rotation sealed a beat
+    before crashing (segments present, live not yet recreated) is opened
+    with O_CREAT the way an append opens it, because the finalise is a
+    write that lands in the live log.
+    """
+    if os.path.isdir(abspath):
+        raise IsADirectoryError(f"log path is a directory: {abspath!r}")
+    if not os.path.exists(abspath) and not _segment_numbers(abspath):
+        raise FileNotFoundError(f"metrics log does not exist: {abspath!r}")
+    return _mutation_lock(abspath, create=True)
+
+
+def _tx_acquire_logs(record):
+    """Guard, lock and settle every participating log in canonical order.
+
+    The participating logs are stored already sorted, so the combined
+    in-process/flock acquisition graph is acyclic for any two
+    transactions whose groups overlap.  Returns
+    ``[(abspath, guard, fd), ...]``; the caller releases in reverse.
+    """
+    held = []
+    try:
+        for abspath in record["logs"]:
+            guard = _tx_log_guard(abspath)
+            guard.__enter__()
+            held.append([abspath, guard, None])
+            fd = _tx_lock_existing_set(abspath)
+            _finish_pending(abspath)
+            fd = _relock_after_settle(fd, abspath, create=True)
+            held[-1][2] = fd
+        return held
+    except BaseException:
+        for _abspath, guard, fd in reversed(held):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            guard.__exit__(None, None, None)
+        raise
+
+
+def _tx_release_logs(held):
+    for _abspath, guard, fd in reversed(held):
+        if fd is not None:
+            os.close(fd)
+        guard.__exit__(None, None, None)
+
+
+def _tx_coord_flock(txid):
+    """Take the inter-process coordinator flock (returns fd or None)."""
+    if fcntl is None:
+        return None
+    os.makedirs(_tx_registry_dir(), exist_ok=True)
+    fd = os.open(_tx_lock_path(txid), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _tx_clean_one(abspath, txid):
+    """Remove one finished log's stage file and sidecar entry under lock."""
+    registry = _tx_read_sidecar(abspath)
+    _tx_remove_stage(abspath, txid)
+    registry.pop(str(txid), None)
+    _tx_write_sidecar(abspath, registry)
+
+
+def _tx_resume_committed(record):
+    """Finish every log a committed transaction left mid-finalise.
+
+    Used by a repeated commit (which still must not leave the batch
+    effective on only some logs).  Logs whose sidecar entry is already
+    gone are finished and are skipped.
+    """
+    txid = record["id"]
+    for abspath in record["logs"]:
+        with _tx_log_guard(abspath):
+            fd = _tx_lock_existing_set(abspath)
+            try:
+                _finish_pending(abspath)
+                fd = _relock_after_settle(fd, abspath, create=True)
+                if str(txid) in _tx_read_sidecar(abspath):
+                    index = record["logs"].index(abspath)
+                    _tx_finish_one(abspath, record)
+                    _tx_clean_one(abspath, txid)
+                    _sync_audit_for_write(abspath)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
+
+def tx_commit_metrics(txid):
+    """Atomically commit prepared transaction ``txid``.
+
+    Every participating log is guarded, locked and settled in canonical
+    order, and its exact write serial -- the settled record total,
+    pruned records included -- is read while its lock is held.  Only
+    then is the coordinator record atomically published as ``committed``
+    with the serials: the single commit point.  Each log afterwards
+    appends its staged bytes as one whole newline-terminated write,
+    fsyncs, and removes stage file and sidecar entry, all with the locks
+    still held, so no ordinary append interleaves.  Before the commit
+    point no participating log holds a batch record; after it every
+    participating log holds the whole batch.
+
+    A crash after the commit point leaves deterministic residue: a torn
+    prefix no read acknowledges is truncated and the batch rewritten
+    whole by the next write on that log (which settles transaction
+    residue first).  The same identifier can never commit twice, take
+    effect on only some logs, or commit after a rollback; repeating the
+    commit or committing a rolled-back identifier raises
+    :class:`ValueError` and leaves the deterministic residue to the next
+    write.
+
+    Raises:
+        TypeError: ``txid`` is not an integer (booleans do not count).
+        ValueError: ``txid`` is negative, forged, was already committed,
+            or was rolled back; or the transaction state is corrupt.
+        FileNotFoundError: the coordinator record or a participating
+            log is missing.
+        IsADirectoryError: a participating path is a directory.
+        OSError: locking or writing fails.
+    """
+    _tx_check_identifier(txid)
+    with _tx_coord_guard(txid):
+        lock_fd = _tx_coord_flock(txid)
+        try:
+            record = _tx_read_coordinator(txid)
+            if record is None:
+                raise ValueError(
+                    f"forged or finished transaction id: {txid}"
+                )
+            if record["s"] == _TX_STATUS_COMMITTED:
+                # A repeated commit never applies twice, but it first
+                # finishes any log a crash left mid-finalise, so the
+                # transaction can never stay effective on only some logs;
+                # it then reports the double use as required.
+                _tx_resume_committed(record)
+                raise ValueError(f"transaction {txid} was already committed")
+            if record["s"] == _TX_STATUS_ROLLED_BACK:
+                raise ValueError(f"transaction {txid} was already rolled back")
+            if record["s"] == _TX_STATUS_PREPARING:
+                # Still staging, or a begin that crashed.  Probe the
+                # prepare lock and re-read under it; a transaction that
+                # has not finished preparing is never committable.
+                prep_fd = _tx_prepare_lock_try(txid)
+                if prep_fd is None or prep_fd is False:
+                    raise ValueError(
+                        f"transaction {txid} is still being prepared"
+                    )
+                try:
+                    refreshed = _tx_read_coordinator(txid)
+                finally:
+                    os.close(prep_fd)
+                if refreshed is not None and refreshed["s"] == (
+                    _TX_STATUS_PREPARED
+                ):
+                    record = refreshed
+                else:
+                    raise ValueError(
+                        f"transaction {txid} preparation never finished"
+                    )
+            held = _tx_acquire_logs(record)
+            try:
+                serials = []
+                for index, (abspath, _guard, _fd) in enumerate(held):
+                    entry = _tx_read_sidecar(abspath).get(str(txid))
+                    lines = record["records"][index]
+                    if entry is None or entry["r"] != lines:
+                        raise ValueError(
+                            f"corrupt transaction {txid} state at "
+                            f"{abspath!r}: prepared records do not match "
+                            f"the coordinator record"
+                        )
+                    serials.append(_tx_record_total(abspath))
+                # The single commit point, carrying the exact serials
+                # read while every participating log was locked.
+                record["serials"] = serials
+                record["s"] = _TX_STATUS_COMMITTED
+                _tx_write_coordinator(record)
+                for index, (abspath, _guard, _fd) in enumerate(held):
+                    lines = record["records"][index]
+                    payload = _tx_batch_payload(lines)
+                    if payload:
+                        _tx_append_whole(abspath, payload)
+                    _tx_clean_one(abspath, txid)
+                    _sync_audit_for_write(abspath)
+            finally:
+                _tx_release_logs(held)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+
+def tx_rollback_metrics(txid):
+    """Roll prepared transaction ``txid`` back.
+
+    The coordinator record is atomically published as ``rolled_back``
+    and every participating log discards residue, removes its staging
+    file and drops its sidecar entry under the live-log lock after the
+    log's other pending work is settled.  Before the commit point no
+    readable record existed, so rollback removes no record.  Repeating a
+    finished rollback is a no-op (it still re-sweeps any residue a crash
+    left), while committing a rolled-back identifier remains a
+    :class:`ValueError`.
+
+    Raises:
+        TypeError: ``txid`` is not an integer (booleans do not count).
+        ValueError: ``txid`` is negative or forged (no such transaction),
+            or was already committed.
+        FileNotFoundError: a participating log no longer exists.
+        IsADirectoryError: a participating path is a directory.
+        OSError: locking or writing fails.
+    """
+    _tx_check_identifier(txid)
+    with _tx_coord_guard(txid):
+        lock_fd = _tx_coord_flock(txid)
+        try:
+            record = _tx_read_coordinator(txid)
+            if record is None:
+                raise ValueError(f"forged or finished transaction id: {txid}")
+            if record["s"] == _TX_STATUS_COMMITTED:
+                raise ValueError(f"transaction {txid} was already committed")
+            if record["s"] == _TX_STATUS_PREPARING:
+                prep_fd = _tx_prepare_lock_try(txid)
+                if prep_fd is None or prep_fd is False:
+                    raise ValueError(
+                        f"transaction {txid} is still being prepared"
+                    )
+                os.close(prep_fd)
+            if record["s"] != _TX_STATUS_ROLLED_BACK:
+                record["s"] = _TX_STATUS_ROLLED_BACK
+                _tx_write_coordinator(record)
+            # Idempotent re-entry: still sweep any residue a crash left.
+            for abspath in record["logs"]:
+                with _tx_log_guard(abspath):
+                    fd = _tx_lock_existing_set(abspath)
+                    try:
+                        _finish_pending(abspath)
+                        fd = _relock_after_settle(fd, abspath, create=True)
+                        _tx_remove_stage(abspath, txid)
+                        registry = _tx_read_sidecar(abspath)
+                        registry.pop(str(txid), None)
+                        _tx_write_sidecar(abspath, registry)
+                    finally:
+                        if fd is not None:
+                            os.close(fd)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+
+def _tx_read_extra(path, candidate, record, sidecar):
+    """Pick the staged lines a consistent read still has to add.
+
+    Returns the batch lines the ordinary segment-set walk does not
+    already contain for the transaction's view.  After the commit point
+    the recorded write serial pins the exact boundary: complete batch
+    records already appended are part of the ordinary walk, a torn last
+    line is dropped by it, and only the remaining whole lines are
+    produced -- never a half-written line.
+    """
+    if record is None or record["s"] in (
+        _TX_STATUS_PREPARING, _TX_STATUS_PREPARED
+    ):
+        # Open transaction (a begin mid-flight included): its own view
+        # contains its whole staged batch.
+        return list(candidate)
+    if record["s"] == _TX_STATUS_ROLLED_BACK:
+        return []
+    # Committed.  A missing sidecar entry means the finalise finished and
+    # removed it; the ordinary walk already holds the whole batch.
+    if sidecar is None or not candidate:
+        return []
+    index = _tx_log_index(record, os.path.abspath(path))
+    serial = record["serials"][index]
+    # How many batch records the segment set as a whole already holds;
+    # total-based (rather than live-log based) so a concurrent rotation
+    # settling the finalise cannot make the read miscount.
+    total = _tx_record_total(path)
+    present = max(0, min(total - serial, len(candidate)))
+    return list(candidate[present:])
+
+
+def tx_read_metrics(path, txid):
+    """Stream one log's records from transaction ``txid``'s point of view.
+
+    The view is whole at every call:
+
+    * an open ``prepared`` transaction reads the log's current records
+      followed by its own staged batch in write order;
+    * a committed transaction whose finalise has not finished this log
+      reads the current records with the staged batch appended whole --
+      never a torn prefix -- so the post-commit view is never observed
+      half done; once the batch has joined the log, the ordinary
+      segment-set walk already contains it and it is not produced twice;
+    * a rolled-back transaction reads without the batch;
+    * the added bytes come from the sidecar or coordinator record, never
+      from the live log's torn tail.
+
+    Reading takes no log lock and changes no state, so a same-process
+    prepare, commit or rollback interleaved with it neither deadlocks
+    nor reports a spurious locking failure.
+
+    Raises:
+        TypeError: ``txid`` is not an integer (booleans do not count).
+        ValueError: ``txid`` is negative, forged, belongs to a different
+            transaction than this log, or the transaction state is
+            corrupt; a bad record line is raised lazily while iterating.
+        FileNotFoundError: neither the log nor any segment exists.
+        IsADirectoryError: ``path`` is a directory.
+        OSError: ``path`` is not a string.
+    """
+    if not isinstance(path, str):
+        raise OSError(f"log path must be a string, got {type(path).__name__}")
+    _tx_check_identifier(txid)
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+    members, _pruned = _resolve_members(path)
+    if not members:
+        raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+
+    abspath = os.path.abspath(path)
+    sidecar = _tx_read_sidecar(path).get(str(txid))
+    record = _tx_read_coordinator(txid)
+    if sidecar is None and record is None:
+        raise ValueError(f"forged or foreign transaction id: {txid}")
+    if sidecar is None and abspath not in record["logs"]:
+        raise ValueError(
+            f"transaction {txid} does not participate in log {path!r}"
+        )
+
+    candidate = sidecar["r"] if sidecar is not None else (
+        record["records"][record["logs"].index(abspath)]
+    )
+    extra = _tx_read_extra(path, candidate, record, sidecar)
+
+    def _generate():
+        for member in members:
+            yield from _parse_file(member, member)
+        for line in extra:
+            yield parse_metrics(line)
+
+    return _generate()

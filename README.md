@@ -32,6 +32,10 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher group-takeover FILE GROUP MEMBER [LEASE_SECONDS]
     python3 -m weighted_batcher audit FILE
     python3 -m weighted_batcher verify FILE
+    python3 -m weighted_batcher tx-begin FILE RECORDS_JSON [FILE RECORDS_JSON ...]
+    python3 -m weighted_batcher tx-commit TRANSACTION_ID
+    python3 -m weighted_batcher tx-rollback TRANSACTION_ID
+    python3 -m weighted_batcher tx-read FILE TRANSACTION_ID
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -72,6 +76,23 @@ matches; a record modified by a single byte or mixed in fails with
 wholesale or a replaced segment fails naming the mismatched write
 ordinal, and any failure exits 1. Both print usage and exit 2 on a
 wrong argument count.
+
+`tx-begin` starts one atomic write over several logs: it takes one
+`FILE RECORDS_JSON` pair per participating log (`RECORDS_JSON` is a JSON
+array of metric objects for that log, in write order), prepares the
+whole transaction and prints its persistable integer transaction
+identifier. Before commit none of the logs gains a record;
+`tx-commit TRANSACTION_ID` makes every participating log gain its whole
+batch at once and `tx-rollback TRANSACTION_ID` discards the preparation;
+`tx-read FILE TRANSACTION_ID` streams `FILE`'s records from that
+transaction's point of view, one JSON object per line -- its own batch
+included while open or mid-finalise, excluded after a rollback, never
+half present. An identifier already committed cannot commit twice, take
+effect on only some logs, or commit after a rollback; those cases raise
+`ValueError` and exit 1, as does a forged or foreign identifier. All
+four subcommands print usage on stderr and exit 2 on a wrong argument
+count (or a transaction id that is not an integer), and otherwise exit 1
+on failure.
 
 ## Public interface
 
@@ -278,6 +299,71 @@ wrong argument count.
   `FileNotFoundError` if the log or the audit chain is missing,
   `IsADirectoryError` for a directory, `OSError` for a non-string path,
   and `ValueError` for a corrupt state file or a mismatch.
+- `weighted_batcher.tx_begin_metrics(logs, records) -> int` starts one
+  atomic write over several independent logs and returns a persistable
+  exact-decimal-integer transaction identifier. `logs` is a sequence of
+  participating log paths and `records` the matching sequence of record
+  batches, each a list of metric mappings in write order; the sequences
+  have the same length and no path repeats. Every record follows the
+  established metric-line rules (exact oversized integer counters,
+  `-0.0`, insertion key order). The coordinator record persists the
+  identifier, the integer-indexed participating log set and every
+  record's exact decimal write serial (the record total, pruned records
+  included, at which the batch joins the log). Preparation stages each
+  batch in that log's private sidecar files only, so before commit no
+  participating log gains a record and ordinary appends, rotations,
+  compactions and prunes proceed while the transaction is open; logs are
+  locked in canonical order one at a time. Raises `TypeError` for a
+  non-sequence argument, a non-mapping record or a non-string/non-number
+  metric key or value (booleans do not count), `ValueError` for unequal
+  lengths, a repeated path or a NaN/Infinity value, `FileNotFoundError`
+  for a missing log, `IsADirectoryError` for a directory, and `OSError`
+  for a non-string path or a locking/write failure; a failed preparation
+  leaves nothing readable behind.
+- `weighted_batcher.tx_commit_metrics(txid) -> None` commits the
+  prepared transaction: the coordinator record is atomically published as
+  committed — the single commit point, recording every batch record's
+  exact decimal write serial while each participating log is locked and
+  settled — and each log then appends its staged bytes as one whole
+  newline-terminated write, so every participating log gains the whole
+  batch or, before the commit point, none does, and a read never meets a
+  half-written transaction. A crash after the commit point leaves
+  deterministic residue that the next write on each log (or a repeated
+  commit) finishes from the staged bytes; old segment sets are not
+  migrated and their format is unchanged. The same identifier cannot
+  commit twice, take effect on only some logs, or commit after a
+  rollback; a repeated commit or a rolled-back identifier raises
+  `ValueError`. Raises `TypeError` if `txid` is not an integer (booleans
+  do not count), `ValueError` if it is negative, forged, already
+  committed, already rolled back or still preparing,
+  `FileNotFoundError` if the record or a participating log is missing,
+  `IsADirectoryError` for a directory, and `OSError` for a locking/write
+  failure.
+- `weighted_batcher.tx_rollback_metrics(txid) -> None` rolls the prepared
+  transaction back: the coordinator record is published as rolled back
+  and every participating log drops its staged preparation, having never
+  gained a readable record. Repeating a finished rollback is a no-op
+  (it still sweeps crash residue), while committing a rolled-back
+  identifier raises `ValueError`. Raises `TypeError` if `txid` is not an
+  integer (booleans do not count), `ValueError` if it is negative,
+  forged, still preparing or already committed, `FileNotFoundError` if a
+  participating log is missing, `IsADirectoryError` for a directory,
+  and `OSError` for a locking/write failure.
+- `weighted_batcher.tx_read_metrics(path, txid)` streams one log's
+  records from the transaction's point of view: an open or mid-finalise
+  transaction yields the current records followed by its own staged batch
+  in write order (the batch produced whole from the sidecar, never a torn
+  tail), a rolled-back transaction yields the records without the batch,
+  and a finished commit reads through the ordinary segment walk with no
+  duplication. Reading is lock free and changes no state, so a
+  same-process prepare, commit or rollback interleaved with it neither
+  deadlocks nor reports a spurious locking failure. Raises `TypeError` if
+  `txid` is not an integer (booleans do not count), `ValueError` if it is
+  negative, forged or belongs to a different transaction than this log
+  (a bad record line is raised lazily while iterating),
+  `FileNotFoundError` if neither the log nor any segment exists,
+  `IsADirectoryError` for a directory, and `OSError` for a non-string
+  path.
 
 ## Tests
 

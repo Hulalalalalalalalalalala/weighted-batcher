@@ -34,6 +34,10 @@ __all__ = [
     "takeover_group_metrics",
     "audit_metrics",
     "verify_metrics",
+    "tx_begin_metrics",
+    "tx_commit_metrics",
+    "tx_rollback_metrics",
+    "tx_read_metrics",
     "sample_batch_metrics",
     "resume_batch_metrics",
 ]
@@ -186,6 +190,10 @@ from .persistence import (  # noqa: E402
     snapshot_diff_metrics,
     snapshot_metrics,
     takeover_group_metrics,
+    tx_begin_metrics,
+    tx_commit_metrics,
+    tx_read_metrics,
+    tx_rollback_metrics,
     verify_metrics,
 )
 from .batching import (  # noqa: E402
