@@ -29,6 +29,7 @@
     python3 -m weighted_batcher tx-read FILE TRANSACTION_ID
     python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
     python3 -m weighted_batcher tx-conflicts FILE
+    python3 -m weighted_batcher tx-replay FILE [FILE ...]
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ from . import (
     tx_commit_metrics,
     tx_conflicts_metrics,
     tx_read_metrics,
+    tx_replay_metrics,
     tx_rollback_metrics,
     verify_metrics,
 )
@@ -100,7 +102,8 @@ _USAGE = (
     "  python3 -m weighted_batcher tx-rollback TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-read FILE TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID\n"
-    "  python3 -m weighted_batcher tx-conflicts FILE"
+    "  python3 -m weighted_batcher tx-conflicts FILE\n"
+    "  python3 -m weighted_batcher tx-replay FILE [FILE ...]"
 )
 
 
@@ -418,6 +421,16 @@ def _tx_conflicts(path):
     # and its overlapping write serials, all exact decimal integers.
     for entry in tx_conflicts_metrics(path):
         sys.stdout.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    return 0
+
+
+def _tx_replay(paths):
+    # One compact JSON object per rebuilt transaction, ordered by
+    # ascending identifier; the generator yields the keys in the fixed
+    # id/status/rejected/serials order and an empty group yields nothing
+    # at all.  Identifiers and write serials are exact decimal integers.
+    for row in tx_replay_metrics(paths):
+        sys.stdout.write(json.dumps(row, separators=(",", ":")) + "\n")
     return 0
 
 
@@ -755,6 +768,14 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(_tx_conflicts, args[1])
+    if args and args[0] == "tx-replay":
+        # One or more log paths; every path is validated by the entry
+        # point and a wrong count is a usage error (status 2).
+        if len(args) < 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        paths = args[1:]
+        return _dispatch(lambda _path: _tx_replay(paths), paths[0])
     print(_USAGE, file=sys.stderr)
     return 2
 

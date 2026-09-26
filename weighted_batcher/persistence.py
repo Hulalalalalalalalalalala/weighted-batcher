@@ -179,6 +179,7 @@ __all__ = [
     "tx_read_metrics",
     "tx_adjudicate_metrics",
     "tx_conflicts_metrics",
+    "tx_replay_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -4837,3 +4838,221 @@ def tx_conflicts_metrics(path):
         for txid in txids
         if overlaps[txid]
     ]
+
+
+def _tx_replay_classify(record):
+    """Map one coordinator record to ``(kind, status_word)``.
+
+    ``kind`` is the decidable role the record bears for replay-time
+    conflict reconstruction -- exactly the roles :func:`_tx_peer_states`
+    exposes to adjudication: ``"winner"`` for a standing winner
+    (adjudicated winner, still prepared or already committed),
+    ``"undecided"`` for a prepared transaction never adjudicated, and
+    ``None`` for every other decided state.  ``status_word`` is the
+    word printed in replay output.
+    """
+    status = record["s"]
+    verdict = record.get("a")
+    if status == _TX_STATUS_COMMITTED:
+        return (
+            (_TX_VERDICT_WINNER, "committed")
+            if verdict == _TX_VERDICT_WINNER
+            else (None, "committed")
+        )
+    if status == _TX_STATUS_PREPARED:
+        if verdict == _TX_VERDICT_WINNER:
+            return (_TX_VERDICT_WINNER, "prepared")
+        return ("undecided", "prepared")
+    if status == _TX_STATUS_REJECTED:
+        return (None, "rejected")
+    return (None, "rolled-back")
+
+
+def _tx_replay_scan(abspaths):
+    """Read every coordinator record touching the given logs.
+
+    Returns ``{txid: {"status", "kind", "ranges"}}`` where ``ranges``
+    maps each participating given log to ``(start, count)``.  Record
+    payloads are deliberately not retained -- only the small range
+    summary -- so a scan stays bounded in memory however large the
+    staged batches are.  A live or unfinishable ``preparing`` begin is
+    probed with the same non-blocking prepare flock settlement uses and
+    is excluded, exactly as its unobservable residue is swept rather
+    than read: a half-finished begin never appears in replay output.
+    """
+    wanted = set(abspaths)
+    try:
+        names = os.listdir(_tx_registry_dir())
+    except FileNotFoundError:
+        return {}
+    summaries = {}
+    for name in names:
+        if not name.endswith(".json"):
+            # Coordinator records are "<id>.json"; lock, prep-lock and
+            # staging anchors carry other suffixes and carry no state.
+            continue
+        stem = name[: -len(".json")]
+        if not (stem.isascii() and stem.isdigit()):
+            continue
+        txid = int(stem)
+        record = _tx_read_coordinator(txid)
+        if record is None:
+            continue
+        if record["s"] == _TX_STATUS_PREPARING:
+            prep_fd = _tx_prepare_lock_try(txid)
+            if prep_fd is None or prep_fd is False:
+                # A live begin still staging: not yet observable.
+                continue
+            try:
+                refreshed = _tx_read_coordinator(txid)
+            finally:
+                os.close(prep_fd)
+            if refreshed is None or refreshed["s"] == _TX_STATUS_PREPARING:
+                # A crashed begin whose residue the settle discarded.
+                continue
+            record = refreshed
+        ranges = {}
+        for index, abspath in enumerate(record["logs"]):
+            if abspath in wanted:
+                start = record["serials"][index]
+                count = len(record["records"][index])
+                ranges[abspath] = (start, count)
+        if not ranges:
+            # Coordinator record of a transaction on none of the logs
+            # this replay covers.
+            continue
+        kind, status_word = _tx_replay_classify(record)
+        summaries[txid] = {
+            "status": status_word,
+            "kind": kind,
+            "ranges": ranges,
+        }
+    return summaries
+
+
+def _tx_replay_rows(abspaths, summaries):
+    """Yield one replay row per transaction, ordered by ascending id.
+
+    The rejected set is rebuilt with adjudication's one ordering rule:
+    a rejected transaction names every overlapping peer that is a
+    standing winner or an undecided transaction with a smaller
+    identifier -- the exact condition under which adjudication rejects
+    it.  Rejected, rolled-back and plain-committed transactions carry no
+    decidable range, just as in :func:`_tx_peer_states`.
+    """
+    rejected_by = {txid: set() for txid in summaries}
+    for abspath in abspaths:
+        candidates = []
+        losers = []
+        for txid, summary in summaries.items():
+            slot = summary["ranges"].get(abspath)
+            if slot is None:
+                continue
+            if summary["status"] == "rejected":
+                losers.append((txid, slot))
+            elif summary["kind"] in (
+                _TX_VERDICT_WINNER,
+                "undecided",
+            ):
+                candidates.append((txid, summary["kind"], slot))
+        for txid, (start, count) in losers:
+            for other, kind, (other_start, other_count) in candidates:
+                if other == txid:
+                    continue
+                if not _tx_ranges_overlap(
+                    start, count, other_start, other_count
+                ):
+                    continue
+                if kind == _TX_VERDICT_WINNER or other < txid:
+                    rejected_by[txid].add(other)
+    for txid in sorted(summaries):
+        summary = summaries[txid]
+        serials = []
+        for start, count in summary["ranges"].values():
+            serials.extend(range(start, start + count))
+        yield {
+            "id": txid,
+            "status": summary["status"],
+            "rejected": sorted(rejected_by[txid]),
+            "serials": sorted(serials),
+        }
+
+
+def tx_replay_metrics(paths):
+    """Deterministically rebuild the final visible batches of a log group.
+
+    ``paths`` is the one group of participating metric logs.  Before the
+    rebuild every given log is locked and settled one at a time in
+    lexicographic path order -- never with two log locks held at once --
+    so an unfinished compaction, trim, snapshot copy or transaction
+    residue is resolved first, and a crash that stopped before or after
+    an adjudication or commit point leaves exactly that settled state:
+    half a state file never mixes into the result.  Concurrent appends,
+    commits, adjudications, rollbacks and replays are serialised by the
+    same locks, so records are never torn and no update is lost;
+    same-process readers and writers interleaved with the rebuild
+    neither self-deadlock nor report a spurious locking failure.
+
+    One row is yielded per transaction that participates in at least one
+    given log, ordered by ascending transaction identifier; an empty
+    group (no transactions) yields nothing.  Each row is
+    ``{"id", "status", "rejected", "serials"}`` with the identifier and
+    every serial an exact decimal integer.  ``status`` is one of
+    ``committed``, ``prepared``, ``rejected`` and ``rolled-back``:
+    committed transactions and winners that later committed land their
+    batches in write-serial order, while rejected and rolled-back
+    transactions land none.  ``rejected`` lists, in ascending order, the
+    conflicting transactions under which the transaction lost under the
+    shared adjudication ordering -- a standing winner, or a smaller
+    still-undecided identifier.  ``serials`` is the transaction's own
+    write serials across the given logs in ascending order.
+
+    Raises:
+        TypeError: ``paths`` is not a sequence of log paths.
+        ValueError: the sequence is empty, or transaction state is
+            corrupt.
+        FileNotFoundError: a given log and every segment of it are
+            missing.
+        IsADirectoryError: a given path is a directory.
+        OSError: a path is not a string, or locking or reading fails.
+    """
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        raise TypeError(
+            f"paths must be a sequence of log paths, got "
+            f"{type(paths).__name__}"
+        )
+    if len(paths) == 0:
+        raise ValueError("at least one log path is required")
+    for path in paths:
+        if not isinstance(path, str):
+            raise OSError(
+                f"log path must be a string, got {type(path).__name__}"
+            )
+    abspaths = []
+    seen = set()
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if os.path.isdir(abspath):
+            raise IsADirectoryError(f"log path is a directory: {path!r}")
+        if not os.path.exists(abspath) and not _segment_numbers(abspath):
+            raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+        if abspath not in seen:
+            seen.add(abspath)
+            abspaths.append(abspath)
+    abspaths.sort()
+    # Settle the logs one by one in lexicographic order, holding never
+    # more than one log lock: the fixed recovery order inside
+    # _finish_pending finishes staged compaction, prune and snapshot
+    # work before transaction residue, so every coordinator record read
+    # afterwards describes a quiescent, crash-consistent state.
+    for abspath in abspaths:
+        with _tx_log_guard(abspath):
+            fd = _tx_lock_existing_set(abspath)
+            try:
+                _finish_pending(abspath)
+                fd = _relock_after_settle(fd, abspath, create=True)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+    summaries = _tx_replay_scan(abspaths)
+    return _tx_replay_rows(abspaths, summaries)
