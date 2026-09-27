@@ -38,6 +38,7 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher tx-read FILE TRANSACTION_ID
     python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
     python3 -m weighted_batcher tx-conflicts FILE
+    python3 -m weighted_batcher tx-replay FILE [FILE ...]
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -114,6 +115,23 @@ normally, its batch landing whole in write-serial order. Both
 subcommands exit 0 on success and 1 on failure, and print usage on
 stderr and exit 2 on a wrong argument count (or a transaction id that
 is not an integer).
+
+`tx-replay FILE [FILE ...]` replays and reconciles every transaction
+found on the given logs: half-finished compactions, prunes, snapshot
+copies and transaction residue are first settled in the established
+deterministic order, already-decided transactions are reproduced
+according to their recorded outcome, and every still-undecided
+transaction is decided by ascending identifier — the smaller identifier
+wins first and a conflicting later one (including one whose write-serial
+range overlaps an already-decided winner's) loses and is rejected, its
+whole batch never taking effect. It prints one JSON object per
+transaction, `{"txid":N,"state":"...","rejected":[...],"serials":[...]}`
+with keys in that order: the final state (`committed`, `rolled_back`,
+`rejected` or `pending`), the identifiers rejected in a winning
+transaction's favour, and the transaction's write serials in ascending
+order — every identifier and serial an exact decimal integer. It exits
+0 on success and 1 on failure; a missing log argument prints usage on
+stderr and exits 2.
 
 ## Public interface
 
@@ -418,6 +436,41 @@ is not an integer).
   segment exists, `IsADirectoryError` for a directory, `OSError` for a
   non-string path or a locking failure, and `ValueError` for corrupt
   transaction state.
+- `weighted_batcher.tx_replay_metrics(paths) -> list[dict]` replays and
+  reconciles every transaction found on the logs in `paths` (a
+  non-empty sequence with no repeated path) and returns one mapping per
+  transaction, ordered by ascending identifier:
+  `{"txid": ..., "state": ..., "rejected": [...], "serials": [...]}`
+  with keys in that order. Each log is locked one at a time in
+  lexicographic path order — never two log locks held at once — and its
+  half-finished compactions, prunes, snapshot copies and transaction
+  residue are settled in the established deterministic order before its
+  transaction registry is read, so concurrent appends, commits,
+  adjudications and replays neither tear a record nor lose an update,
+  and same-process reads and writes interleaved with a replay neither
+  self-deadlock nor report spurious locking failures. Already-decided
+  transactions are reproduced according to their recorded outcome;
+  every still-undecided transaction is decided by ascending identifier,
+  the smaller identifier winning first and a conflicting later one —
+  including one whose write-serial range overlaps an already-decided
+  winner's — losing and being atomically published as `rejected`, its
+  whole batch never taking effect. Each verdict is re-checked under the
+  transaction's coordinator lock before publication, so a concurrent
+  commit, rollback or adjudication of the same transaction yields one
+  determinate final state, and a crash leaves the pre- or post-replay
+  state, never half a state file. `state` is one of `committed`,
+  `rolled_back`, `rejected` or `pending`; `rejected` lists the
+  identifiers rejected in a winning transaction's favour (empty for a
+  non-winner); `serials` lists the transaction's write serials in
+  ascending order — every identifier and serial an exact decimal
+  integer, never a float. Log contents are only ever streamed, never
+  materialised. Raises `TypeError` if `paths` is not a sequence,
+  `ValueError` if it is empty or repeats a path, an identifier is
+  forged or belongs to a different transaction than the log it was
+  found on, or the transaction state is corrupt, `FileNotFoundError`
+  if a log has neither a current log nor any segment,
+  `IsADirectoryError` for a directory, and `OSError` for a non-string
+  path or a locking/write failure.
 
 ## Tests
 

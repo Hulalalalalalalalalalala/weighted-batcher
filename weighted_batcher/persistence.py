@@ -128,6 +128,24 @@ modified by a single byte or an injected record raises
 truncated wholesale or a replaced segment raises :class:`ValueError`
 naming the write ordinal that no longer matches.
 
+:func:`tx_replay_metrics` replays and reconciles every transaction found
+on a set of logs.  Each log is locked one at a time in lexicographic
+path order -- never two log locks held at once -- and its half-finished
+compactions, prunes, snapshot copies and transaction residue are settled
+in the established deterministic order before its transaction registry
+is read.  Already-decided transactions are reproduced according to
+their recorded outcome; every still-undecided transaction is decided by
+ascending identifier, the smaller identifier winning first and a
+conflicting later one -- including one whose range overlaps an
+already-decided winner's -- losing and being rejected, its whole batch
+never taking effect.  Each replay verdict is one atomic
+coordinator-record publication, so a crash leaves the pre- or
+post-replay state, never half a state file.  The result is one mapping
+per transaction -- its final state (``committed``, ``rolled_back``,
+``rejected`` or ``pending``), the identifiers rejected in its favour
+and its write serials in ascending order -- every identifier, count and
+serial an exact decimal integer.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -179,6 +197,7 @@ __all__ = [
     "tx_read_metrics",
     "tx_adjudicate_metrics",
     "tx_conflicts_metrics",
+    "tx_replay_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -4837,3 +4856,267 @@ def tx_conflicts_metrics(path):
         for txid in txids
         if overlaps[txid]
     ]
+
+
+def tx_replay_metrics(paths):
+    """Replay and reconcile every transaction found on the given logs.
+
+    ``paths`` is a non-empty sequence of log paths with no repeats.  Each
+    log is guarded, locked and settled one at a time in lexicographic
+    path order -- never two log locks held at once -- so half-finished
+    compactions, prunes, snapshot copies and transaction residue are
+    cleaned up in the established deterministic order before the
+    transaction registries are read, and concurrent appends, commits,
+    adjudications and replays neither tear a record nor lose an update.
+
+    Reconciliation is a deterministic serialisable replay:
+
+    * an already-decided transaction is reproduced according to its
+      recorded outcome -- a committed one's batch joins its logs whole,
+      a rolled-back or rejected one's residue is swept;
+    * every still-undecided transaction is decided by ascending
+      identifier, the smaller identifier winning first: a transaction
+      loses -- and is atomically published as ``rejected``, its whole
+      batch never taking effect -- when its write-serial range overlaps
+      a standing winner's (committed or adjudicated) or a smaller
+      still-undecided transaction's on a shared log.  Each verdict is
+      re-checked under the transaction's coordinator lock before
+      publication, so a concurrent commit, rollback or adjudication of
+      the same transaction yields one determinate final state.
+
+    Returns one mapping per transaction found, ordered by ascending
+    identifier: ``{"txid": ..., "state": ..., "rejected": [...],
+    "serials": [...]}`` with the final state (``"committed"``,
+    ``"rolled_back"``, ``"rejected"`` or ``"pending"``), the identifiers
+    rejected in a winning transaction's favour (empty for a non-winner)
+    and the transaction's write serials in ascending order -- every
+    identifier and serial an exact decimal integer, never a float.  Log
+    contents are only ever streamed, never materialised.
+
+    Raises:
+        TypeError: ``paths`` is not a sequence of paths.
+        ValueError: ``paths`` is empty or repeats a path, an identifier
+            is forged or belongs to a different transaction than the log
+            it was found on, or the transaction state is corrupt.
+        FileNotFoundError: a log has neither a current log nor any
+            segment.
+        IsADirectoryError: a path is a directory.
+        OSError: a path is not a string, or locking or writing fails;
+            no half-written state file is left behind.
+    """
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        raise TypeError(
+            f"paths must be a sequence of log paths, got "
+            f"{type(paths).__name__}"
+        )
+    if len(paths) == 0:
+        raise ValueError("replay needs at least one log path")
+    for path in paths:
+        if not isinstance(path, str):
+            raise OSError(
+                f"log path must be a string, got {type(path).__name__}"
+            )
+    absolute = [os.path.abspath(path) for path in paths]
+    if len(set(absolute)) != len(absolute):
+        raise ValueError("a log path is repeated")
+    for path in paths:
+        if os.path.isdir(path):
+            raise IsADirectoryError(f"log path is a directory: {path!r}")
+    for path in paths:
+        members, _pruned = _resolve_members(path)
+        if not members:
+            raise FileNotFoundError(f"no metrics log or segments at {path!r}")
+
+    logset = set(absolute)
+
+    # Phase 1: one log lock at a time in lexicographic order, collect the
+    # transaction registry and then settle every half-finished mutation
+    # in the established deterministic order.  The registry is read
+    # before settling so decided transactions -- whose entries the settle
+    # sweeps once their outcome is reproduced -- are still reported.
+    found = {}
+    for abspath in sorted(absolute):
+        with _tx_log_guard(abspath):
+            fd = _tx_lock_existing_set(abspath)
+            try:
+                registry = _tx_read_sidecar(abspath)
+                for txid_text, entry in registry.items():
+                    found.setdefault(int(txid_text), {})[abspath] = entry["r"]
+                _finish_pending(abspath)
+                fd = _relock_after_settle(fd, abspath, create=True)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
+    # Phase 2: load the coordinator records.  An entry with no record --
+    # or one whose begin died mid-flight -- is crash residue the settle
+    # already swept, never a transaction.  A record that does not
+    # participate in the log its entry was found on, or whose staged
+    # lines differ from the entry's, is forged or corrupt state.
+    records = {}
+    for txid in sorted(found):
+        record = _tx_read_coordinator(txid)
+        if record is not None and record["s"] == _TX_STATUS_PREPARING:
+            # A begin mid-flight holds the prepare flock; acquiring it
+            # means the begin is dead and its residue was swept.  Re-read
+            # under the lock, exactly as the settle does, so a begin that
+            # finished in between is seen with its terminal status.
+            prep_fd = _tx_prepare_lock_try(txid)
+            if prep_fd is None or prep_fd is False:
+                # A live begin: the transaction is still being prepared.
+                records[txid] = record
+                continue
+            try:
+                record = _tx_read_coordinator(txid)
+            finally:
+                os.close(prep_fd)
+            if record is None or record["s"] == _TX_STATUS_PREPARING:
+                continue
+        if record is None:
+            continue
+        for abspath, lines in found[txid].items():
+            if abspath not in record["logs"]:
+                raise ValueError(
+                    f"forged or foreign transaction id: {txid}"
+                )
+            index = record["logs"].index(abspath)
+            if record["records"][index] != lines:
+                raise ValueError(
+                    f"corrupt transaction {txid} state at {abspath!r}: "
+                    f"prepared records do not match the coordinator record"
+                )
+        records[txid] = record
+
+    def _spans(record):
+        """``{log: (start, count)}`` write-serial ranges on the replayed logs."""
+        spans = {}
+        for index, abspath in enumerate(record["logs"]):
+            if abspath in logset:
+                spans[abspath] = (
+                    record["serials"][index],
+                    len(record["records"][index]),
+                )
+        return spans
+
+    def _conflict(first, second):
+        """True when two per-log ranges overlap on at least one shared log."""
+        for abspath, (start, count) in first.items():
+            other = second.get(abspath)
+            if other is not None and _tx_ranges_overlap(
+                start, count, other[0], other[1]
+            ):
+                return True
+        return False
+
+    # Phase 3: plan the verdict of every still-undecided transaction by
+    # ascending identifier -- a standing winner (committed or adjudicated)
+    # or a smaller still-undecided conflicting transaction wins first.
+    undecided = {}
+    winners = {}
+    for txid, record in records.items():
+        if record["s"] == _TX_STATUS_COMMITTED:
+            winners[txid] = _spans(record)
+        elif record["s"] == _TX_STATUS_PREPARED:
+            if record.get("a") == _TX_VERDICT_WINNER:
+                winners[txid] = _spans(record)
+            elif "a" not in record:
+                undecided[txid] = _spans(record)
+    losers = set()
+    for txid in sorted(undecided):
+        own = undecided[txid]
+        if any(_conflict(own, span) for span in winners.values()):
+            losers.add(txid)
+        elif any(
+            _conflict(own, undecided[other])
+            for other in undecided
+            if other < txid
+        ):
+            losers.add(txid)
+
+    # Phase 4: publish each replay verdict as one atomic coordinator
+    # record publication, re-reading under the coordinator lock so a
+    # concurrent commit, rollback or adjudication is respected and the
+    # final state of one transaction is determinate and unique.
+    for txid in sorted(undecided):
+        verdict = (
+            _TX_VERDICT_REJECTED if txid in losers else _TX_VERDICT_WINNER
+        )
+        with _tx_coord_guard(txid):
+            lock_fd = _tx_coord_flock(txid)
+            try:
+                current = _tx_read_coordinator(txid)
+                if current is None:
+                    records.pop(txid, None)
+                    continue
+                if (
+                    current["s"] == _TX_STATUS_PREPARED
+                    and "a" not in current
+                ):
+                    current["a"] = verdict
+                    if verdict == _TX_VERDICT_REJECTED:
+                        current["s"] = _TX_STATUS_REJECTED
+                    _tx_write_coordinator(current)
+                records[txid] = current
+            finally:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+
+    # Phase 5: report one row per transaction in ascending identifier
+    # order.  A winner's rejected set holds every rejected transaction
+    # whose range overlaps its own on a shared log.
+    final_winners = {
+        txid: _spans(record)
+        for txid, record in records.items()
+        if record["s"] == _TX_STATUS_COMMITTED
+        or (
+            record["s"] == _TX_STATUS_PREPARED
+            and record.get("a") == _TX_VERDICT_WINNER
+        )
+    }
+    final_rejected = {
+        txid: _spans(record)
+        for txid, record in records.items()
+        if record["s"] == _TX_STATUS_REJECTED
+    }
+    rows = []
+    for txid in sorted(records):
+        record = records[txid]
+        status = record["s"]
+        if status == _TX_STATUS_COMMITTED:
+            state = "committed"
+        elif status == _TX_STATUS_ROLLED_BACK:
+            state = "rolled_back"
+        elif status == _TX_STATUS_REJECTED:
+            state = "rejected"
+        else:
+            # Prepared (an adjudicated or replay winner, or a begin still
+            # in flight): decided to live on, not yet committed.
+            state = "pending"
+        span = final_winners.get(txid)
+        rejected = []
+        if span is not None:
+            rejected = sorted(
+                other
+                for other, other_span in final_rejected.items()
+                if other != txid and _conflict(span, other_span)
+            )
+        if status == _TX_STATUS_PREPARING:
+            # A begin still in flight has no settled write serials yet.
+            serials = []
+        else:
+            serials = []
+            for index in range(len(record["logs"])):
+                start = record["serials"][index]
+                serials.extend(
+                    range(start, start + len(record["records"][index]))
+                )
+            serials.sort()
+        rows.append(
+            {
+                "txid": txid,
+                "state": state,
+                "rejected": rejected,
+                "serials": serials,
+            }
+        )
+    return rows
