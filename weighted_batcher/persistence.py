@@ -128,6 +128,19 @@ modified by a single byte or an injected record raises
 truncated wholesale or a replaced segment raises :class:`ValueError`
 naming the write ordinal that no longer matches.
 
+:func:`tx_replay_metrics` deterministically replays and reconciles every
+transaction touching a group of logs.  Each log is settled first in the
+established deterministic order -- unfinished compaction, prune,
+snapshot copies and transaction residue -- one log at a time in
+lexicographic path order with never two log locks held at once.  Decided
+transactions keep their recorded outcome; still-undecided ones are
+serialised by ascending identifier, the smaller identifier winning first
+and a transaction overlapping a standing winner's write-serial range
+losing as a whole.  It reports one mapping per transaction -- final
+state, rejected set and write serials -- reading only coordinator
+records, never the log contents, so the replay streams with bounded
+memory.
+
 Every data-file descriptor is released before a rename on platforms that
 cannot rename open files (Windows), so sealing, compaction and pruning no
 longer raise ``PermissionError`` there.
@@ -179,6 +192,7 @@ __all__ = [
     "tx_read_metrics",
     "tx_adjudicate_metrics",
     "tx_conflicts_metrics",
+    "tx_replay_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -3468,6 +3482,12 @@ _TX_STAGE_TMP_SUFFIX = ".txstage.tmp."
 # settle racing that window can tell an in-flight begin from a crashed
 # one: the lock is tried non-blocking and a busy lock retains the entry.
 _TX_PREP_LOCK_SUFFIX = ".preplock"
+# The four final states a replayed transaction can report: committed,
+# rolled back, rejected, or still pending a decision.
+_TX_REPLAY_COMMITTED = "已提交"
+_TX_REPLAY_ROLLED_BACK = "已回滚"
+_TX_REPLAY_REJECTED = "已拒绝"
+_TX_REPLAY_PENDING = "待定"
 
 # fcntl flock is per open file description: even inside one process a
 # second open of a locked inode is denied while another thread holds it.
@@ -4648,14 +4668,63 @@ def _tx_locked_sidecar(abspath):
                 os.close(fd)
 
 
+def _tx_registry_records():
+    """Yield every coordinator record in the registry directory.
+
+    A missing registry directory yields nothing; staging, lock and other
+    sidecar names are skipped.  A present but corrupt record raises
+    :class:`ValueError` exactly as :func:`_tx_read_coordinator` does.
+    """
+    try:
+        names = os.listdir(_tx_registry_dir())
+    except FileNotFoundError:
+        return
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        stem = name[:-5]
+        if not (stem.isascii() and stem.isdigit()):
+            continue
+        record = _tx_read_coordinator(int(stem))
+        if record is not None:
+            yield record
+
+
+def _tx_decided_winners(abspath):
+    """``{txid: (start, count)}`` of decided winners touching one log.
+
+    Committed transactions and adjudicated winners still prepared stand
+    as winners whether or not the log's sidecar still carries their
+    entry -- a finished commit removes it, so the sidecar alone no
+    longer proves their range.  Their recorded write serials are final
+    (the commit point publishes the status together with the serials),
+    so a later transaction whose range overlaps one of them conflicts
+    with a decided winner and loses.
+    """
+    winners = {}
+    for record in _tx_registry_records():
+        if abspath not in record["logs"]:
+            continue
+        if record["s"] == _TX_STATUS_COMMITTED or (
+            record["s"] == _TX_STATUS_PREPARED
+            and record.get("a") == _TX_VERDICT_WINNER
+        ):
+            winners[record["id"]] = _tx_log_range(record, abspath)
+    return winners
+
+
 def tx_adjudicate_metrics(txid):
     """Adjudicate prepared transaction ``txid`` against its conflicts.
 
     Two still-undecided transactions whose write-serial ranges overlap
-    on the same log are in write-write conflict.  Adjudication orders
-    conflicting transactions by ascending identifier -- the smaller
-    identifier wins first and the conflicting later one loses and is
-    rejected.  This call decides ``txid`` exactly once:
+    on the same log are in write-write conflict, and a transaction whose
+    range overlaps an already-decided winner's -- committed, or
+    adjudicated winner and still standing -- conflicts with it whether
+    or not the log's sidecar still carries that winner's entry.
+    Adjudication orders conflicting transactions by ascending identifier
+    -- the smaller identifier wins first and the conflicting later one
+    loses and is rejected, the rejection taking effect at adjudication
+    time.  This call decides ``txid`` exactly once:
 
     * it loses when a conflicting transaction already stands as a winner
       or a conflicting transaction with a smaller identifier is still
@@ -4746,10 +4815,19 @@ def tx_adjudicate_metrics(txid):
             loses = False
             for abspath in record["logs"]:
                 registry = _tx_locked_sidecar(abspath)
-                own_start, own_count = _tx_log_range(record, abspath)
-                for other, (state, start, count) in _tx_peer_states(
-                    abspath, registry
+                peers = _tx_peer_states(abspath, registry)
+                # Decided winners stand even after their sidecar entry
+                # is gone: a later transaction overlapping a committed
+                # or standing winner's recorded range loses here and
+                # now, exactly as against a sidecar-visible winner.
+                for other, (start, count) in _tx_decided_winners(
+                    abspath
                 ).items():
+                    peers.setdefault(
+                        other, (_TX_VERDICT_WINNER, start, count)
+                    )
+                own_start, own_count = _tx_log_range(record, abspath)
+                for other, (state, start, count) in peers.items():
                     if other == txid:
                         continue
                     if not _tx_ranges_overlap(
@@ -4837,3 +4915,157 @@ def tx_conflicts_metrics(path):
         for txid in txids
         if overlaps[txid]
     ]
+
+
+def tx_replay_metrics(paths):
+    """Replay every transaction touching ``paths`` and reconcile states.
+
+    ``paths`` is a sequence of one or more log paths; duplicates
+    collapse.  Before anything is replayed, each log is settled in the
+    established deterministic order -- an unfinished compaction, prune,
+    snapshot copy or transaction residue is resolved first -- one log at
+    a time in lexicographic path order with never two log locks held at
+    once, so a half-finished mutation never mixes into the reconstructed
+    result, a crash leaves the settled state, and no half state file is
+    left behind.
+
+    Every transaction recorded for the logs is then reconciled
+    deterministically.  A committed, rolled-back or rejected transaction
+    keeps its recorded outcome; a still-undecided transaction is
+    serialised against the others by ascending identifier -- the smaller
+    identifier wins first, and a transaction whose write-serial range
+    overlaps a standing winner's (committed, adjudicated, or an earlier
+    replay winner) loses and its whole batch never takes effect.
+
+    Returns an iterator yielding one mapping per transaction, ordered by
+    ascending identifier, with keys ``txid``, ``state``, ``rejected``
+    and ``serials`` in that order: the transaction identifier, its final
+    state (``已提交`` committed, ``已回滚`` rolled back, ``已拒绝``
+    rejected or ``待定`` pending), the identifiers of the transactions
+    rejected against this one in ascending order, and the transaction's
+    write serials in ascending order -- every identifier and serial an
+    exact decimal integer, never a float.  Log record contents are never
+    materialised -- only coordinator records are read -- so the replay
+    streams with bounded memory.
+
+    Raises:
+        TypeError: ``paths`` is not a sequence.
+        ValueError: no log was given, or the transaction state is
+            corrupt.
+        FileNotFoundError: a log and all its segments are missing.
+        IsADirectoryError: a path is a directory.
+        OSError: a path is not a string, or locking or writing fails.
+    """
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        raise TypeError(
+            f"paths must be a sequence of log paths, got "
+            f"{type(paths).__name__}"
+        )
+    if not paths:
+        raise ValueError("a replay needs at least one log")
+    for path in paths:
+        if not isinstance(path, str):
+            raise OSError(
+                f"log path must be a string, got {type(path).__name__}"
+            )
+    for path in paths:
+        if os.path.isdir(path):
+            raise IsADirectoryError(f"log path is a directory: {path!r}")
+    absolute = sorted({os.path.abspath(path) for path in paths})
+    for abspath in absolute:
+        if not os.path.exists(abspath) and not _segment_numbers(abspath):
+            raise FileNotFoundError(
+                f"metrics log does not exist: {abspath!r}"
+            )
+    # Settle every log in lexicographic order, one lock at a time, so
+    # concurrent appends, commits, adjudications and replays neither
+    # tear nor lose updates and never hold two log locks at once.
+    for abspath in absolute:
+        with _tx_log_guard(abspath):
+            fd = _tx_lock_existing_set(abspath)
+            try:
+                _finish_pending(abspath)
+                fd = _relock_after_settle(fd, abspath, create=True)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+    wanted = set(absolute)
+    records = {}
+    for record in _tx_registry_records():
+        if wanted.isdisjoint(record["logs"]):
+            continue
+        records[record["id"]] = record
+
+    def _log_ranges(record):
+        return {
+            abspath: (record["serials"][index], len(record["records"][index]))
+            for index, abspath in enumerate(record["logs"])
+        }
+
+    ranges = {}
+    states = {}
+    undecided = []
+    winners = set()
+    for txid, record in records.items():
+        status = record["s"]
+        if status == _TX_STATUS_PREPARING:
+            # A begin mid-flight (or its crash residue): no final state
+            # and no real write serials yet, so it bears no range.
+            states[txid] = _TX_REPLAY_PENDING
+            ranges[txid] = {}
+            continue
+        ranges[txid] = _log_ranges(record)
+        if status == _TX_STATUS_COMMITTED:
+            states[txid] = _TX_REPLAY_COMMITTED
+            winners.add(txid)
+        elif status == _TX_STATUS_ROLLED_BACK:
+            states[txid] = _TX_REPLAY_ROLLED_BACK
+        elif status == _TX_STATUS_REJECTED:
+            states[txid] = _TX_REPLAY_REJECTED
+        elif record.get("a") == _TX_VERDICT_WINNER:
+            # An adjudicated winner still prepared: decided, pending commit.
+            states[txid] = _TX_REPLAY_PENDING
+            winners.add(txid)
+        else:
+            undecided.append(txid)
+
+    def _overlaps(first, second):
+        for abspath in ranges[first].keys() & ranges[second].keys():
+            if _tx_ranges_overlap(
+                *ranges[first][abspath], *ranges[second][abspath]
+            ):
+                return True
+        return False
+
+    # Still-undecided transactions are serialised by ascending
+    # identifier: the smaller identifier wins first, and a transaction
+    # whose range overlaps a standing winner's loses as a whole.
+    for txid in sorted(undecided):
+        if any(_overlaps(txid, winner) for winner in winners):
+            states[txid] = _TX_REPLAY_REJECTED
+        else:
+            states[txid] = _TX_REPLAY_PENDING
+            winners.add(txid)
+    # Every rejected transaction is charged to the smallest conflicting
+    # winner's rejected set, in ascending identifier order.
+    defeated = {txid: [] for txid in records}
+    for txid in sorted(records):
+        if states[txid] != _TX_REPLAY_REJECTED:
+            continue
+        beaters = [winner for winner in winners if _overlaps(txid, winner)]
+        if beaters:
+            defeated[min(beaters)].append(txid)
+
+    def _generate():
+        for txid in sorted(records):
+            serials = []
+            for start, count in ranges[txid].values():
+                serials.extend(range(start, start + count))
+            yield {
+                "txid": txid,
+                "state": states[txid],
+                "rejected": defeated[txid],
+                "serials": sorted(serials),
+            }
+
+    return _generate()

@@ -29,6 +29,7 @@
     python3 -m weighted_batcher tx-read FILE TRANSACTION_ID
     python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
     python3 -m weighted_batcher tx-conflicts FILE
+    python3 -m weighted_batcher tx-replay FILE [FILE ...]
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ from . import (
     tx_commit_metrics,
     tx_conflicts_metrics,
     tx_read_metrics,
+    tx_replay_metrics,
     tx_rollback_metrics,
     verify_metrics,
 )
@@ -100,7 +102,8 @@ _USAGE = (
     "  python3 -m weighted_batcher tx-rollback TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-read FILE TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID\n"
-    "  python3 -m weighted_batcher tx-conflicts FILE"
+    "  python3 -m weighted_batcher tx-conflicts FILE\n"
+    "  python3 -m weighted_batcher tx-replay FILE [FILE ...]"
 )
 
 
@@ -418,6 +421,18 @@ def _tx_conflicts(path):
     # and its overlapping write serials, all exact decimal integers.
     for entry in tx_conflicts_metrics(path):
         sys.stdout.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    return 0
+
+
+def _tx_replay(paths):
+    # One JSON line per transaction touching the given logs: identifier,
+    # final state, rejected set and write serials, keys in that order,
+    # every count and serial an exact decimal integer.  The state words
+    # are non-ASCII, so the line is written with ensure_ascii off.
+    for entry in tx_replay_metrics(paths):
+        sys.stdout.write(
+            json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
     return 0
 
 
@@ -755,6 +770,12 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(_tx_conflicts, args[1])
+    if args and args[0] == "tx-replay":
+        # One or more log paths; a missing path list is a usage error.
+        if len(args) < 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda _path: _tx_replay(args[1:]), args[1])
     print(_USAGE, file=sys.stderr)
     return 2
 
