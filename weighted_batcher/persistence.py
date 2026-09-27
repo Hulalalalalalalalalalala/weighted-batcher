@@ -193,6 +193,8 @@ __all__ = [
     "tx_adjudicate_metrics",
     "tx_conflicts_metrics",
     "tx_replay_metrics",
+    "merge_metrics",
+    "split_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -364,6 +366,33 @@ def _open_locked(path, create):
     return fd
 
 
+def _mutation_lock_may_recover(path):
+    """Whether this caller should drive anchor-first marker recovery.
+
+    Runs before the log lock is taken (the caller holds no lock), so it
+    is safe to wait on the anchor of a live merge/split: the live run
+    needs the involved log locks (which this caller does not hold yet)
+    and finishes as soon as in-flight writers release theirs.  Both a
+    committed plan and a pre-commit freeze are recovered/wait on here so
+    that every involved peer is settled together, rather than leaving a
+    sibling's freeze behind when only one log is written next.
+    Transaction/reorg internals and a raced begin never recover (their
+    lock order is anchor -> coordinator -> log).
+    """
+    if _tx_coord_is_active() or _reorg_recovering_is_active():
+        return False
+    if _reorg_live_is_active():
+        return False
+    if _reorg_prepare_is_active():
+        # This begin either raced the freeze (it finishes staging and
+        # the reorg drains its prepare flock) or passed the entry gate
+        # after the markers vanished; never seek the anchor here.
+        return False
+    return os.path.exists(path + _REORG_PLAN_SUFFIX) or os.path.exists(
+        path + _REORG_FREEZE_SUFFIX
+    )
+
+
 def _mutation_lock(path, create):
     """Lock the segment set for a mutation, or just prove the log exists.
 
@@ -371,7 +400,16 @@ def _mutation_lock(path, create):
     on platforms without :mod:`fcntl`, where the existence check has
     already closed its descriptor and no rename may happen with a handle
     still open.
+
+    Before the log lock is taken, a caller holding no higher-level
+    transaction or reorganisation lock finishes or waits out any
+    merge/split marker covering the log, anchor first.  Transaction and
+    reorganisation internals skip that step: their lock hierarchy is
+    anchor -> coordinator -> log and they never seek a lock below a held
+    one, so they block on the relevant flock directly instead.
     """
+    if _mutation_lock_may_recover(path):
+        _reorg_recover_markers(path)
     fd = _open_locked(path, create)
     if fcntl is None:
         os.close(fd)
@@ -628,6 +666,16 @@ def _resolve_members(path):
 
 def _resolve_once(path, marker_raw):
     """Resolve one directory state, returning it with the post-listing marker."""
+    # A merge/split at or past its commit point keeps the whole new set in
+    # the staged whole slice until the local swap finishes; lock-free
+    # reads resolve to that one file on the new zero pruned basis.  Once
+    # the slice is renamed into path.1 (and the prune marker reads zero)
+    # resolution falls through to the finished members.
+    if os.path.exists(path + _REORG_PLAN_SUFFIX) and os.path.exists(
+        path + _REORG_SEG_SUFFIX
+    ):
+        return [path + _REORG_SEG_SUFFIX], 0, _marker_observation(path)
+
     if marker_raw:
         data = json.loads(marker_raw.decode("utf-8"))
         pruned, plan = (
@@ -858,6 +906,10 @@ def _finish_pending(path):
     _finish_staged_compact(path)
     _finish_staged_prune(path)
     _finish_snapshot_orphans(path)
+    # A merge/split a crash interrupted is finished before transaction
+    # residue is settled, so translated sidecars and coordinator serials
+    # are in place when tx recovery runs; a no-op without a marker.
+    _finish_pending_reorg(path)
     # After the log's own staged mutations are settled and before the
     # audit chain is caught up, resolve transaction residue: a committed
     # transaction a crash left unfinished joins its batch whole here, and
@@ -4104,11 +4156,29 @@ def _tx_prepare_one(path, txid, lines, payload):
         try:
             _finish_pending(path)
             fd = _relock_after_settle(fd, path, create=False)
+            # A freeze published after this begin cleared the entry gate:
+            # if this thread itself holds the live prepare flock the
+            # begin predates the freeze and the reorganisation is draining
+            # it, so staging proceeds; otherwise a newer begin loses the
+            # race and aborts before writing any sidecar state.
+            if os.path.exists(_reorg_freeze_path(path)) or os.path.exists(
+                _reorg_plan_path(path)
+            ):
+                probe = _tx_prepare_lock_try(txid)
+                owner = probe is None or probe is False
+                if probe is not None and probe is not False:
+                    os.close(probe)
+                if not owner:
+                    raise OSError(
+                        errno.EBUSY,
+                        "transaction preparation raced a merge/split",
+                    )
             serial = _tx_record_total(path)
             _tx_write_stage(path, txid, payload)
             registry = _tx_read_sidecar(path)
             registry[str(txid)] = {"r": lines}
             _tx_write_sidecar(path, registry)
+            _tx_index_add(path, txid)
             return serial
         finally:
             if fd is not None:
@@ -4175,6 +4245,9 @@ def tx_begin_metrics(logs, records):
     for path in paths:
         if not os.path.exists(path):
             raise FileNotFoundError(f"metrics log does not exist: {path!r}")
+    # Wait out any merge/split covering a participating log before this
+    # begin exists; this holds no log or coordinator lock.
+    _reorg_wait_for_gate(paths)
 
     order = sorted(range(len(paths)), key=lambda index: absolute[index])
 
@@ -4192,7 +4265,21 @@ def tx_begin_metrics(logs, records):
     if fcntl is not None:
         fcntl.flock(prep_fd, fcntl.LOCK_EX)
     prepared = []
+    # This begin may have started just before a merge/split published its
+    # freezes (the drain waits for exactly this prepare flock while
+    # holding no log lock); mark the thread so its log opens never attempt
+    # anchor-first marker recovery, which would circularly wait on the
+    # reorganisation that is waiting for this staging to finish.
+    _reorg_prepare_active_set(True)
     try:
+        # Re-check the merge/split gate here as well: a begin that
+        # cleared the entry gate but had not published anything when a
+        # freeze appeared must fail rather than publish "preparing"
+        # mid-reorganisation (it could then stage only some logs before
+        # blocking on a reorg-held log lock, which the reorg could not
+        # translate or discard consistently).  Its own failure path rolls
+        # the empty preparation back.
+        _reorg_wait_for_gate(paths)
         # Publish before the first sidecar byte, so a racing settler
         # always sees either nothing or a coordinator record whose
         # liveness flock answers authoritatively.
@@ -4238,6 +4325,7 @@ def tx_begin_metrics(logs, records):
             pass
         raise
     finally:
+        _reorg_prepare_active_set(False)
         os.close(prep_fd)
         # The begin is over; the terminal prepare status is durable, so
         # the liveness lock has no further reader and its anchor is
@@ -4272,7 +4360,11 @@ def _tx_acquire_logs(record):
     in-process/flock acquisition graph is acyclic for any two
     transactions whose groups overlap.  Returns
     ``[(abspath, guard, fd), ...]``; the caller releases in reverse.
+    The caller already holds this transaction's coordinator flock, so the
+    thread is marked and log-lock opens skip anchor-first recovery to
+    preserve the anchor -> coordinator -> log order.
     """
+    _tx_coord_set(True)
     held = []
     try:
         for abspath in record["logs"]:
@@ -4292,6 +4384,7 @@ def _tx_acquire_logs(record):
                 except OSError:
                     pass
             guard.__exit__(None, None, None)
+        _tx_coord_set(False)
         raise
 
 
@@ -4300,6 +4393,7 @@ def _tx_release_logs(held):
         if fd is not None:
             os.close(fd)
         guard.__exit__(None, None, None)
+    _tx_coord_set(False)
 
 
 def _tx_coord_flock(txid):
@@ -4383,6 +4477,7 @@ def tx_commit_metrics(txid):
     _tx_check_identifier(txid)
     with _tx_coord_guard(txid):
         lock_fd = _tx_coord_flock(txid)
+        _tx_coord_set(True)
         try:
             record = _tx_read_coordinator(txid)
             if record is None:
@@ -4421,34 +4516,74 @@ def tx_commit_metrics(txid):
                     raise ValueError(
                         f"transaction {txid} preparation never finished"
                     )
-            held = _tx_acquire_logs(record)
-            try:
-                serials = []
-                for index, (abspath, _guard, _fd) in enumerate(held):
-                    entry = _tx_read_sidecar(abspath).get(str(txid))
-                    lines = record["records"][index]
-                    if entry is None or entry["r"] != lines:
-                        raise ValueError(
-                            f"corrupt transaction {txid} state at "
-                            f"{abspath!r}: prepared records do not match "
-                            f"the coordinator record"
-                        )
-                    serials.append(_tx_record_total(abspath))
-                # The single commit point, carrying the exact serials
-                # read while every participating log was locked.
-                record["serials"] = serials
-                record["s"] = _TX_STATUS_COMMITTED
-                _tx_write_coordinator(record)
-                for index, (abspath, _guard, _fd) in enumerate(held):
-                    lines = record["records"][index]
-                    payload = _tx_batch_payload(lines)
-                    if payload:
-                        _tx_append_whole(abspath, payload)
-                    _tx_clean_one(abspath, txid)
-                    _sync_audit_for_write(abspath)
-            finally:
-                _tx_release_logs(held)
+            # Acquire the participating logs against a record read while
+            # this transaction's coordinator flock is held.  A merge/
+            # split needs the same flock to translate the record, so once
+            # the log locks are held the record is re-read; if a reorg
+            # translated it while any lock was waited on, all locks are
+            # released and acquisition restarts from the new
+            # participating-log set (the reorg that won the race has
+            # finished and released its flocks, so this terminates).
+            held = None
+            next_record = _tx_read_coordinator(txid)
+            committed = False
+            while not committed:
+                basis = next_record
+                held = _tx_acquire_logs(basis)
+                try:
+                    refreshed = _tx_read_coordinator(txid)
+                    if (
+                        refreshed is None
+                        or refreshed["logs"] != [
+                            abspath for abspath, _g, _f in held
+                        ]
+                    ):
+                        # The participating set changed (a merge/split
+                        # translated the record) while the locks were
+                        # acquired; drop them and retry from the new set.
+                        next_record = refreshed
+                        continue
+                    record = refreshed
+                    serials = []
+                    sidecar_ok = True
+                    for index, (abspath, _guard, _fd) in enumerate(held):
+                        entry = _tx_read_sidecar(abspath).get(str(txid))
+                        lines = record["records"][index]
+                        if entry is None or entry["r"] != lines:
+                            sidecar_ok = False
+                            break
+                        serials.append(_tx_record_total(abspath))
+                    if not sidecar_ok:
+                        # A merge/split is mid-publication (its commit
+                        # point already renamed the coordinator record or
+                        # is about to); the layout the record describes is
+                        # not installed on every participating log yet.
+                        # Release the locks and retry until the record and
+                        # all sidecars describe the same finished world --
+                        # the reorg needs these log locks to finish and
+                        # this thread holds none between retries, so this
+                        # always converges rather than deadlocking.
+                        next_record = record
+                        time.sleep(0.002)
+                        continue
+                    # Every participating sidecar matches.  This is the
+                    # single commit point with exact serials read while
+                    # every participating log was locked.
+                    record["serials"] = serials
+                    record["s"] = _TX_STATUS_COMMITTED
+                    _tx_write_coordinator(record)
+                    for index, (abspath, _guard, _fd) in enumerate(held):
+                        lines = record["records"][index]
+                        payload = _tx_batch_payload(lines)
+                        if payload:
+                            _tx_append_whole(abspath, payload)
+                        _tx_clean_one(abspath, txid)
+                        _sync_audit_for_write(abspath)
+                    committed = True
+                finally:
+                    _tx_release_logs(held)
         finally:
+            _tx_coord_set(False)
             if lock_fd is not None:
                 os.close(lock_fd)
 
@@ -4476,6 +4611,7 @@ def tx_rollback_metrics(txid):
     _tx_check_identifier(txid)
     with _tx_coord_guard(txid):
         lock_fd = _tx_coord_flock(txid)
+        _tx_coord_set(True)
         try:
             record = _tx_read_coordinator(txid)
             if record is None:
@@ -4509,6 +4645,7 @@ def tx_rollback_metrics(txid):
                         if fd is not None:
                             os.close(fd)
         finally:
+            _tx_coord_set(False)
             if lock_fd is not None:
                 os.close(lock_fd)
 
@@ -4702,7 +4839,7 @@ def _tx_decided_winners(abspath):
     with a decided winner and loses.
     """
     winners = {}
-    for record in _tx_registry_records():
+    for record in _tx_related_records([abspath]):
         if abspath not in record["logs"]:
             continue
         if record["s"] == _TX_STATUS_COMMITTED or (
@@ -4770,6 +4907,7 @@ def tx_adjudicate_metrics(txid):
     _tx_check_identifier(txid)
     with _tx_coord_guard(txid):
         lock_fd = _tx_coord_flock(txid)
+        _tx_coord_set(True)
         try:
             record = _tx_read_coordinator(txid)
             if record is None:
@@ -4857,6 +4995,7 @@ def tx_adjudicate_metrics(txid):
                 "serials": sorted(serials),
             }
         finally:
+            _tx_coord_set(False)
             if lock_fd is not None:
                 os.close(lock_fd)
 
@@ -4991,7 +5130,10 @@ def tx_replay_metrics(paths):
                     os.close(fd)
     wanted = set(absolute)
     records = {}
-    for record in _tx_registry_records():
+    # Narrow participant-index scope: only transactions related to the
+    # requested logs are read, so a corrupt unrelated coordinator record
+    # never disturbs the replay.
+    for record in _tx_related_records(absolute):
         if wanted.isdisjoint(record["logs"]):
             continue
         records[record["id"]] = record
@@ -5069,3 +5211,1523 @@ def tx_replay_metrics(paths):
             }
 
     return _generate()
+
+
+# ---------------------------------------------------------------------------
+# Online merge and split of independent metric log sets
+#
+# merge_metrics gathers several whole log sets, in the caller's deterministic
+# order (destination first, then each source), into the destination set and
+# leaves the sources existing but empty; split_metrics moves every surviving
+# record of one set into caller-named new sets at whole-record boundaries.
+# Records move byte for byte with their original newlines; the torn tail and
+# blank lines keep the established read rule.  The new ordinal of every moved
+# record is uniquely computable: merge lays the sets' surviving records out
+# one after another, each set starting at the running record count; split
+# lays the slices out in destination order.  Every set rebuilds its pruned
+# basis at zero, so moved records are numbered from zero.
+#
+# Lock order (one global hierarchy, always acquired in this direction):
+# reorg anchor flock  ->  per-transaction coordinator flocks (ascending id)
+# ->  per-log flocks (ascending path, one at a time).  Every involved log is
+# guarded by the reentrant same-process guard as well, so same-process
+# callers never self-lock and concurrent appends, commits, rollbacks,
+# adjudications and replays serialise instead of deadlocking; overlapping
+# reorganisations share one anchor (the lexicographically smallest involved
+# path), so two of them never take anchor flocks in opposite orders.
+#
+# Crash protocol.  Freeze markers (path.reorgfreeze) are published first;
+# content is then staged under reorg-private names invisible to the numeric
+# segment walk.  Plan markers (path.reorg) are the commit point: once
+# published, lock-free reads resolve to the staged whole slices, and every
+# involved path swaps its own slice in as path.1 and installs translated
+# private state, after which the translated transaction coordinator records
+# are renamed and the plan markers retired.  Any writer that finds a marker
+# before taking its log lock recovers it anchor first -- a live run is
+# waited out (the writer holds no lock, so it cannot deadlock), a dead
+# run's peers are finished one at a time with never two log locks held.
+#
+# Decided transactions keep their verdict with write serials, participating
+# logs and batches translated through the same ordinal map the records use;
+# open (prepared) transactions keep identifier order and join whole after
+# the moved records, so the ascending-id adjudication rule and a standing
+# winner's interval are unchanged.  A transaction still mid-preparation when
+# the freeze appears finishes staging (the reorg drains its prepare flock)
+# and is then translated like any prepared transaction; newcomers wait at
+# the tx-begin entry gate.  Snapshot handles are not moved -- a handle reads
+# its pinned creation-time private copy exactly as across an append or
+# prune; take a fresh snapshot to pin the new layout.  Consumer-group
+# positions move through the same ordinal map; the audit chain is rebuilt
+# where records survive and dropped where they do not.
+#
+# path.txidx is each log's participant index of transaction ids ever
+# touching it; it scopes every read of the global coordinator registry to
+# transactions related to the log in hand, so an unrelated corrupt record
+# never affects an operation.  Old sets without an index use a lenient
+# filtered scan.
+# ---------------------------------------------------------------------------
+
+_REORG_VERSION = 1
+_REORG_PLAN_SUFFIX = ".reorg"
+_REORG_FREEZE_SUFFIX = ".reorgfreeze"
+_REORG_LOCK_SUFFIX = ".reorglock"
+_REORG_SEG_SUFFIX = ".reorgseg"
+_REORG_SEG_TMP = _REORG_SEG_SUFFIX + ".tmp"
+_REORG_GROUP_PREFIX = ".reorggroup."
+_REORG_TX_SIDECAR = ".reorg.tx"
+_REORG_TXINDEX = ".reorg.txidx"
+_REORG_COORD_TMP_MARK = ".json.reorgtmp."
+
+_TX_INDEX_SUFFIX = ".txidx"
+_TX_INDEX_TMP_SUFFIX = ".txidx.tmp"
+
+_reorg_anchor_guards = {}
+_reorg_anchor_guard_refs = {}
+_reorg_held = threading.local()
+# Set while a transaction begin is staging its logs: such a begin either
+# predates the freeze (and the reorganisation drains its prepare flock) or
+# passed the entry gate after the markers vanished, so its log opens must
+# not themselves try to recover the reorg markers (that would deadlock
+# against the drain).
+_reorg_prepare_active = threading.local()
+# True only on the thread running a live merge/split (vs crash recovery).
+_reorg_live_active = threading.local()
+
+
+def _reorg_live_set(value):
+    _reorg_live_active.flag = bool(value)
+
+
+def _reorg_live_is_active():
+    return getattr(_reorg_live_active, "flag", False)
+
+
+# True while this thread holds one or more transaction coordinator flocks;
+# its log-lock acquisitions must skip anchor-first marker recovery (the
+# hierarchy is anchor -> coordinator -> log, never the reverse).
+_tx_coord_active = threading.local()
+
+
+def _tx_coord_set(value):
+    _tx_coord_active.flag = bool(value)
+
+
+def _tx_coord_is_active():
+    return getattr(_tx_coord_active, "flag", False)
+
+
+# True while this thread is itself driving anchor-first marker recovery:
+# the per-peer log opens nested inside that recovery must not recurse
+# back into recovery.
+_reorg_recovering = threading.local()
+
+
+def _reorg_recovering_set(value):
+    _reorg_recovering.flag = bool(value)
+
+
+def _reorg_recovering_is_active():
+    return getattr(_reorg_recovering, "flag", False)
+
+
+# -- per-log transaction participant index ---------------------------------
+
+def _tx_index_path(path):
+    return path + _TX_INDEX_SUFFIX
+
+
+def _tx_read_index(path):
+    """Return the participant-id index, or ``None`` when no index exists."""
+    try:
+        fd = os.open(_tx_index_path(path), os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        ids = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"corrupt transaction index {_tx_index_path(path)!r}: {exc}"
+        ) from exc
+    if not isinstance(ids, list) or any(
+        isinstance(txid, bool) or not isinstance(txid, int) or txid < 0
+        for txid in ids
+    ):
+        raise ValueError(
+            f"corrupt transaction index {_tx_index_path(path)!r}: index "
+            f"must be a list of non-negative integer transaction ids"
+        )
+    return sorted(ids)
+
+
+def _tx_write_index(path, ids):
+    """Atomically publish the participant index; an empty one is removed."""
+    tmp = path + _TX_INDEX_TMP_SUFFIX
+    if not ids:
+        _unlink_if_exists(tmp)
+        _unlink_if_exists(_tx_index_path(path))
+        return
+    payload = json.dumps(sorted(set(ids)), separators=(",", ":")).encode(
+        "utf-8"
+    )
+    _tx_publish_json(tmp, _tx_index_path(path), payload)
+
+
+def _tx_index_add(path, txid):
+    """Append one identifier to a log's participant index (write lock held)."""
+    ids = _tx_read_index(path)
+    if ids is None:
+        ids = []
+    if txid not in ids:
+        _tx_write_index(path, ids + [txid])
+
+
+def _tx_scan_related(wanted):
+    """Yield parseable coordinator records participating in ``wanted``.
+
+    Index-free fallback for old sets.  A document that cannot be parsed is
+    skipped rather than raised: its participating logs are unreadable, so
+    it cannot be proved related to any requested log; records reached via
+    an index or a direct identifier stay strict.
+    """
+    try:
+        names = os.listdir(_tx_registry_dir())
+    except FileNotFoundError:
+        return
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        stem = name[:-5]
+        if not (stem.isascii() and stem.isdigit()):
+            continue
+        try:
+            record = _tx_read_coordinator(int(stem))
+        except ValueError:
+            continue
+        if record is not None and not wanted.isdisjoint(record["logs"]):
+            yield record
+
+
+def _tx_related_records(abspaths):
+    """Yield coordinator records related to any of ``abspaths`` (narrow)."""
+    union = set()
+    indexed = True
+    for abspath in abspaths:
+        ids = _tx_read_index(abspath)
+        if ids is None:
+            indexed = False
+            break
+        union.update(ids)
+    if indexed:
+        for txid in sorted(union):
+            record = _tx_read_coordinator(txid)
+            if record is not None:
+                yield record
+        return
+    yield from _tx_scan_related(set(abspaths))
+
+
+def _tx_related_id_set(abspaths):
+    """Union of ids related to the given logs (narrow index scope)."""
+    union = set()
+    indexed = True
+    for abspath in abspaths:
+        ids = _tx_read_index(abspath)
+        if ids is None:
+            indexed = False
+            break
+        union.update(ids)
+    if indexed:
+        return union
+    return {record["id"] for record in _tx_scan_related(set(abspaths))}
+
+
+# -- markers, locks and orphan cleanup -------------------------------------
+
+def _reorg_plan_path(path):
+    return path + _REORG_PLAN_SUFFIX
+
+
+def _reorg_freeze_path(path):
+    return path + _REORG_FREEZE_SUFFIX
+
+
+def _reorg_lock_path(abspath):
+    return abspath + _REORG_LOCK_SUFFIX
+
+
+def _reorg_anchor_tag(anchor):
+    return hashlib.blake2b(anchor.encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _reorg_anchor_guard(anchor):
+    return _TxGuard(_reorg_anchor_guards, _reorg_anchor_guard_refs, anchor)
+
+
+def _reorg_anchor_mark(anchor):
+    held = getattr(_reorg_held, "anchors", None)
+    if held is None:
+        held = set()
+        _reorg_held.anchors = held
+    held.add(anchor)
+
+
+def _reorg_anchor_unmark(anchor):
+    held = getattr(_reorg_held, "anchors", None)
+    if held:
+        held.discard(anchor)
+
+
+def _reorg_anchor_is_held(anchor):
+    held = getattr(_reorg_held, "anchors", None)
+    return bool(held and anchor in held)
+
+
+def _reorg_prepare_active_set(value):
+    _reorg_prepare_active.flag = bool(value)
+
+
+def _reorg_prepare_is_active():
+    return getattr(_reorg_prepare_active, "flag", False)
+
+
+def _reorg_read_marker(target):
+    """Read one JSON reorg marker; ``None`` when the file is absent."""
+    try:
+        fd = os.open(target, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"corrupt reorg state {target!r}: {exc}") from exc
+
+
+def _reorg_publish(target, payload_bytes):
+    # Atomic stage-and-rename; retried if the private temporary file was
+    # removed by another operation's orphan sweep in the tiny window
+    # before this reorganisation's per-path locks were observed.
+    for _ in range(100):
+        try:
+            _tx_publish_json(target + ".tmp", target, payload_bytes)
+            return
+        except FileNotFoundError:
+            if os.path.exists(target):
+                return
+            time.sleep(0.001)
+    _tx_publish_json(target + ".tmp", target, payload_bytes)
+
+
+def _reorg_anchor_flock(anchor, blocking):
+    """Take the anchor flock; returns fd, or ``False`` when non-blocking busy."""
+    if fcntl is None:
+        return None
+    fd = os.open(anchor, os.O_RDWR | os.O_CREAT, 0o666)
+    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+    try:
+        try:
+            fcntl.flock(fd, flags)
+        except OSError as exc:
+            if not blocking and exc.errno in (
+                errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK
+            ):
+                os.close(fd)
+                return False
+            os.close(fd)
+            raise
+    except OSError:
+        raise
+    return fd
+
+
+def _reorg_sweep_private(path):
+    """Remove this path's private reorg staging files (write lock held).
+
+    A live reorganisation holds ``path.reorglock`` for its whole
+    staging window, so the sweep first tries that flock non-blocking: a
+    busy lock means a live run may be publishing this very directory and
+    the staging files are not orphans.  The names never overlap data
+    members or established sidecars.
+    """
+    if fcntl is not None:
+        guard_fd = os.open(
+            _reorg_lock_path(path), os.O_RDWR | os.O_CREAT, 0o666
+        )
+        try:
+            try:
+                fcntl.flock(guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    return  # a live reorganisation owns this directory
+                raise
+        finally:
+            os.close(guard_fd)
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    exact = (
+        _REORG_SEG_SUFFIX,
+        _REORG_SEG_TMP,
+        _REORG_TX_SIDECAR,
+        _REORG_TX_SIDECAR + ".tmp",
+        _REORG_TXINDEX,
+        _REORG_TXINDEX + ".tmp",
+        _REORG_PLAN_SUFFIX,
+        _REORG_PLAN_SUFFIX + ".tmp",
+        _REORG_FREEZE_SUFFIX,
+        _REORG_FREEZE_SUFFIX + ".tmp",
+    )
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if name in (base + suffix for suffix in exact) or name.startswith(
+            base + _REORG_GROUP_PREFIX
+        ):
+            _unlink_if_exists(os.path.join(directory, name))
+
+
+def _reorg_sweep_coord_temps(tag):
+    """Remove staged coordinator payloads carrying one dead anchor's tag."""
+    directory = _tx_registry_dir()
+    suffix = _REORG_COORD_TMP_MARK + tag
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if name.endswith(suffix):
+            _unlink_if_exists(os.path.join(directory, name))
+
+
+def _reorg_list_group_files(path):
+    """``{group: state_path}`` of consumer-group state files on one log."""
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    prefix = base + _GROUP_STATE_SUFFIX
+    groups = {}
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return groups
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        group = name[len(prefix):]
+        if group.endswith(_GROUP_STATE_LOCK_SUFFIX) or group.endswith(
+            _GROUP_STATE_TMP_SUFFIX
+        ):
+            continue
+        groups[group] = os.path.join(directory, name)
+    return groups
+
+
+def _reorg_point_owner(points, local):
+    """Owner of local surviving ordinal over sorted ``[(start, owner)]``.
+
+    An ordinal equal to a slice start belongs to that slice; one at or
+    past the last start (the end edge) belongs to the last slice.
+    """
+    owner = points[0][1]
+    for start, candidate in points:
+        if local < start:
+            return owner
+        owner = candidate
+    return owner
+
+
+# -- validation and locking ------------------------------------------------
+
+def _reorg_check_str_path(path):
+    if not isinstance(path, str):
+        raise OSError(
+            f"log path must be a string, got {type(path).__name__}"
+        )
+    if os.path.isdir(path):
+        raise IsADirectoryError(f"log path is a directory: {path!r}")
+
+
+def _reorg_require_existing(path):
+    _reorg_check_str_path(path)
+    if not os.path.exists(path) and not _segment_numbers(path):
+        raise FileNotFoundError(f"metrics log does not exist: {path!r}")
+
+
+def _reorg_check_no_path_prefix_collision(absolute):
+    """Reject paths whose ``path.<suffix>`` sidecar name spaces overlap."""
+    ordered = sorted(absolute)
+    for first, second in zip(ordered, ordered[1:]):
+        if second.startswith(first + "."):
+            raise ValueError(
+                f"log paths share a sidecar name space: {first!r}, "
+                f"{second!r}"
+            )
+
+
+def _reorg_lock_one(abspath, create):
+    """Guard and lock one involved log, settling it (create sets born)."""
+    guard = _tx_log_guard(abspath)
+    guard.__enter__()
+    try:
+        if create:
+            fd = _mutation_lock(abspath, create=True)
+        else:
+            fd = _tx_lock_existing_set(abspath)
+            _finish_pending(abspath)
+            fd = _relock_after_settle(fd, abspath, create=True)
+        return guard, fd
+    except BaseException:
+        guard.__exit__(None, None, None)
+        raise
+
+
+def _reorg_acquire(involved, creates=()):
+    """Guard, lock and settle the involved logs in lexicographic order."""
+    creates = set(creates)
+    held = []
+    try:
+        for abspath in sorted(involved):
+            guard, fd = _reorg_lock_one(abspath, abspath in creates)
+            held.append([abspath, guard, fd])
+        return held
+    except BaseException:
+        for _abspath, guard, fd in reversed(held):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            guard.__exit__(None, None, None)
+        raise
+
+
+def _reorg_release(held):
+    for _abspath, guard, fd in reversed(held):
+        if fd is not None:
+            os.close(fd)
+        guard.__exit__(None, None, None)
+
+
+# -- streaming staging -----------------------------------------------------------------------------------------------------
+
+def _reorg_path_record_stream(path):
+    """Yield every surviving record's bytes across one set's members."""
+    for member in _segment_members(path):
+        yield from _iter_raw_records(member)
+
+
+def _reorg_collect(path):
+    """Settled ``(pruned, surviving)`` for one log."""
+    pruned = _read_prune_state(path)[0]
+    surviving = 0
+    for member in _segment_members(path):
+        surviving += sum(1 for _ in _iter_raw_records(member))
+    return pruned, surviving
+
+
+def _reorg_stage_slice(target, streams):
+    """Stream record byte streams into ``<target>.reorgseg`` atomically."""
+    tmp = target + _REORG_SEG_TMP
+    out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        for stream in streams:
+            for raw in stream:
+                _write_bytes(out, raw)
+        os.fsync(out)
+    finally:
+        os.close(out)
+    os.replace(tmp, target + _REORG_SEG_SUFFIX)
+
+
+def _reorg_window(stream, start, end):
+    """Yield surviving records with local index in ``[start, end)``."""
+    index = 0
+    for raw in stream:
+        if start <= index < end:
+            yield raw
+        index += 1
+
+
+# -- per-path finalisation -------------------------------------------------
+
+def _reorg_listdir(directory):
+    try:
+        return os.listdir(directory)
+    except FileNotFoundError:
+        return []
+
+
+def _reorg_stage_sidecar_file(target, registry):
+    # Always published, even when empty: the staged registry replaces
+    # whatever lived on the path, including an emptied owner's state.
+    payload = json.dumps(registry, separators=(",", ":")).encode("utf-8")
+    _reorg_publish(target, payload)
+
+
+def _reorg_stage_groups(owner_groups):
+    """Stage translated group state files under reorg-private names."""
+    for owner, groups in owner_groups.items():
+        for group, state in groups:
+            target = owner + _REORG_GROUP_PREFIX + group
+            payload = json.dumps(state, separators=(",", ":")).encode(
+                "utf-8"
+            )
+            _reorg_publish(target, payload)
+
+
+def _reorg_move_position(pruned, surviving, base, position):
+    """Translate one source read position into a merged ordinal."""
+    if position <= pruned:
+        return base
+    if position >= pruned + surviving:
+        return base + surviving
+    return base + (position - pruned)
+
+
+def _reorg_stage_tx_private(involved, sidecars, indexes):
+    """Stage each path's translated prepared registry and participant index."""
+    for owner in involved:
+        _reorg_stage_sidecar_file(
+            owner + _REORG_TX_SIDECAR, sidecars[owner]
+        )
+        target = owner + _REORG_TXINDEX
+        payload = json.dumps(
+            sorted(indexes[owner]), separators=(",", ":")
+        ).encode("utf-8")
+        _reorg_publish(target, payload)
+
+
+def _reorg_force_sweep_private(path):
+    """Remove this path's reorg staging files without the reorglock probe.
+
+    Used by the live driver itself on abort, when it still holds every
+    path reorglock; the non-blocking probe in
+    :func:`_reorg_sweep_private` would wrongly treat its own run as a
+    foreign live one.
+    """
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    exact = (
+        _REORG_SEG_SUFFIX,
+        _REORG_SEG_TMP,
+        _REORG_TX_SIDECAR,
+        _REORG_TX_SIDECAR + ".tmp",
+        _REORG_TXINDEX,
+        _REORG_TXINDEX + ".tmp",
+        _REORG_PLAN_SUFFIX,
+        _REORG_PLAN_SUFFIX + ".tmp",
+        _REORG_FREEZE_SUFFIX,
+        _REORG_FREEZE_SUFFIX + ".tmp",
+    )
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if name in (base + suffix for suffix in exact) or name.startswith(
+            base + _REORG_GROUP_PREFIX
+        ):
+            _unlink_if_exists(os.path.join(directory, name))
+
+
+def _reorg_abort_cleanup(involved, tag, born):
+    """Remove every trace of a reorganisation that never armed a plan.
+
+    Once any plan marker is armed the commit point is crossed and this is
+    a no-op: crash recovery, never rollback, finishes a committed plan.
+    The live driver holds every path reorglock, so it force-sweeps its
+    own staging without the non-blocking probe a foreign writer uses.
+    """
+    if any(os.path.exists(_reorg_plan_path(abspath)) for abspath in involved):
+        return
+    for abspath in involved:
+        _reorg_force_sweep_private(abspath)
+    for abspath in born:
+        try:
+            if os.path.exists(abspath) and os.path.getsize(abspath) == 0:
+                os.unlink(abspath)
+        except FileNotFoundError:
+            pass
+    _reorg_sweep_coord_temps(tag)
+
+
+def _reorg_path_finalized(abspath, doc):
+    """True once one path carries its finished post-reorg layout."""
+    if os.path.exists(abspath + _REORG_SEG_SUFFIX):
+        return False
+    if os.path.exists(abspath + _REORG_TX_SIDECAR) or os.path.exists(
+        abspath + _REORG_TXINDEX
+    ):
+        return False
+    return os.path.exists(f"{abspath}.1")
+
+
+def _reorg_finalize_path(abspath, doc):
+    """Swap one path into its new layout from the committed plan.
+
+    Purely local and idempotent; the caller holds this path's live-log
+    lock (and the anchor flock).  The plan marker stays until the anchor
+    holder closes the whole reorganisation, so lock-free reads keep
+    resolving to the new world meanwhile.
+    """
+    section = doc["paths"][abspath]
+    slice_path = abspath + _REORG_SEG_SUFFIX
+    # Rebuild the pruned basis before the swap: while the slice exists
+    # readers short-circuit to it on a zero basis, and once the rename
+    # lands the marker already reads zero.
+    _replace_marker(abspath, "0")
+    _unlink_if_exists(abspath + _TRIM_SUFFIX)
+    _unlink_if_exists(abspath + _TRIM_TMP_SUFFIX)
+    if os.path.exists(slice_path):
+        for number in _segment_numbers(abspath):
+            _unlink_if_exists(f"{abspath}.{number}")
+        _truncate_live_log(abspath)
+        os.replace(slice_path, f"{abspath}.1")
+
+    hosted_groups = set(section.get("groups", ()))
+    for group, state_path in _reorg_list_group_files(abspath).items():
+        if group not in hosted_groups:
+            _unlink_if_exists(state_path)
+    directory = os.path.dirname(abspath) or "."
+    base = os.path.basename(abspath)
+    for name in _reorg_listdir(directory):
+        if name.startswith(base + _REORG_GROUP_PREFIX):
+            group = name[len(base) + len(_REORG_GROUP_PREFIX):]
+            os.replace(
+                os.path.join(directory, name),
+                abspath + _GROUP_STATE_SUFFIX + group,
+            )
+
+    staged_sidecar = abspath + _REORG_TX_SIDECAR
+    staged_index = abspath + _REORG_TXINDEX
+    if os.path.exists(staged_sidecar) or os.path.exists(staged_index):
+        for name in _reorg_listdir(directory):
+            if name.startswith(base + _TX_STAGE_SUFFIX) or name.startswith(
+                base + _TX_STAGE_TMP_SUFFIX
+            ):
+                _unlink_if_exists(os.path.join(directory, name))
+        _unlink_if_exists(_tx_sidecar_path(abspath))
+        _unlink_if_exists(abspath + _TX_SIDECAR_TMP_SUFFIX)
+        _unlink_if_exists(_tx_index_path(abspath))
+        _unlink_if_exists(abspath + _TX_INDEX_TMP_SUFFIX)
+        if os.path.exists(staged_sidecar):
+            os.replace(staged_sidecar, _tx_sidecar_path(abspath))
+        _unlink_if_exists(staged_sidecar + ".tmp")
+        if os.path.exists(staged_index):
+            os.replace(staged_index, _tx_index_path(abspath))
+        _unlink_if_exists(staged_index + ".tmp")
+
+    if section.get("audit"):
+        _unlink_if_exists(abspath + _AUDIT_SUFFIX)
+        _unlink_if_exists(abspath + _AUDIT_TMP_SUFFIX)
+        _sync_audit(abspath, strict=False)
+    else:
+        _unlink_if_exists(abspath + _AUDIT_SUFFIX)
+        _unlink_if_exists(abspath + _AUDIT_TMP_SUFFIX)
+
+
+def _reorg_arm_markers(doc):
+    """Publish every missing plan marker and remove freezes (anchor held)."""
+    payload = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+    for peer in doc["involved"]:
+        plan = _reorg_plan_path(peer)
+        if not os.path.exists(plan):
+            _reorg_publish(plan, payload)
+        _unlink_if_exists(_reorg_freeze_path(peer))
+
+
+def _reorg_close(doc):
+    """Publish translated coordinator records, then retire plan markers."""
+    for txid, tmp_name in doc.get("coords", ()):
+        staged = os.path.join(_tx_registry_dir(), tmp_name)
+        if os.path.exists(staged):
+            os.replace(staged, _tx_record_path(txid))
+    for peer in doc["involved"]:
+        _unlink_if_exists(_reorg_plan_path(peer))
+
+
+def _reorg_finish_all(path, doc):
+    """Finish a committed reorg from one involved path (its log lock held).
+
+    Arm peer plan markers as plain files, finalise this path locally, and
+    -- only once every involved path reports a finished layout -- publish
+    the translated coordinator records and retire the markers.  Peers are
+    never locked here; their own writers (or the anchor-first recovery
+    that runs before a log lock is taken) finish them, so two log locks
+    are never held at once.  Idempotent under the anchor flock.
+    """
+    abspath = os.path.abspath(path)
+    _reorg_arm_markers(doc)
+    if not _reorg_path_finalized(abspath, doc):
+        _reorg_finalize_path(abspath, doc)
+    if all(
+        _reorg_path_finalized(peer, doc)
+        or (not os.path.exists(peer) and not _segment_numbers(peer))
+        for peer in doc["involved"]
+    ):
+        _reorg_close(doc)
+
+
+def _finish_pending_reorg(path):
+    """Settle merge/split residue with the live-log lock held.
+
+    Marker recovery itself runs anchor first, before this log lock is
+    taken (see _reorg_recover_markers), so a marker found here either
+    belongs to the reorganisation this very thread is driving -- its
+    anchor is marked and the finalisation is driven explicitly elsewhere
+    -- or is dead-run residue with a free anchor.  A freeze-only dead
+    run leaves only private staging; a committed dead plan is finished
+    under its anchor.
+    """
+    abspath = os.path.abspath(path)
+    plan = _reorg_read_marker(_reorg_plan_path(path))
+    freeze = _reorg_read_marker(_reorg_freeze_path(path))
+    if plan is None and freeze is None:
+        _reorg_sweep_private(path)
+        return
+    doc = plan if plan is not None else freeze
+    anchor = doc["anchor"]
+    if not _reorg_anchor_is_held(anchor):
+        # The pre-lock recovery in _open_locked owns this case; reaching
+        # here without the anchor means a marker this thread cannot
+        # resolve, so leave it (lock-free reads use the staged slice).
+        return
+    if _reorg_live_is_active():
+        # The live driver settling while acquiring its locks: its own
+        # freeze/plan and staging files are authoritative, leave them.
+        return
+    # This thread holds the anchor as the crash-recovery driver.
+    if plan is not None:
+        _reorg_finish_all(path, plan)
+        return
+    # Freeze-only dead run: the commit point was never crossed.
+    _reorg_sweep_private(path)
+    _reorg_sweep_coord_temps(freeze["tag"])
+    _unlink_if_exists(_reorg_freeze_path(path))
+
+
+def _reorg_covering_doc(path):
+    plan = _reorg_read_marker(_reorg_plan_path(path))
+    if plan is not None:
+        return plan
+    return _reorg_read_marker(_reorg_freeze_path(path))
+
+
+def _reorg_recover_markers(path):
+    """Recover every merge/split marker covering ``path``, anchor first.
+
+    Runs with no log lock held, before the caller takes one: a live run
+    keeps the anchor flock until it finishes and is simply waited out; a
+    dead run's peers are settled one at a time (each log lock acquired and
+    released in turn, never two together), and a committed plan is closed
+    once every peer is finished.
+    """
+    if _reorg_prepare_is_active():
+        return
+    seen = set()
+    while True:
+        doc = _reorg_covering_doc(path)
+        if doc is None:
+            return
+        anchor = doc["anchor"]
+        if anchor in seen:
+            return
+        seen.add(anchor)
+        if _reorg_anchor_is_held(anchor):
+            # Nested peer open while this thread already drives recovery
+            # under the anchor: the outer loop finalises each peer.
+            return
+        with _reorg_anchor_guard(anchor):
+            fd = _reorg_anchor_flock(anchor, blocking=True)
+            _reorg_anchor_mark(anchor)
+            _reorg_recovering_set(True)
+            try:
+                for peer in sorted(doc.get("involved", ())):
+                    has_marker = os.path.exists(
+                        _reorg_freeze_path(peer)
+                    ) or os.path.exists(_reorg_plan_path(peer))
+                    # A split output that died pre-commit may carry a
+                    # freeze while its live log/segments were never born;
+                    # it is still swept below, so the missing-set skip
+                    # applies only when there is also no marker.
+                    if (
+                        not has_marker
+                        and not os.path.exists(peer)
+                        and not _segment_numbers(peer)
+                    ):
+                        continue
+                    if not has_marker:
+                        continue
+                    guard = _tx_log_guard(peer)
+                    guard.__enter__()
+                    peer_fd = None
+                    try:
+                        if os.path.exists(peer) or _segment_numbers(peer):
+                            peer_fd = _tx_lock_existing_set(peer)
+                        _finish_pending_reorg(peer)
+                    finally:
+                        if peer_fd is not None:
+                            os.close(peer_fd)
+                        guard.__exit__(None, None, None)
+                plan = _reorg_read_marker(_reorg_plan_path(path))
+                if plan is not None and all(
+                    _reorg_path_finalized(peer, plan)
+                    or (not os.path.exists(peer)
+                        and not _segment_numbers(peer))
+                    for peer in plan["involved"]
+                ):
+                    _reorg_close(plan)
+                elif plan is None:
+                    _reorg_sweep_coord_temps(doc["tag"])
+            finally:
+                _reorg_recovering_set(False)
+                _reorg_anchor_unmark(anchor)
+                if fd is not None:
+                    os.close(fd)
+
+
+def _reorg_wait_for_gate(paths):
+    """Block a transaction begin until no reorg marker covers ``paths``."""
+    absolute = sorted({os.path.abspath(path) for path in paths})
+    while True:
+        pending = [
+            abspath for abspath in absolute
+            if os.path.exists(_reorg_freeze_path(abspath))
+            or os.path.exists(_reorg_plan_path(abspath))
+        ]
+        if not pending:
+            return
+        _reorg_recover_markers(pending[0])
+        if not any(
+            os.path.exists(_reorg_freeze_path(abspath))
+            or os.path.exists(_reorg_plan_path(abspath))
+            for abspath in absolute
+        ):
+            return
+        time.sleep(0.01)
+
+
+def _reorg_drain_prepares(involved):
+    """Wait for in-flight begins (holding no log lock) to finish staging.
+
+    Freeze markers are already published, so no new begin can pass the
+    entry gate; only begins that started earlier remain, and they release
+    their prepare flock once every participating log is staged, which is
+    exactly what this waits for.  A dead begin's acquirable flock needs no
+    wait.
+    """
+    if fcntl is None:
+        return
+    while True:
+        busy = False
+        for record in _tx_related_records(involved):
+            if record["s"] != _TX_STATUS_PREPARING:
+                continue
+            probe = _tx_prepare_lock_try(record["id"])
+            if probe is None or probe is False:
+                busy = True
+            else:
+                os.close(probe)
+        if not busy:
+            return
+        time.sleep(0.01)
+
+
+# -- coordinator translation ------------------------------------------------
+
+def _reorg_translate(record, maps):
+    """Rewrite one coordinator record for the new layout.
+
+    ``maps`` maps each involved old absolute path to
+    ``(points, pruned, offsets)``: sorted slice-start/owner points and the
+    per-owner ordinal offset (merge: the piece's running count; split:
+    zero).  Logs absent from ``maps`` keep lines and serial untouched.
+    Returns ``(logs, records, serials)`` in sorted-owner order, each
+    owner's lines in write order, partitioned record by record.
+    """
+    buckets = {}
+
+    def bucket(owner):
+        return buckets.setdefault(
+            owner, {"kept": None, "moved": [], "empty": None}
+        )
+
+    for index, old in enumerate(record["logs"]):
+        lines = record["records"][index]
+        serial = record["serials"][index]
+        mapping = maps.get(old)
+        if mapping is None:
+            bucket(old)["kept"] = (list(lines), serial)
+            continue
+        points, pruned, offsets = mapping
+        if not lines:
+            local = serial - pruned
+            owner = _reorg_point_owner(points, max(local, 0))
+            start = next(s for s, candidate in points if candidate == owner)
+            bucket(owner)["empty"] = local - start + offsets[owner]
+            continue
+        for offset, line in enumerate(lines):
+            local = serial + offset - pruned
+            owner = _reorg_point_owner(points, local)
+            start = next(s for s, candidate in points if candidate == owner)
+            new_ord = local - start + offsets[owner]
+            bucket(owner)["moved"].append((new_ord, local, line))
+
+    new_logs = []
+    new_records = []
+    new_serials = []
+    for owner in sorted(buckets):
+        entry = buckets[owner]
+        if entry["kept"] is not None:
+            lines, serial = entry["kept"]
+            new_logs.append(owner)
+            new_records.append(lines)
+            new_serials.append(serial)
+            continue
+        moved = sorted(entry["moved"], key=lambda item: item[0])
+        if moved:
+            new_logs.append(owner)
+            new_records.append([line for _new_ord, _local, line in moved])
+            new_serials.append(moved[0][0])
+        elif entry["empty"] is not None:
+            new_logs.append(owner)
+            new_records.append([])
+            new_serials.append(entry["empty"])
+    return new_logs, new_records, new_serials
+
+
+def _reorg_publish_freezes(involved, kind, anchor, tag):
+    freeze = {
+        "v": _REORG_VERSION,
+        "kind": kind,
+        "anchor": anchor,
+        "tag": tag,
+        "involved": involved,
+    }
+    payload = json.dumps(freeze, separators=(",", ":")).encode("utf-8")
+    for abspath in involved:
+        _reorg_publish(_reorg_freeze_path(abspath), payload)
+
+
+def _reorg_collect_tx_state(involved, maps, join_serials):
+    """Translate all related transaction state for the new layout.
+
+    Returns ``(coords, sidecars, indexes)``: translated coordinator
+    records, each new owner's prepared registry, and participant index.
+    Preparing records visible here are dead-begin residue (live begins
+    were drained) and are discarded; prepared records are re-homed with
+    their batches joining after each new owner's moved records.
+    """
+    coords = []
+    sidecars = {abspath: {} for abspath in involved}
+    indexes = {abspath: set() for abspath in involved}
+    involved_set = set(involved)
+    for record in _tx_related_records(involved):
+        txid = record["id"]
+        if record["s"] == _TX_STATUS_PREPARING:
+            probe = _tx_prepare_lock_try(txid)
+            if probe is None or probe is False:
+                # Theoretically drained away; leave it for the next pass.
+                continue
+            os.close(probe)
+            # Dead begin residue: discard its involved sidecar entries.
+            continue
+        new_logs, new_records, new_serials = _reorg_translate(record, maps)
+        if record["s"] == _TX_STATUS_PREPARED:
+            # Open batches on moved owners join whole after the moved
+            # records; participations kept on an untouched owner keep
+            # their recorded serial and their existing sidecar/index.
+            final_serials = []
+            for owner, lines, serial in zip(new_logs, new_records, new_serials):
+                if owner in involved_set and lines:
+                    final_serials.append(join_serials[owner])
+                else:
+                    final_serials.append(serial)
+            new_serials = final_serials
+            for owner, lines in zip(new_logs, new_records):
+                if owner not in involved_set:
+                    continue
+                indexes[owner].add(txid)
+                sidecars[owner][str(txid)] = {"r": list(lines)}
+        else:
+            for owner in new_logs:
+                if owner in involved_set:
+                    indexes[owner].add(txid)
+        new_record = dict(record)
+        new_record["logs"] = new_logs
+        new_record["records"] = [list(lines) for lines in new_records]
+        new_record["serials"] = new_serials
+        coords.append((txid, new_record))
+    return coords, sidecars, indexes
+
+
+def _reorg_commit(doc, coords):
+    """Stage coordinator payloads, arm the plan, finalise, close.
+
+    The caller holds the anchor flock, every affected coordinator flock
+    and every involved log lock.  Order: stage translated global records,
+    publish plan markers (the commit point; readers switch to the whole
+    slices), rename the translated coordinator records into place *before*
+    any per-path sidecar is swapped (so a committed/committing
+    transaction can never observe new sidecar files against an old
+    coordinator record), then finalise every path and retire the plan
+    markers.
+    """
+    tag = doc["tag"]
+    os.makedirs(_tx_registry_dir(), exist_ok=True)
+    final_coords = []
+    for txid, new_record in coords:
+        tmp_name = f"{txid}{_REORG_COORD_TMP_MARK}{tag}"
+        staged = os.path.join(_tx_registry_dir(), tmp_name)
+        payload = json.dumps(new_record, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        out = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        try:
+            _write_bytes(out, payload)
+            os.fsync(out)
+        finally:
+            os.close(out)
+        final_coords.append([txid, tmp_name])
+    doc = dict(doc)
+    doc["coords"] = final_coords
+    plan_payload = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+    for peer in doc["involved"]:
+        _reorg_publish(_reorg_plan_path(peer), plan_payload)
+        _unlink_if_exists(_reorg_freeze_path(peer))
+    # Global records become new-layout before the local sidecars/indexes
+    # are renamed, while every coordinator flock is still held here.
+    for txid, tmp_name in final_coords:
+        staged = os.path.join(_tx_registry_dir(), tmp_name)
+        os.replace(staged, _tx_record_path(txid))
+    for abspath in doc["involved"]:
+        _reorg_finalize_path(abspath, doc)
+    for peer in doc["involved"]:
+        _unlink_if_exists(_reorg_plan_path(peer))
+    return doc
+
+
+def _reorg_path_lock_fds(involved, anchor):
+    """Take ``path.reorglock`` on every involved path except the anchor.
+
+    Taken in lexicographic order after the anchor flock (which is itself
+    the smallest path's reorglock), so the whole reorg-lock set follows
+    one fixed order and two reorganisations cannot invert against each
+    other.  These flocks make orphan sweeps of *other* writers skip a
+    directory a live reorganisation is publishing into.
+    """
+    fds = []
+    if fcntl is None:
+        return fds
+    try:
+        for abspath in involved:
+            if _reorg_lock_path(abspath) == anchor:
+                continue  # the anchor fd already locks this path
+            fd = os.open(_reorg_lock_path(abspath), os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                os.close(fd)
+                raise
+            fds.append(fd)
+        return fds
+    except BaseException:
+        for fd in reversed(fds):
+            os.close(fd)
+        raise
+
+
+def _reorg_run(involved, kind, creates, stage):
+    """Shared locked section of merge/split.
+
+    ``stage`` is called with every lock held and stages all content,
+    returning the plan document and translated coordinator records.
+    Lock order: anchor flock -> per-path reorglocks -> freeze markers and
+    prepare-flock drain -> per-log flocks (ascending path).  Once every
+    involved log lock is held, no transaction commit can be in flight (a
+    commit needs the same log locks) and no begin can stage (its staging
+    takes the same locks), so the related transaction set is closed; the
+    translation reads and rewrites the coordinator records without a
+    separate coordinator flock, and a commit that waited on a log lock
+    re-reads its (possibly translated) record and retries before
+    appending.  Releases happen in reverse order.
+    """
+    anchor = _reorg_lock_path(min(involved))
+    tag = _reorg_anchor_tag(anchor)
+    with _reorg_anchor_guard(anchor):
+        anchor_fd = _reorg_anchor_flock(anchor, blocking=True)
+        path_fds = _reorg_path_lock_fds(involved, anchor)
+        _reorg_anchor_mark(anchor)
+        _reorg_live_set(True)
+        try:
+            _reorg_publish_freezes(involved, kind, anchor, tag)
+            _reorg_drain_prepares(involved)
+            held = _reorg_acquire(involved, creates=creates)
+            try:
+                # Every involved log lock is held: no transaction commit
+                # is in flight (a commit needs the same log locks and
+                # re-reads/retries after waiting), no ordinary writer can
+                # move a record, and a begin blocked on one of these log
+                # locks reaches the freeze check in _tx_prepare_one once
+                # the locks are released and aborts without writing.  The
+                # pre-lock drain above already let every freeze-racing
+                # in-flight begin finish or fail, so the related set read
+                # here is closed.
+                doc, coords = stage(anchor, tag, involved)
+                _reorg_commit(doc, coords)
+            except BaseException:
+                _reorg_abort_cleanup(involved, tag, creates)
+                raise
+            finally:
+                _reorg_release(held)
+        finally:
+            _reorg_live_set(False)
+            _reorg_anchor_unmark(anchor)
+            if anchor_fd is not None:
+                os.close(anchor_fd)
+            for fd in reversed(path_fds):
+                os.close(fd)
+
+
+def merge_metrics(paths):
+    """Gather several independent metric log sets into one, in fixed order.
+
+    ``paths`` is a non-empty sequence; the first is the destination and
+    every later path a source.  The destination's surviving records come
+    first in write order, followed by each source's surviving records in
+    argument order, moved byte for byte with their original newlines;
+    each source is left existing but empty.  Each moved record's new
+    ordinal is uniquely determined: surviving records keep relative
+    order, and set ``i`` starts at the sum of surviving counts of the
+    destination and earlier sources; every pruned basis restarts at zero.
+    Oversized integer counters stay exact decimal integers, and
+    ``-0.0``, key order, blank lines and torn-tail handling are
+    unchanged.  The move streams line by line with bounded memory.
+
+    Snapshot handles keep working from the path they were created on --
+    a handle reads its pinned creation-time private copy, so records
+    merged in are invisible to it like later appends; take a fresh
+    snapshot on the destination to pin the merged layout.  Consumer
+    groups are re-homed to the destination with positions translated by
+    the same ordinal map (a name held on several sets is taken from the
+    earliest argument, deterministically); the prune count restarts at
+    zero; an audit chain is rebuilt on the destination and dropped from
+    the emptied sources.
+
+    Prepared transactions keep identifier order and batches and are
+    re-homed to the destination, open batches joining after every moved
+    record; committed, rolled-back and rejected verdicts are reproduced
+    exactly with translated write serials and participating logs.  Locks
+    follow the global anchor -> coordinator -> per-log hierarchy, one
+    log at a time in lexicographic order; same-process callers never
+    self-lock, and a crash leaves either every old set or the finished
+    merge, swept transparently by the next write.
+
+    Returns ``{"destination", "count", "pieces": [{"path", "pruned",
+    "count", "start"}, ...]}`` with exact decimal integer counts, pieces
+    in destination-then-source order.
+
+    Raises:
+        TypeError: ``paths`` is not a sequence.
+        ValueError: no destination, a repeated path, overlapping path
+            name spaces, or corrupt transaction state.
+        FileNotFoundError: one of the sets is missing.
+        IsADirectoryError: a path is a directory.
+        OSError: a non-string path, or a locking/staging failure.
+    """
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        raise TypeError(
+            f"paths must be a sequence of log paths, got {type(paths).__name__}"
+        )
+    if not paths:
+        raise ValueError("merge needs a destination path")
+    for path in paths:
+        _reorg_require_existing(path)
+    absolute = [os.path.abspath(path) for path in paths]
+    if len(set(absolute)) != len(absolute):
+        raise ValueError("a merge path is repeated")
+    _reorg_check_no_path_prefix_collision(absolute)
+    dest = absolute[0]
+    involved = sorted(set(absolute))
+
+    def stage(anchor, tag, involved_paths):
+        info = {}
+        base = 0
+        piece_entries = []
+        for abspath in absolute:
+            pruned, surviving = _reorg_collect(abspath)
+            info[abspath] = (pruned, surviving, base)
+            piece_entries.append(
+                {"path": abspath, "pruned": pruned, "count": surviving,
+                 "start": base}
+            )
+            base += surviving
+        total_count = base
+        _reorg_stage_slice(
+            dest,
+            [_reorg_path_record_stream(abspath) for abspath in absolute],
+        )
+        for source in absolute[1:]:
+            _reorg_stage_slice(source, [])
+
+        seen_groups = set()
+        owner_groups = {abspath: [] for abspath in involved_paths}
+        for abspath in absolute:
+            pruned, surviving, piece_base = info[abspath]
+            for group, state_path in _reorg_list_group_files(abspath).items():
+                if group in seen_groups:
+                    continue
+                seen_groups.add(group)
+                state = _load_group_state(state_path)
+                state["position"] = _reorg_move_position(
+                    pruned, surviving, piece_base, state["position"]
+                )
+                owner_groups[dest].append((group, state))
+        _reorg_stage_groups(owner_groups)
+
+        maps = {
+            abspath: (
+                [(0, dest)],
+                info[abspath][0],
+                {dest: info[abspath][2]},
+            )
+            for abspath in absolute
+        }
+        join_serials = {owner: 0 for owner in involved_paths}
+        join_serials[dest] = total_count
+        coords, sidecars, indexes = _reorg_collect_tx_state(
+            involved_paths, maps, join_serials
+        )
+        _reorg_stage_tx_private(involved_paths, sidecars, indexes)
+        hosted = {
+            abspath: [group for group, _state in owner_groups[abspath]]
+            for abspath in involved_paths
+        }
+        doc = {
+            "v": _REORG_VERSION,
+            "kind": "merge",
+            "anchor": anchor,
+            "tag": tag,
+            "involved": involved_paths,
+            "paths": {
+                abspath: {
+                    "groups": hosted[abspath],
+                    "audit": abspath == dest,
+                }
+                for abspath in involved_paths
+            },
+        }
+        return doc, coords, piece_entries
+
+    result = {}
+
+    def wrapped(anchor, tag, involved_paths):
+        doc, coords, pieces = stage(anchor, tag, involved_paths)
+        result["pieces"] = pieces
+        return doc, coords
+
+    _reorg_run(involved, "merge", set(), wrapped)
+    return {
+        "destination": dest,
+        "count": sum(piece["count"] for piece in result["pieces"]),
+        "pieces": result["pieces"],
+    }
+
+
+def split_metrics(path, outputs, boundaries):
+    """Split one metric log set into several at whole-record boundaries.
+
+    Every surviving record of the set at ``path`` moves, byte for byte
+    with its original newline, into one of the ``outputs`` sets: output
+    ``i`` receives the surviving records with local indices in
+    ``[boundaries[i], boundaries[i + 1])``, the final edge being the
+    surviving record count, so boundaries are strictly increasing record
+    edges starting at zero; the last boundary may equal the surviving
+    count (an empty final output) but never exceed it.  A non-integer
+    boundary (booleans do not count), a negative boundary, a first
+    boundary other than zero, a non-increasing sequence or one past the
+    surviving count raises :class:`ValueError`.  Each moved record's new
+    ordinal is uniquely ``local index - boundaries[i]``; every output
+    rebuilds its pruned basis at zero.  The move streams line by line.
+
+    Outputs must not already name a log set (they are created); the
+    source is left existing but empty.  Snapshot handles keep working
+    from the source path -- they read their pinned creation-time copies
+    -- while a fresh snapshot on an output pins that output's layout.
+    Consumer groups move to the output owning their position (a position
+    inside the old pruned region clamps to the first output's zero); the
+    audit chain is rebuilt on the outputs and dropped from the source.
+
+    Prepared transactions keep identifier order and batches and are
+    partitioned record by record across the owning outputs, open batches
+    joining after each output's moved records; committed, rolled-back and
+    rejected verdicts keep their exact translated serials and logs.
+    Locks follow the global hierarchy one log at a time, same-process
+    callers never self-lock, and a crash leaves either the old source or
+    the finished split, swept transparently by the next write.
+
+    Returns ``{"source", "count", "pieces": [{"path", "start",
+    "count"}, ...]}``.
+
+    Raises:
+        TypeError: ``outputs`` is not a string sequence or
+            ``boundaries`` is not an integer sequence.
+        ValueError: count mismatch/emptiness, bad boundaries, a repeated
+            path, overlapping name spaces, or corrupt state.
+        FileNotFoundError: the source set is missing.
+        FileExistsError: an output already names a log set.
+        IsADirectoryError: a path is a directory.
+        OSError: a non-string path, or a locking/staging failure.
+    """
+    if isinstance(outputs, str) or not isinstance(outputs, (list, tuple)):
+        raise TypeError(
+            "outputs must be a sequence of log paths, got "
+            f"{type(outputs).__name__}"
+        )
+    if isinstance(boundaries, str) or not isinstance(
+        boundaries, (list, tuple)
+    ):
+        raise TypeError(
+            "boundaries must be a sequence of integers, got "
+            f"{type(boundaries).__name__}"
+        )
+    if not outputs or len(outputs) != len(boundaries):
+        raise ValueError(
+            "outputs and boundaries must be non-empty and equal in count"
+        )
+    checked = []
+    for boundary in boundaries:
+        if isinstance(boundary, bool) or not isinstance(boundary, int):
+            raise TypeError(
+                "split boundary must be an integer, got "
+                f"{type(boundary).__name__}"
+            )
+        if boundary < 0:
+            raise ValueError("split boundary must not be negative")
+        checked.append(boundary)
+    if checked[0] != 0:
+        raise ValueError("the first split boundary must be 0")
+    if any(second <= first for first, second in zip(checked, checked[1:])):
+        raise ValueError("split boundaries must be strictly increasing")
+    _reorg_require_existing(path)
+    for output in outputs:
+        _reorg_check_str_path(output)
+    source_abs = os.path.abspath(path)
+    output_abs = [os.path.abspath(output) for output in outputs]
+    if source_abs in output_abs or len(set(output_abs)) != len(output_abs):
+        raise ValueError("a split output repeats another path or the source")
+    all_paths = [source_abs] + output_abs
+    _reorg_check_no_path_prefix_collision(all_paths)
+    for output in output_abs:
+        if os.path.exists(output) or _segment_numbers(output):
+            raise FileExistsError(
+                f"split output already exists as a log set: {output!r}"
+            )
+    involved = sorted(set(all_paths))
+
+    def stage(anchor, tag, involved_paths):
+        pruned, surviving = _reorg_collect(source_abs)
+        if checked[-1] > surviving:
+            raise ValueError(
+                f"split boundary {checked[-1]} exceeds the surviving "
+                f"record count of {surviving}"
+            )
+        edges = checked + [surviving]
+        points = list(zip(checked, output_abs))
+        for i, owner in enumerate(output_abs):
+            _reorg_stage_slice(
+                owner,
+                [_reorg_window(
+                    _reorg_path_record_stream(source_abs),
+                    edges[i], edges[i + 1],
+                )],
+            )
+        _reorg_stage_slice(source_abs, [])
+
+        owner_groups = {abspath: [] for abspath in involved_paths}
+        for group, state_path in _reorg_list_group_files(source_abs).items():
+            state = _load_group_state(state_path)
+            position = state["position"]
+            if position <= pruned:
+                local = 0
+            elif position >= pruned + surviving:
+                local = surviving
+            else:
+                local = position - pruned
+            owner = _reorg_point_owner(points, local)
+            start = next(
+                edge for edge, candidate in points if candidate == owner
+            )
+            state["position"] = local - start
+            owner_groups[owner].append((group, state))
+        _reorg_stage_groups(owner_groups)
+
+        offsets = {owner: 0 for owner in involved_paths}
+        maps = {source_abs: (points, pruned, offsets)}
+        join_serials = {owner: 0 for owner in involved_paths}
+        for i, owner in enumerate(output_abs):
+            join_serials[owner] = edges[i + 1] - edges[i]
+        coords, sidecars, indexes = _reorg_collect_tx_state(
+            involved_paths, maps, join_serials
+        )
+        _reorg_stage_tx_private(involved_paths, sidecars, indexes)
+        hosted = {
+            abspath: [group for group, _state in owner_groups[abspath]]
+            for abspath in involved_paths
+        }
+        nonempty = {
+            output_abs[i]
+            for i in range(len(output_abs))
+            if edges[i + 1] > edges[i]
+        }
+        pieces = [
+            {"path": owner, "start": edges[i],
+             "count": edges[i + 1] - edges[i]}
+            for i, owner in enumerate(output_abs)
+        ]
+        doc = {
+            "v": _REORG_VERSION,
+            "kind": "split",
+            "anchor": anchor,
+            "tag": tag,
+            "involved": involved_paths,
+            "paths": {
+                abspath: {
+                    "groups": hosted[abspath],
+                    "audit": abspath in nonempty,
+                }
+                for abspath in involved_paths
+            },
+        }
+        return doc, coords, pieces
+
+    captured = {}
+
+    def wrapped(anchor, tag, involved_paths):
+        doc, coords, pieces = stage(anchor, tag, involved_paths)
+        captured["pieces"] = pieces
+        return doc, coords
+
+    _reorg_run(involved, "split", set(output_abs), wrapped)
+    return {
+        "source": source_abs,
+        "count": sum(piece["count"] for piece in captured["pieces"]),
+        "pieces": captured["pieces"],
+    }

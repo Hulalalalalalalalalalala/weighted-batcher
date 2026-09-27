@@ -30,6 +30,8 @@
     python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
     python3 -m weighted_batcher tx-conflicts FILE
     python3 -m weighted_batcher tx-replay FILE [FILE ...]
+    python3 -m weighted_batcher merge FILE [FILE ...]
+    python3 -m weighted_batcher split FILE OUTPUT START [OUTPUT START ...]
 """
 
 from __future__ import annotations
@@ -70,6 +72,8 @@ from . import (
     tx_replay_metrics,
     tx_rollback_metrics,
     verify_metrics,
+    merge_metrics,
+    split_metrics,
 )
 
 _USAGE = (
@@ -103,7 +107,9 @@ _USAGE = (
     "  python3 -m weighted_batcher tx-read FILE TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-conflicts FILE\n"
-    "  python3 -m weighted_batcher tx-replay FILE [FILE ...]"
+    "  python3 -m weighted_batcher tx-replay FILE [FILE ...]\n"
+    "  python3 -m weighted_batcher merge FILE [FILE ...]\n"
+    "  python3 -m weighted_batcher split FILE OUTPUT START [OUTPUT START ...]"
 )
 
 
@@ -433,6 +439,27 @@ def _tx_replay(paths):
         sys.stdout.write(
             json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
+    return 0
+
+
+def _merge(paths):
+    # Gather the sets in argument order and print the deterministic
+    # ordinal map (destination, total count, pieces) as one JSON object.
+    result = merge_metrics(paths)
+    sys.stdout.write(
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    return 0
+
+
+def _split(path, outputs, boundaries):
+    # Split at the given whole-record boundaries and print the
+    # deterministic ordinal map; an out-of-range or mid-record boundary
+    # raises ValueError in split_metrics and ends with status 1.
+    result = split_metrics(path, outputs, boundaries)
+    sys.stdout.write(
+        json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
     return 0
 
 
@@ -776,6 +803,29 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(lambda _path: _tx_replay(args[1:]), args[1])
+    if args and args[0] == "merge":
+        # One destination and zero or more sources.
+        if len(args) < 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(lambda _path: _merge(args[1:]), args[1])
+    if args and args[0] == "split":
+        # FILE followed by one or more OUTPUT START pairs; a boundary
+        # that does not parse as an integer is a usage error, while an
+        # out-of-range boundary is a runtime failure (status 1).
+        tail = args[2:]
+        if len(tail) < 2 or len(tail) % 2 != 0:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        outputs = tail[0::2]
+        try:
+            boundaries = [int(text) for text in tail[1::2]]
+        except ValueError:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda _path: _split(args[1], outputs, boundaries), args[1]
+        )
     print(_USAGE, file=sys.stderr)
     return 2
 

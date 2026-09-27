@@ -39,6 +39,20 @@ Append one metric line to a durable log, recover the log back as JSON, seal it i
     python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
     python3 -m weighted_batcher tx-conflicts FILE
     python3 -m weighted_batcher tx-replay FILE [FILE ...]
+    python3 -m weighted_batcher merge FILE [FILE ...]
+    python3 -m weighted_batcher split FILE OUTPUT START [OUTPUT START ...]
+
+`merge` gathers the given log sets into the first `FILE`, in argument order,
+moves every record byte for byte with its original newline, leaves the later
+source sets existing but empty, and prints one JSON object describing the
+deterministic old-to-new ordinal map; it exits 0.  `split` moves every
+surviving record of `FILE` into the `OUTPUT` sets at the given whole-record
+edges (`START` is the first local surviving ordinal of each output, starting
+at zero and strictly increasing; the last edge may equal the record count),
+leaves `FILE` existing but empty, and likewise prints the ordinal map; it
+exits 0.  Both stream line by line with bounded memory; a non-integer or
+negative boundary, an out-of-range edge, or a mid-record split (boundaries
+count whole records) is a failure that exits 1.
 
 `recover` and `stream` print one JSON object per line on stdout and exit 0.
 `rotate` seals `FILE` into a numbered segment (`FILE.1`, then one past the
@@ -474,6 +488,68 @@ stderr and exits 2.
   corrupt, `FileNotFoundError` if a log and all its segments are
   missing, `IsADirectoryError` for a directory, and `OSError` for a
   non-string path or a locking/write failure.
+- `weighted_batcher.merge_metrics(paths)` gathers several independent
+  metric log sets, in the caller's fixed order, into one set.  The first
+  path is the destination and every later path a source; the
+  destination's surviving records come first in write order, followed by
+  each source's surviving records in argument order, moved byte for byte
+  (not re-rendered) with original newlines, `-0.0`, key order, blank
+  lines and torn-tail handling unchanged.  Each source is left existing
+  but empty, and every set restarts its pruned basis at zero.  Every
+  moved record's new ordinal is uniquely determined -- set `i` starts at
+  the sum of the surviving counts of the destination and earlier
+  sources -- and the call returns the map as
+  `{"destination": <abspath>, "count": <n>, "pieces": [{"path",
+  "pruned", "count", "start"}, ...]}` with pieces in destination-then-
+  source order, every count an exact decimal integer.  Snapshot handles
+  keep reading their pinned creation-time private copies from the path
+  they were created on (take a fresh snapshot on the destination to pin
+  the merged layout); consumer groups are re-homed to the destination
+  with positions translated by the same ordinal map (a name held on
+  several sets is taken from the earliest argument); an audit chain is
+  rebuilt on the destination and dropped from emptied sources.
+  Prepared transactions keep identifier order and batches and are
+  re-homed with open batches joining after the moved records; committed,
+  rolled-back and rejected verdicts keep their exact write serials and
+  participating logs.  Raises `TypeError` if `paths` is not a sequence,
+  `ValueError` with no destination, a repeated path or overlapping path
+  name spaces, `FileNotFoundError` for a missing set,
+  `IsADirectoryError` for a directory, and `OSError` for a non-string
+  path or a locking/write failure.
+- `weighted_batcher.split_metrics(path, outputs, boundaries)` moves
+  every surviving record of one set into caller-named new sets at
+  whole-record edges.  Output `i` receives the surviving records with
+  local indices in `[boundaries[i], boundaries[i+1])` (the final edge is
+  the surviving count); boundaries must be integers (booleans do not
+  count), start at zero and be strictly increasing, and the last edge
+  may equal but never exceed the surviving record count, so a boundary
+  can never land in the middle of a record or past the sequence.  Each
+  moved record's new ordinal is uniquely `local index - boundaries[i]`;
+  every output rebuilds its pruned basis at zero; the source is left
+  existing but empty; records stream byte for byte with bounded memory.
+  Returns `{"source": <abspath>, "count": <n>, "pieces": [{"path",
+  "start", "count"}, ...]}`.  Snapshot handles keep reading their pinned
+  copies from the source; consumer groups move to the output owning
+  their position (a position inside the old pruned region clamps to the
+  first output's zero); the audit chain is rebuilt on non-empty outputs
+  and dropped elsewhere; prepared transactions keep identifier order and
+  are partitioned record by record across the owning outputs, with
+  decided verdicts and serials translated exactly.  Raises `TypeError`
+  for non-string outputs or non-integer boundaries, `ValueError` for
+  count mismatch, empty inputs, a non-zero first edge, non-increasing or
+  out-of-range boundaries, a repeated path, overlapping name spaces, an
+  existing output set, or corrupt state, `FileNotFoundError` for a
+  missing source, `FileExistsError` when an output already names a log
+  set, `IsADirectoryError` for a directory, and `OSError` for a
+  non-string path or a locking/write failure.
+
+  Both operations lock the involved logs one at a time in lexicographic
+  path order (never two cross-held out of order), so concurrent
+  appends, commits, rollbacks, adjudications and replays proceed;
+  same-process callers neither self-lock nor report a spurious locking
+  failure.  All output is staged before the commit point and a crash
+  leaves either the old layout or the deterministically finished new one,
+  the half-finished work swept transparently by the next write.
 
 ## Tests
 
