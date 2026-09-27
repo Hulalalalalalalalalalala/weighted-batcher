@@ -193,6 +193,8 @@ __all__ = [
     "tx_adjudicate_metrics",
     "tx_conflicts_metrics",
     "tx_replay_metrics",
+    "merge_metrics",
+    "split_metrics",
 ]
 
 _READ_CHUNK = 1 << 20
@@ -260,6 +262,25 @@ _AUDIT_TMP_SUFFIX = ".audit.tmp"
 # segment number.  Labels keep the plan independent of how ``path`` was
 # spelled when the plan was written.
 _LIVE_LABEL = -1
+# Merge/split layout state.  ``path.layout`` is the published, byte
+# identical plan marker at every involved path and is the commit point;
+# ``path.layout.tmp`` stages it.  ``path.layoutstage`` is a destination's
+# whole replacement segment (sole readable member while present) and
+# ``path.layoutstage.tmp`` its private staging name; ``path.layoutpart.
+# <stamp>`` snapshots one input span (split: piece) immutably.  All are
+# non-numeric sidecars invisible to ``_segment_numbers``.
+_LAYOUT_MARKER_SUFFIX = ".layout"
+_LAYOUT_MARKER_TMP_SUFFIX = ".layout.tmp"
+_LAYOUT_STAGE_SUFFIX = ".layoutstage"
+_LAYOUT_STAGE_TMP_SUFFIX = ".layoutstage.tmp"
+_LAYOUT_PART_SUFFIX = ".layoutpart."
+_LAYOUT_KIND_MERGE = "merge"
+_LAYOUT_KIND_SPLIT = "split"
+_LAYOUT_VERSION = 1
+# Coordinator-record extension fields: ``l`` stamps the remap idempotent
+# per layout operation; ``ranges`` carries a remapped txn's per-log list
+# of write intervals (a merged batch may span former spans).
+_LAYOUT_STAMP_KEY = "l"
 
 def _segment_numbers(path):
     """Return the already-used segment numbers for ``path`` as a set.
@@ -365,18 +386,76 @@ def _open_locked(path, create):
 
 
 def _mutation_lock(path, create):
-    """Lock the segment set for a mutation, or just prove the log exists.
+    """Take the log's path guard/anchor, settle layouts, then its log lock.
 
-    Returns the live-log lock fd on POSIX (caller closes it) or ``None``
-    on platforms without :mod:`fcntl`, where the existence check has
-    already closed its descriptor and no rename may happen with a handle
-    still open.
+    The per-log :func:`_tx_log_guard` is both the reentrant in-process
+    guard and the cross-process operation anchor (a
+    ``path.layoutop.lock`` flock held for the outermost acquisition on
+    the thread): ordinary writers take it implicitly here, multi-log
+    transactions take every participating guard in canonical order, and
+    a merge/split holds every involved anchor up front, so the combined
+    wait graph is acyclic for any two overlapping operations.
+
+    When a layout plan is observed under the log lock this writer lost
+    the freeze race: it releases the log lock, blocks on the layout
+    driver flock (released when the driver finishes or crashes), lets
+    the barrier finish the plan, and retries on the new set -- or raises
+    :class:`FileNotFoundError` for a consumed path instead of recreating
+    an empty zombie.  Returns the live-log fd (release with
+    :func:`_mutation_unlock`) or ``None`` on a lock-less platform.
     """
-    fd = _open_locked(path, create)
-    if fcntl is None:
+    abspath = os.path.abspath(path)
+    owns_guard = _tx_thread_holds_log(path)
+    guard = None if owns_guard else _tx_log_guard(path)
+    if guard is not None:
+        guard.__enter__()
+    try:
+        for _attempt in range(1000):
+            _layout_barrier(path)
+            fd = _open_locked(path, create)
+            plan = _layout_peek_plan(path)
+            if plan is None:
+                if fcntl is None:
+                    os.close(fd)
+                    return None
+                if guard is not None:
+                    _mutation_fd_guard[fd] = guard
+                return fd
+            stamp = plan["stamp"]
+            consumed = _layout_plan_consumed(plan, abspath)
+            os.close(fd)
+            _layout_wait_driver(stamp)
+            _layout_barrier(path)
+            if consumed:
+                if create and os.path.exists(path) and os.path.getsize(path) == 0:
+                    _unlink_if_exists(path)
+                raise FileNotFoundError(
+                    f"metrics log was moved by a merge/split: {path!r}"
+                )
+        raise OSError("layout locking did not settle after 1000 attempts")
+    except BaseException:
+        if guard is not None:
+            guard.__exit__(None, None, None)
+        raise
+
+
+_mutation_fd_guard = {}
+
+
+def _mutation_unlock(fd):
+    """Release a live-log fd and the path guard this lock acquired.
+
+    A caller that already held the per-log guard (a multi-log
+    transaction or a layout) keeps it until its own outer block exits.
+    """
+    if fd is None:
+        return
+    guard = _mutation_fd_guard.pop(fd, None)
+    try:
         os.close(fd)
-        return None
-    return fd
+    finally:
+        if guard is not None:
+            guard.__exit__(None, None, None)
 
 
 def _relock_after_settle(fd, path, create):
@@ -387,14 +466,19 @@ def _relock_after_settle(fd, path, create):
     new live log would otherwise be unlocked for the rest of the
     operation.  Re-open and re-lock the settled path (the same
     follow-rotation loop :func:`_open_locked` uses), returning the new
-    fd; ``None`` (a lock-less platform) is returned unchanged.
+    fd; ``None`` (a lock-less platform) is returned unchanged.  The
+    operation anchor stays with the replacement fd.
     """
     if fd is None:
         return None
     if _same_inode(fd, path):
         return fd
+    guard = _mutation_fd_guard.get(fd)
     os.close(fd)
-    return _open_locked(path, create)
+    new_fd = _open_locked(path, create)
+    if guard is not None:
+        _mutation_fd_guard[new_fd] = guard
+    return new_fd
 
 
 def _member_label(name, path):
@@ -486,7 +570,15 @@ def _read_snapshot_registry(path):
 
 
 def _write_snapshot_registry(path, registry):
-    """Atomically publish the snapshot registry and fsync it."""
+    """Atomically publish the snapshot registry and fsync it.
+
+    An empty registry removes its file, so a set holding no snapshot
+    carries no registry sidecar.
+    """
+    if not registry:
+        _unlink_if_exists(path + _REGISTRY_TMP_SUFFIX)
+        _unlink_if_exists(path + _REGISTRY_SUFFIX)
+        return
     tmp = path + _REGISTRY_TMP_SUFFIX
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
     try:
@@ -636,6 +728,24 @@ def _resolve_once(path, marker_raw):
         )
     else:
         pruned, plan = 0, None
+
+    # A locally published merge/split layout whose whole replacement
+    # segment is staged is, like a compaction staging file, the sole
+    # readable member while cleanup finishes.  The marker carries this
+    # role's new pruned basis, so read ordinals stay consistent during
+    # the switch-over.  Once the stage was promoted and renamed away,
+    # resolution falls through to the finished set.
+    layout_stage = path + _LAYOUT_STAGE_SUFFIX
+    if os.path.exists(path + _LAYOUT_MARKER_SUFFIX) and os.path.exists(
+        layout_stage
+    ):
+        try:
+            layout = _layout_read(path)
+        except ValueError:
+            layout = None
+        if layout is not None:
+            role = layout["roles"][os.path.abspath(path)]
+            return [layout_stage], int(role["pruned"]), _marker_observation(path)
 
     staging = _staging_path(path)
     if os.path.exists(staging):
@@ -854,10 +964,14 @@ def _finish_staged_compact(path):
 
 
 def _finish_pending(path):
-    """Settle any half-finished compaction, prune, snapshot or transaction."""
+    """Settle any half-finished compaction, prune, snapshot, layout or transaction."""
     _finish_staged_compact(path)
     _finish_staged_prune(path)
     _finish_snapshot_orphans(path)
+    # A merge/split plan at this path is finished before transaction
+    # residue is reconciled, so moved sidecar entries never meet the old
+    # segment set and a crash leaves one settled layout.
+    _finish_staged_layout(path)
     # After the log's own staged mutations are settled and before the
     # audit chain is caught up, resolve transaction residue: a committed
     # transaction a crash left unfinished joins its batch whole here, and
@@ -917,8 +1031,7 @@ def rotate_metrics(path):
         os.close(new_fd)
         _sync_audit_for_write(path)
     finally:
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
 
 
 def _append_payload(path, payload):
@@ -956,8 +1069,7 @@ def _append_payload(path, payload):
             _write_bytes(fd, payload)
         _sync_audit_for_write(path)
     finally:
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
 
 
 def append_metrics(path, line):
@@ -1063,8 +1175,7 @@ def compact_metrics(path):
         _finish_staged_compact(path)
         _sync_audit_for_write(path)
     finally:
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
 
 
 def _stage_trim(path, source, skip):
@@ -1190,8 +1301,7 @@ def prune_metrics(path, quota):
         _finish_staged_prune(path)
         _sync_audit_for_write(path)
     finally:
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
 
 
 def resume_metrics(path, position=0):
@@ -1344,8 +1454,7 @@ def snapshot_metrics(path):
         _sync_audit_for_write(path)
         return handle
     finally:
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
 
 
 def release_metrics(path, handle):
@@ -1388,8 +1497,7 @@ def release_metrics(path, handle):
         _write_snapshot_registry(path, registry)
         _unlink_if_exists(path + _SNAP_COPY_SUFFIX + handle)
     finally:
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
 
 
 def resume_snapshot_metrics(path, handle, position=0):
@@ -3289,8 +3397,7 @@ def audit_metrics(path):
         state = _sync_audit(path, strict=True)
         return {"count": state["count"], "checksum": state["checksum"]}
     finally:
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
 
 
 def verify_metrics(path):
@@ -3493,21 +3600,43 @@ _TX_REPLAY_PENDING = "待定"
 # second open of a locked inode is denied while another thread holds it.
 # These reentrant per-key guards order same-process threads before the
 # flock is touched, so read/write interleaving neither self-deadlocks
-# nor reports a spurious locking failure.
+# nor reports a spurious locking failure.  A *log* guard additionally
+# holds that path's cross-process operation anchor
+# (``path.layoutop.lock`` flock) for the outermost acquisition on the
+# thread: ordinary writers and merge/split layouts therefore serialize
+# across processes on one shared, canonically ordered anchor.
 _tx_guard_table_lock = threading.Lock()
 _tx_path_guards = {}
 _tx_path_guard_refs = {}
 _tx_coord_guards = {}
 _tx_coord_guard_refs = {}
+# Per (thread, key) nesting depth and held anchor flock fd.
+_tx_anchor_local = threading.local()
+
+
+def _anchor_depth_state():
+    state = getattr(_tx_anchor_local, "depth", None)
+    if state is None:
+        state = {}
+        _tx_anchor_local.depth = state
+    return state
 
 
 class _TxGuard:
-    """Reentrant in-process mutual exclusion keyed by one string."""
+    """Reentrant in-process mutual exclusion keyed by one string.
 
-    def __init__(self, table, refs, key):
+    With ``anchor_flock`` set to an absolute file path, the outermost
+    acquisition on the calling thread also takes an exclusive flock on
+    that file (released when that same acquisition exits); nested
+    acquisitions on the thread only bump the reentrant in-process lock.
+    The flock is what makes the per-log anchor cross-process.
+    """
+
+    def __init__(self, table, refs, key, anchor_flock=None):
         self._table = table
         self._refs = refs
         self._key = key
+        self._anchor_flock = anchor_flock
         with _tx_guard_table_lock:
             guard = table.get(key)
             if guard is None:
@@ -3518,10 +3647,35 @@ class _TxGuard:
             refs[key] += 1
 
     def __enter__(self):
+        state = _anchor_depth_state()
+        outer = state.get(self._key, (0, None))[0] == 0
         self._guard.acquire()
+        depth, anchor_fd = state.get(self._key, (0, None))
+        if outer and self._anchor_flock is not None and fcntl is not None:
+            descriptor = os.open(self._anchor_flock, os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            except OSError:
+                os.close(descriptor)
+                self._guard.release()
+                raise
+            anchor_fd = descriptor
+        state[self._key] = (depth + 1, anchor_fd)
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        state = _anchor_depth_state()
+        depth, anchor_fd = state[self._key]
+        depth -= 1
+        if depth == 0:
+            if anchor_fd is not None:
+                try:
+                    os.close(anchor_fd)
+                finally:
+                    anchor_fd = None
+            del state[self._key]
+        else:
+            state[self._key] = (depth, anchor_fd)
         self._guard.release()
         with _tx_guard_table_lock:
             self._refs[self._key] -= 1
@@ -3532,7 +3686,21 @@ class _TxGuard:
 
 
 def _tx_log_guard(path):
-    return _TxGuard(_tx_path_guards, _tx_path_guard_refs, os.path.abspath(path))
+    # The path guard doubles as the cross-process merge/split anchor.
+    return _TxGuard(
+        _tx_path_guards,
+        _tx_path_guard_refs,
+        os.path.abspath(path),
+        anchor_flock=os.path.abspath(path) + _LAYOUT_OP_LOCK_SUFFIX,
+    )
+
+
+def _tx_thread_holds_log(path):
+    """Whether the calling thread already owns this log's guard/anchor."""
+    abspath = os.path.abspath(path)
+    with _tx_guard_table_lock:
+        guard = _tx_path_guards.get(abspath)
+    return guard is not None and guard._is_owned()
 
 
 def _tx_coord_guard(txid):
@@ -3676,7 +3844,7 @@ def _tx_read_coordinator(txid):
     if not isinstance(record, dict) or not (
         {"v", "id", "s", "logs", "records", "serials"}
         <= set(record)
-        <= {"v", "id", "s", "logs", "records", "serials", "a"}
+        <= {"v", "id", "s", "logs", "records", "serials", "a", "ranges", "l"}
     ):
         raise ValueError(
             f"corrupt transaction record {target!r}: unexpected fields"
@@ -3739,6 +3907,34 @@ def _tx_read_coordinator(txid):
             raise ValueError(
                 f"corrupt transaction record {target!r}: bad write serial"
             )
+    ranges = record.get("ranges")
+    if ranges is not None:
+        # Optional merge/split extension: one interval list per
+        # participating log, each interval a [start, count] pair.
+        if not isinstance(ranges, list) or len(ranges) != len(logs):
+            raise ValueError(
+                f"corrupt transaction record {target!r}: bad write ranges"
+            )
+        for intervals in ranges:
+            if not isinstance(intervals, list):
+                raise ValueError(
+                    f"corrupt transaction record {target!r}: bad write range"
+                )
+            for interval in intervals:
+                if not (
+                    isinstance(interval, list)
+                    and len(interval) == 2
+                    and not isinstance(interval[0], bool)
+                    and isinstance(interval[0], int)
+                    and not isinstance(interval[1], bool)
+                    and isinstance(interval[1], int)
+                    and interval[0] >= 0
+                    and interval[1] >= 0
+                ):
+                    raise ValueError(
+                        f"corrupt transaction record {target!r}: bad "
+                        f"write range interval"
+                    )
     return record
 
 
@@ -3990,6 +4186,11 @@ def _tx_settle_log(path):
         txid = int(txid_text)
         record = _tx_read_coordinator(txid)
         if record is not None and record["s"] == _TX_STATUS_COMMITTED:
+            if abspath not in record["logs"]:
+                # A merge/split already remapped this committed record
+                # onto its destination; residue at this former log is stale.
+                discard.append(txid_text)
+                continue
             index = record["logs"].index(abspath)
             committed.append((record["serials"][index], txid_text, record))
             continue
@@ -4018,10 +4219,13 @@ def _tx_settle_log(path):
             ):
                 discard.append(txid_text)
             elif record["s"] == _TX_STATUS_COMMITTED:
-                index = record["logs"].index(abspath)
-                committed.append(
-                    (record["serials"][index], txid_text, record)
-                )
+                if abspath in record["logs"]:
+                    index = record["logs"].index(abspath)
+                    committed.append(
+                        (record["serials"][index], txid_text, record)
+                    )
+                else:
+                    discard.append(txid_text)
             # Prepared while the lock was acquired: a finished open
             # transaction -- retain.
         finally:
@@ -4111,8 +4315,7 @@ def _tx_prepare_one(path, txid, lines, payload):
             _tx_write_sidecar(path, registry)
             return serial
         finally:
-            if fd is not None:
-                os.close(fd)
+            _mutation_unlock(fd)
 
 
 def _tx_discard_prepare(path, txid):
@@ -4126,8 +4329,7 @@ def _tx_discard_prepare(path, txid):
                 _tx_write_sidecar(path, registry)
             _tx_remove_stage(path, txid)
         finally:
-            if fd is not None:
-                os.close(fd)
+            _mutation_unlock(fd)
 
 
 def tx_begin_metrics(logs, records):
@@ -4286,19 +4488,17 @@ def _tx_acquire_logs(record):
         return held
     except BaseException:
         for _abspath, guard, fd in reversed(held):
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+            try:
+                _mutation_unlock(fd)
+            except OSError:
+                pass
             guard.__exit__(None, None, None)
         raise
 
 
 def _tx_release_logs(held):
     for _abspath, guard, fd in reversed(held):
-        if fd is not None:
-            os.close(fd)
+        _mutation_unlock(fd)
         guard.__exit__(None, None, None)
 
 
@@ -4344,8 +4544,7 @@ def _tx_resume_committed(record):
                     _tx_clean_one(abspath, txid)
                     _sync_audit_for_write(abspath)
             finally:
-                if fd is not None:
-                    os.close(fd)
+                _mutation_unlock(fd)
 
 
 def tx_commit_metrics(txid):
@@ -4437,6 +4636,14 @@ def tx_commit_metrics(txid):
                 # The single commit point, carrying the exact serials
                 # read while every participating log was locked.
                 record["serials"] = serials
+                if "ranges" in record:
+                    # Remapped prepare-time interval hints are replaced by
+                    # the actual landing ranges: each batch appends as one
+                    # contiguous interval at the serial just read.
+                    record["ranges"] = [
+                        [[serial, len(lines)]]
+                        for serial, lines in zip(serials, record["records"])
+                    ]
                 record["s"] = _TX_STATUS_COMMITTED
                 _tx_write_coordinator(record)
                 for index, (abspath, _guard, _fd) in enumerate(held):
@@ -4506,8 +4713,7 @@ def tx_rollback_metrics(txid):
                         registry.pop(str(txid), None)
                         _tx_write_sidecar(abspath, registry)
                     finally:
-                        if fd is not None:
-                            os.close(fd)
+                        _mutation_unlock(fd)
         finally:
             if lock_fd is not None:
                 os.close(lock_fd)
@@ -4620,6 +4826,30 @@ def _tx_ranges_overlap(a_start, a_count, b_start, b_count):
     )
 
 
+def _tx_log_ranges(record, abspath):
+    """All write-serial intervals of one log's participation.
+
+    A classical transaction occupies one contiguous interval starting at
+    its write serial; a merge/split-remapped record carries an explicit
+    ``ranges`` field whose per-log value is a list of [start, count]
+    intervals in ascending order.
+    """
+    index = _tx_log_index(record, abspath)
+    if "ranges" in record:
+        return [[int(start), int(count)]
+                for start, count in record["ranges"][index]]
+    return [[record["serials"][index], len(record["records"][index])]]
+
+
+def _tx_interval_lists_overlap(first, second):
+    """True when any interval of one list overlaps any of the other."""
+    for a_start, a_count in first:
+        for b_start, b_count in second:
+            if _tx_ranges_overlap(a_start, a_count, b_start, b_count):
+                return True
+    return False
+
+
 def _tx_peer_states(abspath, registry):
     """Classify one log's sidecar peers for conflict adjudication.
 
@@ -4639,13 +4869,13 @@ def _tx_peer_states(abspath, registry):
             # Crash residue of a dead begin, or an entry the next settle
             # sweeps away; it carries no decidable range.
             continue
-        start, count = _tx_log_range(record, abspath)
+        intervals = _tx_log_ranges(record, abspath)
         if record.get("a") == _TX_VERDICT_WINNER and record["s"] in (
             _TX_STATUS_PREPARED, _TX_STATUS_COMMITTED
         ):
-            peers[txid] = (_TX_VERDICT_WINNER, start, count)
+            peers[txid] = (_TX_VERDICT_WINNER, intervals)
         elif "a" not in record and record["s"] == _TX_STATUS_PREPARED:
-            peers[txid] = ("undecided", start, count)
+            peers[txid] = ("undecided", intervals)
     return peers
 
 
@@ -4664,27 +4894,58 @@ def _tx_locked_sidecar(abspath):
             fd = _relock_after_settle(fd, abspath, create=True)
             return _tx_read_sidecar(abspath)
         finally:
-            if fd is not None:
-                os.close(fd)
+            _mutation_unlock(fd)
 
 
-def _tx_registry_records():
-    """Yield every coordinator record in the registry directory.
+def _tx_registry_records(wanted=None):
+    """Yield coordinator records, narrowed to ``wanted`` absolute logs.
 
-    A missing registry directory yields nothing; staging, lock and other
-    sidecar names are skipped.  A present but corrupt record raises
-    :class:`ValueError` exactly as :func:`_tx_read_coordinator` does.
+    With ``wanted`` given, a record is opened only when it carries an
+    entry in one of the wanted logs' sidecars or its bytes name one of
+    those paths, so a corrupt unrelated record cannot disturb an
+    operation scoped to other logs.  ``wanted`` of ``None`` reads every
+    record, as before.
     """
     try:
         names = os.listdir(_tx_registry_dir())
     except FileNotFoundError:
         return
+    wanted_set = None if wanted is None else set(wanted)
+    needles = sidecar_txids = None
+    if wanted_set is not None:
+        needles = [abspath.encode("utf-8") for abspath in wanted_set]
+        sidecar_txids = set()
+        for abspath in wanted_set:
+            try:
+                sidecar_txids.update(
+                    int(text) for text in _tx_read_sidecar(abspath)
+                )
+            except FileNotFoundError:
+                pass
     for name in sorted(names):
         if not name.endswith(".json"):
             continue
         stem = name[:-5]
         if not (stem.isascii() and stem.isdigit()):
             continue
+        if wanted_set is not None and int(stem) not in sidecar_txids:
+            full = os.path.join(_tx_registry_dir(), name)
+            fd = os.open(full, os.O_RDONLY)
+            try:
+                raw = b""
+                matched = False
+                while True:
+                    chunk = os.read(fd, _READ_CHUNK)
+                    if not chunk:
+                        break
+                    raw += chunk
+                    if any(needle in raw for needle in needles):
+                        matched = True
+                        break
+            finally:
+                os.close(fd)
+            if not matched:
+                continue
         record = _tx_read_coordinator(int(stem))
         if record is not None:
             yield record
@@ -4702,14 +4963,14 @@ def _tx_decided_winners(abspath):
     with a decided winner and loses.
     """
     winners = {}
-    for record in _tx_registry_records():
+    for record in _tx_registry_records({abspath}):
         if abspath not in record["logs"]:
             continue
         if record["s"] == _TX_STATUS_COMMITTED or (
             record["s"] == _TX_STATUS_PREPARED
             and record.get("a") == _TX_VERDICT_WINNER
         ):
-            winners[record["id"]] = _tx_log_range(record, abspath)
+            winners[record["id"]] = _tx_log_ranges(record, abspath)
     return winners
 
 
@@ -4820,18 +5081,14 @@ def tx_adjudicate_metrics(txid):
                 # is gone: a later transaction overlapping a committed
                 # or standing winner's recorded range loses here and
                 # now, exactly as against a sidecar-visible winner.
-                for other, (start, count) in _tx_decided_winners(
-                    abspath
-                ).items():
-                    peers.setdefault(
-                        other, (_TX_VERDICT_WINNER, start, count)
-                    )
-                own_start, own_count = _tx_log_range(record, abspath)
-                for other, (state, start, count) in peers.items():
+                for other, intervals in _tx_decided_winners(abspath).items():
+                    peers.setdefault(other, (_TX_VERDICT_WINNER, intervals))
+                own_intervals = _tx_log_ranges(record, abspath)
+                for other, (state, intervals) in peers.items():
                     if other == txid:
                         continue
-                    if not _tx_ranges_overlap(
-                        own_start, own_count, start, count
+                    if not _tx_interval_lists_overlap(
+                        own_intervals, intervals
                     ):
                         continue
                     conflicts.add(other)
@@ -4848,8 +5105,8 @@ def tx_adjudicate_metrics(txid):
             _tx_write_coordinator(record)
             serials = []
             for abspath in record["logs"]:
-                start, count = _tx_log_range(record, abspath)
-                serials.extend(range(start, start + count))
+                for start, count in _tx_log_ranges(record, abspath):
+                    serials.extend(range(start, start + count))
             return {
                 "txid": txid,
                 "verdict": verdict,
@@ -4891,8 +5148,8 @@ def tx_conflicts_metrics(path):
     abspath = os.path.abspath(path)
     registry = _tx_locked_sidecar(abspath)
     undecided = {
-        txid: (start, count)
-        for txid, (state, start, count) in _tx_peer_states(
+        txid: intervals
+        for txid, (state, intervals) in _tx_peer_states(
             abspath, registry
         ).items()
         if state == "undecided"
@@ -4900,16 +5157,21 @@ def tx_conflicts_metrics(path):
     txids = sorted(undecided)
     overlaps = {txid: set() for txid in txids}
     for position, first in enumerate(txids):
-        first_start, first_count = undecided[first]
         for second in txids[position + 1:]:
-            second_start, second_count = undecided[second]
-            low = max(first_start, second_start)
-            high = min(
-                first_start + first_count, second_start + second_count
-            )
-            for serial in range(low, high):
-                overlaps[first].add(serial)
-                overlaps[second].add(serial)
+            if not _tx_interval_lists_overlap(
+                undecided[first], undecided[second]
+            ):
+                continue
+            for first_start, first_count in undecided[first]:
+                for second_start, second_count in undecided[second]:
+                    low = max(first_start, second_start)
+                    high = min(
+                        first_start + first_count,
+                        second_start + second_count,
+                    )
+                    for serial in range(low, high):
+                        overlaps[first].add(serial)
+                        overlaps[second].add(serial)
     return [
         {"txid": txid, "serials": sorted(overlaps[txid])}
         for txid in txids
@@ -4987,19 +5249,18 @@ def tx_replay_metrics(paths):
                 _finish_pending(abspath)
                 fd = _relock_after_settle(fd, abspath, create=True)
             finally:
-                if fd is not None:
-                    os.close(fd)
+                _mutation_unlock(fd)
     wanted = set(absolute)
     records = {}
-    for record in _tx_registry_records():
+    for record in _tx_registry_records(wanted):
         if wanted.isdisjoint(record["logs"]):
             continue
         records[record["id"]] = record
 
     def _log_ranges(record):
         return {
-            abspath: (record["serials"][index], len(record["records"][index]))
-            for index, abspath in enumerate(record["logs"])
+            abspath: _tx_log_ranges(record, abspath)
+            for abspath in record["logs"]
         }
 
     ranges = {}
@@ -5031,8 +5292,8 @@ def tx_replay_metrics(paths):
 
     def _overlaps(first, second):
         for abspath in ranges[first].keys() & ranges[second].keys():
-            if _tx_ranges_overlap(
-                *ranges[first][abspath], *ranges[second][abspath]
+            if _tx_interval_lists_overlap(
+                ranges[first][abspath], ranges[second][abspath]
             ):
                 return True
         return False
@@ -5059,8 +5320,9 @@ def tx_replay_metrics(paths):
     def _generate():
         for txid in sorted(records):
             serials = []
-            for start, count in ranges[txid].values():
-                serials.extend(range(start, start + count))
+            for intervals in ranges[txid].values():
+                for start, count in intervals:
+                    serials.extend(range(start, start + count))
             yield {
                 "txid": txid,
                 "state": states[txid],
@@ -5069,3 +5331,1415 @@ def tx_replay_metrics(paths):
             }
 
     return _generate()
+# ---------------------------------------------------------------------------
+# Merge and split (layout operations)
+#
+# merge_metrics gathers several independent log sets into one set in a fixed
+# order; split_metrics divides one set at caller-given record boundaries.
+# Records move byte for byte with their original newlines, the copy streams
+# with bounded memory, and every involved log is locked strictly one at a
+# time in lexicographic path order -- never two log locks held at once.
+#
+# One JSON layout plan (``path.layout``), byte identical at every involved
+# path, is the commit point; immutable per-span snapshot parts
+# (``path.layoutpart.<stamp>``) are staged first, then each destination's
+# whole replacement segment at ``path.layoutstage`` (while it coexists with
+# the marker it alone is readable, like compaction's ``path.compact``),
+# promoted to ``path.1``, and only then are source sets removed.  Any
+# writer that meets a published plan runs it to completion through
+# ``_layout_barrier`` *before* taking the log lock, so a crash leaves a
+# deterministic state and half-finished work is cleared transparently.
+#
+# Coordinator records are remapped through the deterministic ordinal
+# mapping (participating logs, exact write intervals in ``ranges``, exact
+# decimal serials, a plan ``l`` stamp making the rewrite idempotent):
+# decided verdicts reproduce as recorded, undecided transactions keep
+# smallest-id-first adjudication on the remapped intervals, and an open
+# prepared batch moves its sidecar entry and stage bytes with its records.
+# A still-preparing begin rejects the operation.  Only records relevant to
+# the involved logs are opened.
+# ---------------------------------------------------------------------------
+
+_LAYOUT_PART_SUFFIX = ".layoutpart."
+_LAYOUT_STAMP_KEY = "l"
+
+
+def _layout_marker_paths(path):
+    return path + _LAYOUT_MARKER_SUFFIX, path + _LAYOUT_MARKER_TMP_SUFFIX
+
+
+def _layout_read_doc(path):
+    """Parse the layout marker; ``None`` when absent. Raises ValueError if corrupt."""
+    target, _tmp = _layout_marker_paths(path)
+    try:
+        fd = os.open(target, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        raw = b""
+        while True:
+            chunk = os.read(fd, _READ_CHUNK)
+            if not chunk:
+                break
+            raw += chunk
+    finally:
+        os.close(fd)
+    return json.loads(raw.decode("utf-8"))
+
+
+def _layout_validate(document):
+    """Validate a v1 layout plan document."""
+    if not isinstance(document, dict):
+        raise ValueError("corrupt layout plan: state must be a JSON object")
+    if document.get("v") == 0:
+        return None
+    if document.get("v") != _LAYOUT_VERSION:
+        raise ValueError("corrupt layout plan: bad version")
+    required = {"v", "kind", "paths", "roles", "spans", "txns", "stamp"}
+    if set(document) != required:
+        raise ValueError("corrupt layout plan: unexpected fields")
+    kind = document["kind"]
+    if kind not in (_LAYOUT_KIND_MERGE, _LAYOUT_KIND_SPLIT):
+        raise ValueError("corrupt layout plan: bad kind")
+    paths = document["paths"]
+    if not isinstance(paths, list) or not all(
+        isinstance(one, str) for one in paths
+    ) or len(set(paths)) != len(paths):
+        raise ValueError("corrupt layout plan: bad paths")
+    roles = document["roles"]
+    spans = document["spans"]
+    txns = document["txns"]
+    if not isinstance(roles, dict) or set(roles) != set(paths):
+        raise ValueError("corrupt layout plan: roles must match paths")
+    if not isinstance(spans, list):
+        raise ValueError("corrupt layout plan: spans must be a list")
+    for role in roles.values():
+        if not isinstance(role, dict):
+            raise ValueError("corrupt layout plan: bad role")
+    if not isinstance(txns, list) or not all(
+        isinstance(txid, int) and not isinstance(txid, bool) and txid >= 0
+        for txid in txns
+    ):
+        raise ValueError("corrupt layout plan: bad txn list")
+    if not isinstance(document["stamp"], str) or not document["stamp"]:
+        raise ValueError("corrupt layout plan: bad stamp")
+    return document
+
+
+def _layout_read(path):
+    document = _layout_read_doc(path)
+    if document is None:
+        return None
+    return _layout_validate(document)
+
+
+def _layout_publish(path, payload):
+    """Stage, fsync and atomically rename a layout marker payload."""
+    _tx_publish_json(
+        path + _LAYOUT_MARKER_TMP_SUFFIX, path + _LAYOUT_MARKER_SUFFIX, payload
+    )
+
+
+def _layout_part_path(path, stamp, piece=None):
+    if piece is None:
+        return f"{path}{_LAYOUT_PART_SUFFIX}{stamp}"
+    return f"{path}{_LAYOUT_PART_SUFFIX}{stamp}.{piece}"
+
+
+def _layout_remove_other_parts(path, stamp):
+    """Remove layout part files that do not belong to ``stamp``."""
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    prefix = base + _LAYOUT_PART_SUFFIX
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if name.startswith(prefix) and not name.startswith(
+            prefix + str(stamp)
+        ):
+            _unlink_if_exists(os.path.join(directory, name))
+
+
+def _layout_cleanup_local(path):
+    """Remove every layout staging sidecar (marker handled separately)."""
+    _unlink_if_exists(path + _LAYOUT_MARKER_TMP_SUFFIX)
+    _unlink_if_exists(path + _LAYOUT_STAGE_TMP_SUFFIX)
+    _unlink_if_exists(path + _LAYOUT_STAGE_SUFFIX)
+
+
+def _layout_retire(path):
+    """Retire a finished plan marker at one path: done doc then unlink."""
+    try:
+        _layout_publish(path, b'{"v":0}')
+    except OSError:
+        return
+    _unlink_if_exists(path + _LAYOUT_MARKER_SUFFIX)
+    _unlink_if_exists(path + _LAYOUT_MARKER_TMP_SUFFIX)
+
+
+def _layout_stream_into(tmp_path, iterables):
+    """Stream record bytes from iterables into one private temp segment."""
+    out = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    count = 0
+    try:
+        for iterable in iterables:
+            for raw in iterable:
+                _write_bytes(out, raw)
+                count += 1
+        os.fsync(out)
+    finally:
+        os.close(out)
+    return count
+
+
+def _layout_promote(path):
+    """Replace the set with its staged whole segment, compaction-style."""
+    stage = path + _LAYOUT_STAGE_SUFFIX
+    if not os.path.exists(stage):
+        return
+    for number in _segment_numbers(path):
+        os.unlink(f"{path}.{number}")
+    _truncate_live_log(path)
+    os.replace(stage, f"{path}.1")
+
+
+def _layout_publish_basis(path, pruned):
+    """Set the new pruned basis; old snapshot handles do not cross layouts."""
+    _replace_marker(path, str(int(pruned)))
+    registry = _read_snapshot_registry(path)
+    for handle in list(registry):
+        _unlink_if_exists(path + _SNAP_COPY_SUFFIX + handle)
+    _write_snapshot_registry(path, {})
+    _finish_snapshot_orphans(path)
+
+
+def _layout_remove_set(path):
+    """Remove one source path's whole log set and log-owned sidecars."""
+    for number in _segment_numbers(path):
+        _unlink_if_exists(f"{path}.{number}")
+    _unlink_if_exists(path)
+    for suffix in (
+        _COMPACT_SUFFIX,
+        _PRUNE_SUFFIX, _PRUNE_TMP_SUFFIX, _TRIM_SUFFIX, _TRIM_TMP_SUFFIX,
+        _REGISTRY_SUFFIX, _REGISTRY_TMP_SUFFIX,
+        _AUDIT_SUFFIX, _AUDIT_TMP_SUFFIX,
+        _TX_SIDECAR_SUFFIX, _TX_SIDECAR_TMP_SUFFIX,
+        _GROUP_COMMIT_SUFFIX, _GROUP_COMMIT_TMP_SUFFIX, _GROUP_LOCK_SUFFIX,
+        _LAYOUT_STAGE_SUFFIX, _LAYOUT_STAGE_TMP_SUFFIX,
+        _LAYOUT_MARKER_SUFFIX, _LAYOUT_MARKER_TMP_SUFFIX,
+        _LAYOUT_OP_LOCK_SUFFIX,
+    ):
+        _unlink_if_exists(path + suffix)
+    directory = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if (
+            name.startswith(base + _SNAP_COPY_SUFFIX)
+            or name.startswith(base + _TX_STAGE_SUFFIX)
+            or name.startswith(base + _TX_STAGE_TMP_SUFFIX)
+            or name.startswith(base + _LAYOUT_PART_SUFFIX)
+            or name.startswith(base + _GROUP_STATE_SUFFIX)
+        ):
+            _unlink_if_exists(os.path.join(directory, name))
+
+
+def _layout_set_summary_locked(path):
+    """``(basis, surviving)`` of one settled set; caller holds the lock."""
+    basis = _read_prune_state(path)[0]
+    surviving = 0
+    for member in _segment_members(path):
+        for _ in _iter_raw_records(member):
+            surviving += 1
+    return basis, surviving
+
+
+def _layout_copy_part_locked(path, stamp, piece=None):
+    """Copy one path's whole surviving set into its immutable part file."""
+    target = _layout_part_path(path, stamp, piece)
+    tmp = target + ".tmp"
+    count = _layout_stream_into(tmp, [_layout_raw_members_locked(path)])
+    os.rename(tmp, target)
+    return count
+
+
+def _layout_raw_members_locked(path):
+    for member in _segment_members(path):
+        yield from _iter_raw_records(member)
+
+
+def _layout_coord_locks(txids):
+    """Acquire coordinator guards/flocks for ``txids`` in id order.
+
+    Coordinator anchors are taken before any log lock, the same order
+    :func:`tx_commit_metrics` uses, so a layout driver and a transaction
+    commit that touch overlapping ids never form a wait cycle.  Returns a
+    list of ``(txid, guard, fd)``; fd is ``None`` on a lock-less platform.
+    """
+    held = []
+    for txid in sorted(txids):
+        guard = _tx_coord_guard(txid)
+        guard.__enter__()
+        fd = None
+        try:
+            if fcntl is not None:
+                os.makedirs(_tx_registry_dir(), exist_ok=True)
+                descriptor = os.open(_tx_lock_path(txid), os.O_RDWR | os.O_CREAT, 0o666)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                except OSError:
+                    os.close(descriptor)
+                    raise
+                fd = descriptor
+            held.append((txid, guard, fd))
+        except BaseException:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            guard.__exit__(None, None, None)
+            raise
+    return held
+
+
+def _layout_coord_unlock(held):
+    for _txid, guard, fd in reversed(held):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        guard.__exit__(None, None, None)
+
+
+def _layout_one_log_lock(abspath, create, settle=True):
+    """Guard and lock one involved log without running the layout barrier.
+
+    The barrier is intentionally bypassed: this helper is used by the
+    layout drive itself, which is what the barrier runs.  Every other
+    settle step (compaction, prune, snapshots, transactions) still runs
+    when ``settle`` is set, so the lock always guards a settled world.
+    """
+    guard = _tx_log_guard(abspath)
+    guard.__enter__()
+    fd = None
+    try:
+        if os.path.isdir(abspath):
+            raise IsADirectoryError(f"log path is a directory: {abspath!r}")
+        if not os.path.exists(abspath) and not _segment_numbers(abspath):
+            if not create:
+                raise FileNotFoundError(
+                    f"metrics log does not exist: {abspath!r}"
+                )
+        fd = _open_locked(abspath, create)
+        if fcntl is None:
+            os.close(fd)
+            fd = None
+        if settle and fd is not None:
+            _finish_pending(abspath)
+            fd = _relock_after_settle(fd, abspath, create=create)
+        elif settle and fd is None:
+            _finish_pending(abspath)
+        return guard, fd
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        guard.__exit__(None, None, None)
+        raise
+
+
+def _layout_remap_merge(record, span_of, offset_of, dest_abs, stamp):
+    """Remap one coordinator record through the merge mapping."""
+    if record.get(_LAYOUT_STAMP_KEY) == stamp:
+        return record
+    grouped = {}
+    for index, abspath in enumerate(record["logs"]):
+        lines = record["records"][index]
+        if "ranges" in record:
+            intervals = [list(interval) for interval in record["ranges"][index]]
+        else:
+            intervals = [
+                [record["serials"][index], len(record["records"][index])]
+            ]
+        if abspath in span_of:
+            span = span_of[abspath]
+            offset = offset_of[abspath]
+            bucket = grouped.setdefault(
+                dest_abs, {"spans": {}, "order": []}
+            )
+            if span not in bucket["spans"]:
+                bucket["spans"][span] = {"lines": [], "intervals": []}
+                bucket["order"].append(span)
+            bucket["spans"][span]["lines"].extend(lines)
+            bucket["spans"][span]["intervals"].extend(
+                [start + offset, count] for start, count in intervals
+            )
+        else:
+            grouped.setdefault(
+                abspath, {"spans": {}, "order": []}
+            )
+            bucket = grouped[abspath]
+            bucket["spans"][None] = {"lines": list(lines), "intervals": intervals}
+            bucket["order"].append(None)
+    entries = []
+    for abspath, bucket in grouped.items():
+        lines = []
+        intervals = []
+        for span in sorted(bucket["order"], key=lambda value: (value is None, value)):
+            part = bucket["spans"][span]
+            lines.extend(part["lines"])
+            intervals.extend(part["intervals"])
+        intervals.sort(key=lambda interval: interval[0])
+        entries.append((abspath, lines, intervals))
+    entries.sort(key=lambda entry: entry[0])
+    new_record = dict(record)
+    new_record["logs"] = [abspath for abspath, _l, _i in entries]
+    new_record["records"] = [lines for _a, lines, _i in entries]
+    interval_lists = [intervals for _a, _l, intervals in entries]
+    new_record["ranges"] = interval_lists
+    new_record["serials"] = [
+        min(start for start, count in intervals) if intervals else 0
+        for intervals in interval_lists
+    ]
+    new_record[_LAYOUT_STAMP_KEY] = stamp
+    return new_record
+
+
+def _layout_remap_split(record, source_abs, piece_of_ordinal, piece_abs, stamp):
+    """Remap one coordinator record through the split boundary mapping."""
+    if record.get(_LAYOUT_STAMP_KEY) == stamp:
+        return record
+    grouped = {}
+    for index, abspath in enumerate(record["logs"]):
+        lines = record["records"][index]
+        if "ranges" in record:
+            intervals = [list(interval) for interval in record["ranges"][index]]
+        else:
+            intervals = [
+                [record["serials"][index], len(record["records"][index])]
+            ]
+        if abspath != source_abs:
+            grouped.setdefault(abspath, {"lines": [], "intervals": []})
+            grouped[abspath]["lines"].extend(lines)
+            grouped[abspath]["intervals"].extend(intervals)
+            continue
+        cursor = 0
+        for start, count in intervals:
+            for at in range(start, start + count):
+                piece = piece_of_ordinal(at)
+                bucket = grouped.setdefault(
+                    piece_abs[piece], {"lines": [], "intervals": []}
+                )
+                bucket["lines"].append(lines[cursor])
+                cursor += 1
+            # Record the interval against every piece it touches; an
+            # interval wholly inside one piece stays one interval.
+            touched = sorted({
+                piece_of_ordinal(at) for at in range(start, start + count)
+            })
+            run_start = start
+            run_piece = touched[0]
+            for at in range(start + 1, start + count + 1):
+                piece = piece_of_ordinal(at) if at < start + count else None
+                if piece != run_piece:
+                    bucket = grouped[piece_abs[run_piece]]
+                    bucket["intervals"].append([run_start, at - run_start])
+                    run_start = at
+                    run_piece = piece
+    entries = []
+    for abspath, bucket in grouped.items():
+        intervals = sorted(bucket["intervals"], key=lambda interval: interval[0])
+        entries.append((abspath, bucket["lines"], intervals))
+    entries.sort(key=lambda entry: entry[0])
+    new_record = dict(record)
+    new_record["logs"] = [abspath for abspath, _l, _i in entries]
+    new_record["records"] = [lines for _a, lines, _i in entries]
+    interval_lists = [intervals for _a, _l, intervals in entries]
+    new_record["ranges"] = interval_lists
+    new_record["serials"] = [
+        min(start for start, count in intervals) if intervals else 0
+        for intervals in interval_lists
+    ]
+    new_record[_LAYOUT_STAMP_KEY] = stamp
+    return new_record
+
+
+def _layout_drive(path, document):
+    """Run a published layout plan to completion without holding log locks.
+
+    Invoked from :func:`_layout_barrier` before a writer takes its log
+    lock, and from the merge/split entry points right after publishing the
+    markers.  Every log lock in the drive is taken one at a time in
+    lexicographic path order; coordinator flocks -- when coordinator
+    records need rewriting or sidecars moving -- are acquired first in
+    transaction-id order, matching commit's anchor order, so the combined
+    wait graph is acyclic.  Every step is idempotent and stamped, so
+    several processes finishing the same plan converge on one result.
+    """
+    layout = _layout_validate(document)
+    if layout is None:
+        _layout_cleanup_local(path)
+        _unlink_if_exists(path + _LAYOUT_MARKER_SUFFIX)
+        return
+    kind = layout["kind"]
+    stamp = layout["stamp"]
+    roles = layout["roles"]
+    spans = layout["spans"]
+    paths = sorted(layout["paths"])
+    abspath = os.path.abspath(path)
+    if abspath not in roles:
+        _layout_cleanup_local(path)
+        return
+
+    def _role_of(target_abs):
+        return roles[target_abs]
+
+    # Phase 1 (merge): assemble the destination stage from immutable parts
+    # and promote it, one destination lock at a time.  Parts survive until
+    # source removal, so a crash simply repeats the concatenation.
+    if kind == _LAYOUT_KIND_MERGE:
+        dest_abs = next(one for one, role in roles.items() if role["dest"])
+        dest_role = roles[dest_abs]
+        span_paths = [span["path"] for span in spans]
+        guard, fd = _layout_one_log_lock(dest_abs, create=True)
+        try:
+            stage = dest_abs + _LAYOUT_STAGE_SUFFIX
+            expected = sum(int(span["surviving"]) for span in spans)
+            promoted = False
+            if os.path.exists(f"{dest_abs}.1"):
+                present = sum(
+                    1 for _ in _iter_raw_records(f"{dest_abs}.1")
+                )
+                promoted = present == expected
+            # Assemble and promote at most once (a pre-existing
+            # destination may already hold ``.1``, so promotion is
+            # recognised by the planned record count, not existence),
+            # but always republish the basis so a crash one beat earlier
+            # is finished by the next drive.
+            if not promoted:
+                if not os.path.exists(stage):
+                    tmp = dest_abs + _LAYOUT_STAGE_TMP_SUFFIX
+                    _layout_stream_into(
+                        tmp,
+                        [
+                            _iter_raw_file_records(
+                                _layout_part_path(span_path, stamp)
+                            )
+                            for span_path in span_paths
+                        ],
+                    )
+                    os.rename(tmp, stage)
+                _layout_promote(dest_abs)
+            _layout_publish_basis(dest_abs, int(dest_role["pruned"]))
+        finally:
+            _mutation_unlock(fd)
+            guard.__exit__(None, None, None)
+    else:
+        # Split: promote each piece from its source-directory part file.
+        source_abs = next(one for one, role in roles.items() if role["piece"] < 0)
+        for piece in sorted(
+            role["piece"] for role in roles.values() if role["piece"] >= 0
+        ):
+            piece_abs = next(
+                one for one, role in roles.items() if role["piece"] == piece
+            )
+            part = _layout_part_path(source_abs, stamp, piece)
+            guard, fd = _layout_one_log_lock(piece_abs, create=True)
+            try:
+                stage = piece_abs + _LAYOUT_STAGE_SUFFIX
+                # Pieces are fresh destinations, so ``.1`` exists only
+                # from an earlier drive attempt; the basis is always
+                # republished to finish a crash one beat before it.
+                if not os.path.exists(f"{piece_abs}.1"):
+                    if not os.path.exists(stage):
+                        tmp = piece_abs + _LAYOUT_STAGE_TMP_SUFFIX
+                        _layout_stream_into(
+                            tmp, [_iter_raw_file_records(part)]
+                        )
+                        os.rename(tmp, stage)
+                    _layout_promote(piece_abs)
+                _layout_publish_basis(
+                    piece_abs, int(roles[piece_abs]["pruned"])
+                )
+            finally:
+                _mutation_unlock(fd)
+                guard.__exit__(None, None, None)
+
+    # Phase 2: remap the participating coordinator records under their
+    # flocks (acquired in id order, no log lock held).
+    coord_held = _layout_coord_locks(layout["txns"])
+    try:
+        if kind == _LAYOUT_KIND_MERGE:
+            dest_abs = next(one for one, role in roles.items() if role["dest"])
+            span_of = {span["path"]: span["span"] for span in spans}
+            offset_of = {span["path"]: span["offset"] for span in spans}
+            for txid in layout["txns"]:
+                record = _tx_read_coordinator(txid)
+                if record is None:
+                    continue
+                if record.get(_LAYOUT_STAMP_KEY) == stamp:
+                    continue
+                new_record = _layout_remap_merge(
+                    record, span_of, offset_of, dest_abs, stamp
+                )
+                _tx_write_coordinator(new_record)
+        else:
+            source_abs = next(
+                one for one, role in roles.items() if role["piece"] < 0
+            )
+            piece_boundaries = [span["cut"] for span in spans[:-1]]
+
+            def _piece_of(ordinal):
+                piece = 0
+                while (
+                    piece < len(piece_boundaries)
+                    and ordinal >= piece_boundaries[piece]
+                ):
+                    piece += 1
+                return piece
+
+            piece_abs = {
+                role["piece"]: one
+                for one, role in roles.items() if role["piece"] >= 0
+            }
+            for txid in layout["txns"]:
+                record = _tx_read_coordinator(txid)
+                if record is None or record.get(_LAYOUT_STAMP_KEY) == stamp:
+                    continue
+                new_record = _layout_remap_split(
+                    record, source_abs, _piece_of, piece_abs, stamp
+                )
+                _tx_write_coordinator(new_record)
+
+        # Phase 3: move prepared sidecar entries and stage bytes.
+        if kind == _LAYOUT_KIND_MERGE:
+            dest_abs = next(one for one, role in roles.items() if role["dest"])
+            span_paths = [span["path"] for span in spans]
+            for txid in layout["txns"]:
+                record = _tx_read_coordinator(txid)
+                if record is None:
+                    continue
+                if record["s"] != _TX_STATUS_PREPARED and record.get("a") != (
+                    _TX_VERDICT_WINNER
+                ):
+                    continue
+                merged_lines = []
+                stage_parts = []
+                for span_path in span_paths:
+                    registry = _tx_read_sidecar(span_path)
+                    entry = registry.get(str(txid))
+                    if entry is not None:
+                        merged_lines.extend(entry["r"])
+                    stage = _tx_stage_path(span_path, txid)
+                    if os.path.exists(stage):
+                        stage_parts.append(stage)
+                if not merged_lines and not stage_parts:
+                    continue
+                payload = b""
+                for stage in stage_parts:
+                    part_fd = os.open(stage, os.O_RDONLY)
+                    try:
+                        while True:
+                            chunk = os.read(part_fd, _READ_CHUNK)
+                            if not chunk:
+                                break
+                            payload += chunk
+                    finally:
+                        os.close(part_fd)
+                if not payload and merged_lines:
+                    payload = _tx_batch_payload(merged_lines)
+                guard, log_fd = _layout_one_log_lock(dest_abs, create=True)
+                try:
+                    if payload:
+                        _tx_write_stage(dest_abs, txid, payload)
+                    dest_registry = _tx_read_sidecar(dest_abs)
+                    if merged_lines:
+                        dest_registry[str(txid)] = {"r": merged_lines}
+                    _tx_write_sidecar(dest_abs, dest_registry)
+                finally:
+                    if log_fd is not None:
+                        os.close(log_fd)
+                    guard.__exit__(None, None, None)
+                for span_path in span_paths:
+                    if span_path == dest_abs:
+                        # The destination received the merged entry above;
+                        # only source-side copies are swept.
+                        continue
+                    guard, log_fd = _layout_one_log_lock(span_path, create=True)
+                    try:
+                        registry = _tx_read_sidecar(span_path)
+                        if registry.pop(str(txid), None) is not None:
+                            _tx_write_sidecar(span_path, registry)
+                        _tx_remove_stage(span_path, txid)
+                    finally:
+                        if log_fd is not None:
+                            os.close(log_fd)
+                        guard.__exit__(None, None, None)
+        else:
+            source_abs = next(
+                one for one, role in roles.items() if role["piece"] < 0
+            )
+            piece_abs = {
+                role["piece"]: one
+                for one, role in roles.items() if role["piece"] >= 0
+            }
+            for txid in layout["txns"]:
+                record = _tx_read_coordinator(txid)
+                if record is None:
+                    continue
+                if record["s"] != _TX_STATUS_PREPARED and record.get("a") != (
+                    _TX_VERDICT_WINNER
+                ):
+                    continue
+                # The coordinator record was remapped in phase 2, so its
+                # "logs" already name the pieces; the move itself is
+                # required exactly when the *source* still holds this
+                # transaction's sidecar entry or stage bytes.
+                registry = _tx_read_sidecar(source_abs)
+                entry = registry.get(str(txid))
+                stage = _tx_stage_path(source_abs, txid)
+                if entry is None and not os.path.exists(stage):
+                    continue
+                lines = entry["r"] if entry is not None else []
+                data = b""
+                if os.path.exists(stage):
+                    part_fd = os.open(stage, os.O_RDONLY)
+                    try:
+                        while True:
+                            chunk = os.read(part_fd, _READ_CHUNK)
+                            if not chunk:
+                                break
+                            data += chunk
+                    finally:
+                        os.close(part_fd)
+                raw_lines = data.splitlines(keepends=True) if data else []
+                # The remapped record lists each piece's records in
+                # serial order; distribute that slice to the piece.
+                per_piece = {}
+                for piece, target in piece_abs.items():
+                    if target not in record["logs"]:
+                        continue
+                    idx = record["logs"].index(target)
+                    per_piece[piece] = record["records"][idx]
+                if raw_lines and sum(
+                    len(part) for part in per_piece.values()
+                ) == len(raw_lines):
+                    raw_by_piece = {}
+                    cursor = 0
+                    for piece in sorted(per_piece):
+                        count = len(per_piece[piece])
+                        raw_by_piece[piece] = raw_lines[cursor:cursor + count]
+                        cursor += count
+                else:
+                    raw_by_piece = None
+                for piece in sorted(per_piece):
+                    target = piece_abs[piece]
+                    text_lines = per_piece[piece]
+                    guard, log_fd = _layout_one_log_lock(target, create=True)
+                    try:
+                        if raw_by_piece is not None:
+                            _tx_write_stage(
+                                target, txid, b"".join(raw_by_piece[piece])
+                            )
+                        elif text_lines:
+                            _tx_write_stage(
+                                target, txid, _tx_batch_payload(text_lines)
+                            )
+                        piece_registry = _tx_read_sidecar(target)
+                        piece_registry[str(txid)] = {"r": text_lines}
+                        _tx_write_sidecar(target, piece_registry)
+                    finally:
+                        if log_fd is not None:
+                            os.close(log_fd)
+                        guard.__exit__(None, None, None)
+                guard, log_fd = _layout_one_log_lock(source_abs, create=True)
+                try:
+                    source_registry = _tx_read_sidecar(source_abs)
+                    source_registry.pop(str(txid), None)
+                    _tx_write_sidecar(source_abs, source_registry)
+                    _tx_remove_stage(source_abs, txid)
+                finally:
+                    if log_fd is not None:
+                        os.close(log_fd)
+                    guard.__exit__(None, None, None)
+    finally:
+        _layout_coord_unlock(coord_held)
+
+    # Phase 4: retire destination/piece markers, then remove source sets
+    # once their destinations are visibly finished; finally retire source
+    # markers.  Every action takes one log lock at a time and repeats
+    # safely, so concurrent finisher processes converge.
+    if kind == _LAYOUT_KIND_MERGE:
+        dest_abs = next(one for one, role in roles.items() if role["dest"])
+        guard, fd = _layout_one_log_lock(dest_abs, create=True)
+        try:
+            _unlink_if_exists(dest_abs + _LAYOUT_STAGE_TMP_SUFFIX)
+            for span_path in (span["path"] for span in spans):
+                _unlink_if_exists(_layout_part_path(span_path, stamp))
+            _layout_retire(dest_abs)
+        finally:
+            _mutation_unlock(fd)
+            guard.__exit__(None, None, None)
+        for source_abs in (span["path"] for span in spans if span["span"] > 0):
+            guard, fd = _layout_one_log_lock(source_abs, create=True)
+            try:
+                finished = not os.path.exists(dest_abs + _LAYOUT_MARKER_SUFFIX)
+                if finished:
+                    _layout_remove_set(source_abs)
+                    _layout_retire(source_abs)
+            finally:
+                _mutation_unlock(fd)
+                guard.__exit__(None, None, None)
+    else:
+        source_abs = next(one for one, role in roles.items() if role["piece"] < 0)
+        piece_paths = [
+            next(one for one, role in roles.items() if role["piece"] == piece)
+            for piece in sorted(r["piece"] for r in roles.values() if r["piece"] >= 0)
+        ]
+        for piece_abs in piece_paths:
+            guard, fd = _layout_one_log_lock(piece_abs, create=True)
+            try:
+                _unlink_if_exists(piece_abs + _LAYOUT_STAGE_TMP_SUFFIX)
+                _layout_retire(piece_abs)
+            finally:
+                _mutation_unlock(fd)
+                guard.__exit__(None, None, None)
+        guard, fd = _layout_one_log_lock(source_abs, create=True)
+        try:
+            if all(
+                not os.path.exists(piece_abs + _LAYOUT_MARKER_SUFFIX)
+                for piece_abs in piece_paths
+            ):
+                _layout_remove_set(source_abs)
+                for piece in range(len(piece_paths)):
+                    _unlink_if_exists(
+                        _layout_part_path(source_abs, stamp, piece)
+                    )
+                _layout_retire(source_abs)
+        finally:
+            _mutation_unlock(fd)
+            guard.__exit__(None, None, None)
+
+
+def _layout_barrier(path):
+    """Finish any published layout at ``path`` before taking its log lock."""
+    try:
+        document = _layout_read_doc(path)
+    except (OSError, ValueError):
+        return
+    if isinstance(document, dict) and document.get("v") == _LAYOUT_VERSION:
+        _layout_drive(path, document)
+    elif isinstance(document, dict) and document.get("v") == 0:
+        _unlink_if_exists(path + _LAYOUT_MARKER_SUFFIX)
+        _layout_cleanup_local(path)
+
+
+def _finish_staged_layout(path):
+    """Local, under-lock safety net for a plan marker (see _layout_barrier)."""
+    try:
+        document = _layout_read_doc(path)
+    except ValueError:
+        return
+    if not isinstance(document, dict):
+        _layout_cleanup_local(path)
+        return
+    if document.get("v") == 0:
+        _layout_cleanup_local(path)
+        _unlink_if_exists(path + _LAYOUT_MARKER_SUFFIX)
+        return
+    if document.get("v") != _LAYOUT_VERSION:
+        return
+    # Promotions and removals are driven through _layout_barrier outside
+    # the lock; under the lock only clear a private temp whose plan never
+    # published (it cannot, since the marker here IS the plan).
+    _unlink_if_exists(path + _LAYOUT_STAGE_TMP_SUFFIX)
+    _unlink_if_exists(path + _LAYOUT_MARKER_TMP_SUFFIX)
+
+
+def _layout_peek_plan(path):
+    """Return the validated v1 layout plan at ``path``, else ``None``.
+
+    Tolerant of a missing, done (``v:0``) or momentarily unreadable
+    marker: those all read as "no plan in flight".
+    """
+    try:
+        document = _layout_read_doc(path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or document.get("v") != _LAYOUT_VERSION:
+        return None
+    try:
+        return _layout_validate(document)
+    except ValueError:
+        return None
+
+
+
+# ---------------------------------------------------------------------------
+# Locking discipline and the layout entry points themselves.
+#
+# Every writer on a log first takes that log's *operation anchor*
+# (``path.layoutop.lock`` flock plus a reentrant per-thread guard) and only
+# then its write lock; a merge/split acquires every involved path's
+# anchor up front in lexicographic order and holds them until done.  The
+# combined wait graph is therefore acyclic for any two overlapping
+# operations, same-process interleaving never self-locks (the guard is
+# reentrant and the per-log settle walks each other log one at a time),
+# and an ordinary append simply waits for an in-flight layout instead of
+# writing into a moving set.  The per-operation *driver flock* (one file
+# in the shared temp directory, keyed by the plan stamp) lets a writer
+# that lost a freeze race block until the driver finishes or crashes.
+# ---------------------------------------------------------------------------
+
+_LAYOUT_OP_LOCK_SUFFIX = ".layoutop.lock"
+
+
+# Reentrant per-(thread, layout stamp) guard around the inter-process
+# driver flock; it lets same-process writers join the driver's wait
+# without a thread re-locking its own held flock.
+_layout_driver_guard_table_lock = threading.Lock()
+_layout_driver_guards = {}
+_layout_driver_refs = {}
+
+
+def _layout_op_acquire_all(abspaths):
+    """Acquire every involved path's shared per-log guard in sorted order."""
+    held = []
+    for abspath in sorted(set(abspaths)):
+        guard = _tx_log_guard(abspath)
+        guard.__enter__()
+        held.append((abspath, guard))
+    return held
+
+
+def _layout_op_release_all(held):
+    for _abspath, guard in reversed(held):
+        guard.__exit__(None, None, None)
+
+
+def _layout_driver_dir():
+    directory = os.path.join(tempfile.gettempdir(), "weighted_batcher_layout")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def _layout_driver_lock(stamp):
+    """Acquire (or join) the driver flock for layout ``stamp``."""
+    key = ("driver", stamp)
+    with _layout_driver_guard_table_lock:
+        guard = _layout_driver_guards.get(key)
+        if guard is None:
+            guard = threading.RLock()
+            _layout_driver_guards[key] = guard
+            _layout_driver_refs[key] = 0
+        _layout_driver_refs[key] += 1
+    guard.acquire()
+    fd = None
+    if fcntl is not None:
+        fd = os.open(os.path.join(_layout_driver_dir(), f"{stamp}.lock"),
+                     os.O_RDWR | os.O_CREAT, 0o666)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    return key, guard, fd
+
+
+def _layout_driver_unlock(held):
+    key, guard, fd = held
+    if fd is not None:
+        os.close(fd)
+    guard.release()
+    with _layout_driver_guard_table_lock:
+        _layout_driver_refs[key] -= 1
+        if _layout_driver_refs[key] == 0:
+            del _layout_driver_guards[key]
+            del _layout_driver_refs[key]
+
+
+def _layout_wait_driver(stamp):
+    """Block until the driver for ``stamp`` finishes (released flock)."""
+    held = _layout_driver_lock(stamp)
+    _layout_driver_unlock(held)
+
+
+def _layout_plan_consumed(plan, abspath):
+    """Whether this layout removes ``abspath`` as a live log set."""
+    role = plan["roles"].get(abspath)
+    if role is None:
+        return False
+    if plan["kind"] == _LAYOUT_KIND_MERGE:
+        return not role["dest"]
+    return role["piece"] < 0
+
+
+def _layout_barrier_paths(abspaths):
+    """Finish published plans on the paths in lexicographic order."""
+    for abspath in sorted(set(abspaths)):
+        document = None
+        try:
+            document = _layout_read_doc(abspath)
+        except (OSError, ValueError):
+            document = None
+        if isinstance(document, dict) and document.get("v") == _LAYOUT_VERSION:
+            _layout_drive(abspath, document)
+        elif isinstance(document, dict) and document.get("v") == 0:
+            _unlink_if_exists(abspath + _LAYOUT_MARKER_SUFFIX)
+            _layout_cleanup_local(abspath)
+
+
+def _layout_related_txns(abspaths):
+    return {
+        record["id"]: record
+        for record in _tx_registry_records(set(abspaths))
+    }
+
+
+def _layout_reject_preparing(records, involved):
+    """Reject the layout while a participating begin is still preparing."""
+    for txid, record in records.items():
+        if record["s"] != _TX_STATUS_PREPARING:
+            continue
+        if involved.isdisjoint(record["logs"]):
+            continue
+        prep_fd = _tx_prepare_lock_try(txid)
+        if prep_fd is None or prep_fd is False:
+            raise ValueError(
+                f"transaction {txid} is still being prepared; finish it "
+                f"before a merge or split"
+            )
+        os.close(prep_fd)
+
+
+def _layout_check_sequence(value, name):
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise TypeError(f"{name} must be a sequence, got {type(value).__name__}")
+
+
+def _merge_metrics_run(destination, sources):
+    """Implementation of :func:`merge_metrics` with anchors already held."""
+    if not isinstance(destination, str):
+        raise OSError(
+            f"destination path must be a string, got "
+            f"{type(destination).__name__}"
+        )
+    _layout_check_sequence(sources, "sources")
+    sources = list(sources)
+    if not sources:
+        raise ValueError("merge requires at least one source log")
+    for one in sources:
+        if not isinstance(one, str):
+            raise OSError(f"log path must be a string, got {type(one).__name__}")
+    if os.path.isdir(destination):
+        raise IsADirectoryError(f"log path is a directory: {destination!r}")
+    for one in sources:
+        if os.path.isdir(one):
+            raise IsADirectoryError(f"log path is a directory: {one!r}")
+    dest_abs = os.path.abspath(destination)
+    source_abs = [os.path.abspath(one) for one in sources]
+    if len(set(source_abs)) != len(source_abs):
+        raise ValueError("a merge source path is repeated")
+    if dest_abs in source_abs:
+        raise ValueError("the merge destination must not also be a source")
+    all_abs = [dest_abs] + source_abs
+    for abspath in source_abs:
+        if not os.path.exists(abspath) and not _segment_numbers(abspath):
+            raise FileNotFoundError(f"metrics log does not exist: {abspath!r}")
+
+    records = _layout_related_txns(all_abs)
+    _layout_reject_preparing(records, set(all_abs))
+
+    stamp = os.urandom(8).hex()
+    span_paths = [dest_abs] + source_abs
+    # Phase 1: snapshot every span into its immutable stamped part while
+    # holding that span's log lock (the operation anchors already exclude
+    # other layouts; ordinary appends take each log lock one at a time).
+    spans = []
+    for span, abspath in enumerate(span_paths):
+        guard, fd = _layout_one_log_lock(abspath, create=(span == 0))
+        try:
+            if os.path.exists(abspath) or _segment_numbers(abspath):
+                basis, surviving = _layout_set_summary_locked(abspath)
+            else:
+                basis, surviving = 0, 0
+            _layout_copy_part_locked(abspath, stamp)
+            spans.append({"path": abspath, "span": span,
+                          "basis": basis, "surviving": surviving})
+        finally:
+            _mutation_unlock(fd)
+            guard.__exit__(None, None, None)
+    frontier = spans[0]["basis"] + spans[0]["surviving"]
+    for span in spans:
+        if span["span"] == 0:
+            span["offset"] = 0
+        else:
+            span["offset"] = frontier - span["basis"]
+            frontier += span["surviving"]
+    new_basis = spans[0]["basis"]
+    total_new = frontier
+
+    roles = {dest_abs: {"dest": True, "pruned": new_basis}}
+    for abspath in source_abs:
+        roles[abspath] = {"dest": False, "pruned": 0}
+    plan = {
+        "v": _LAYOUT_VERSION,
+        "kind": _LAYOUT_KIND_MERGE,
+        "paths": sorted(all_abs),
+        "roles": roles,
+        "spans": [
+            {"path": s["path"], "span": s["span"], "basis": s["basis"],
+             "surviving": s["surviving"], "offset": s["offset"]}
+            for s in spans
+        ],
+        "txns": sorted(records),
+        "stamp": stamp,
+    }
+    payload = json.dumps(plan, separators=(",", ":")).encode("utf-8")
+
+    driver = _layout_driver_lock(stamp)
+    try:
+        # Phase 2: verify each snapshot still matches the live set and
+        # publish its plan marker inside one held log lock.  Appends
+        # serialized behind this lock therefore either completed (and
+        # match the snapshot, so no mismatch) or wait until the plan is
+        # published (then _mutation_lock redirects them).  A snapshot
+        # that no longer matches means an earlier lock pass missed an
+        # append; it cannot happen while anchors are held, and is
+        # reported rather than losing a record.
+        for span in spans:
+            abspath = span["path"]
+            guard, fd = _layout_one_log_lock(abspath, create=True, settle=False)
+            try:
+                basis, surviving = _layout_set_summary_locked(abspath)
+                if basis != span["basis"] or surviving != span["surviving"]:
+                    for one in span_paths:
+                        _unlink_if_exists(_layout_part_path(one, stamp))
+                    raise ValueError(
+                        "log set changed during merge; retry the merge"
+                    )
+                _layout_publish(abspath, payload)
+            finally:
+                _mutation_unlock(fd)
+                guard.__exit__(None, None, None)
+
+        # Phase 3: coordinator records through the mapping (stamped, so a
+        # repeated drive never double-shifts), then run the physical
+        # layout to completion.
+        span_of = {s["path"]: s["span"] for s in spans}
+        offset_of = {s["path"]: s["offset"] for s in spans}
+        coord = _layout_coord_locks(sorted(records))
+        try:
+            for txid in sorted(records):
+                record = _tx_read_coordinator(txid)
+                if record is None or record.get(_LAYOUT_STAMP_KEY) == stamp:
+                    continue
+                _tx_write_coordinator(
+                    _layout_remap_merge(
+                        record, span_of, offset_of, dest_abs, stamp
+                    )
+                )
+        finally:
+            _layout_coord_unlock(coord)
+        _layout_drive(destination, plan)
+    finally:
+        _layout_driver_unlock(driver)
+
+    return {
+        "kind": _LAYOUT_KIND_MERGE,
+        "destination": dest_abs,
+        "pruned": new_basis,
+        "count": total_new,
+        "spans": [
+            {"path": s["path"], "span": s["span"], "basis": s["basis"],
+             "surviving": s["surviving"], "offset": s["offset"]}
+            for s in spans
+        ],
+    }
+
+
+def _split_metrics_run(source, destinations, boundaries):
+    """Implementation of :func:`split_metrics` with anchors held."""
+    if not isinstance(source, str):
+        raise OSError(f"source path must be a string, got {type(source).__name__}")
+    _layout_check_sequence(destinations, "destinations")
+    _layout_check_sequence(boundaries, "boundaries")
+    destinations = list(destinations)
+    boundaries = list(boundaries)
+    for boundary in boundaries:
+        if isinstance(boundary, bool) or not isinstance(boundary, int):
+            raise TypeError(
+                f"split boundary must be an integer, got {type(boundary).__name__}"
+            )
+        if boundary < 0:
+            raise ValueError("split boundary must not be negative")
+    if not destinations:
+        raise ValueError("split requires at least one destination log")
+    if len(boundaries) != len(destinations) - 1:
+        raise ValueError(
+            "split needs one fewer boundary than destinations: "
+            f"{len(destinations)} destination(s) but {len(boundaries)} "
+            f"boundary/boundaries"
+        )
+    for one in [source] + destinations:
+        if not isinstance(one, str):
+            raise OSError(f"log path must be a string, got {type(one).__name__}")
+        if os.path.isdir(one):
+            raise IsADirectoryError(f"log path is a directory: {one!r}")
+    source_abs = os.path.abspath(source)
+    dest_abs = [os.path.abspath(one) for one in destinations]
+    if len(set(dest_abs)) != len(dest_abs):
+        raise ValueError("a split destination path is repeated")
+    if source_abs in dest_abs:
+        raise ValueError("a split destination must not also be the source")
+    if not os.path.exists(source_abs) and not _segment_numbers(source_abs):
+        raise FileNotFoundError(f"metrics log does not exist: {source_abs!r}")
+    for abspath in dest_abs:
+        if os.path.exists(abspath) or _segment_numbers(abspath):
+            raise ValueError(
+                f"split destination already holds a log set: {abspath!r}"
+            )
+    all_abs = [source_abs] + dest_abs
+    records = _layout_related_txns(all_abs)
+    _layout_reject_preparing(records, set(all_abs))
+
+    stamp = os.urandom(8).hex()
+    cuts = boundaries  # completed after the basis is read under lock
+    written = None
+    basis = total = None
+    guard, fd = _layout_one_log_lock(source_abs, create=False)
+    try:
+        basis, surviving = _layout_set_summary_locked(source_abs)
+        total = basis + surviving
+        if boundaries and (boundaries[0] < basis or boundaries[-1] > total):
+            raise ValueError(
+                f"split boundary outside the record range [{basis}, {total}]"
+            )
+        for index in range(1, len(boundaries)):
+            if boundaries[index] <= boundaries[index - 1]:
+                raise ValueError(
+                    "split boundaries must be strictly increasing record "
+                    "boundaries"
+                )
+        def _piece_of(ordinal):
+            # A serial at/after the last boundary belongs to the final
+            # piece -- including a prepared batch's serial, which may
+            # equal the current total (the next append slot).
+            piece = 0
+            while piece < len(boundaries) and ordinal >= boundaries[piece]:
+                piece += 1
+            return piece
+
+        cuts = boundaries + [total]
+        tmp_paths = [
+            _layout_part_path(source_abs, stamp, piece) + ".tmp"
+            for piece in range(len(dest_abs))
+        ]
+        out_fds = [
+            os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+            for tmp in tmp_paths
+        ]
+        written = [0] * len(dest_abs)
+        try:
+            ordinal = basis
+            for member in _segment_members(source_abs):
+                for raw in _iter_raw_records(member):
+                    piece = _piece_of(ordinal)
+                    _write_bytes(out_fds[piece], raw)
+                    written[piece] += 1
+                    ordinal += 1
+            for out_fd in out_fds:
+                os.fsync(out_fd)
+        finally:
+            for out_fd in out_fds:
+                try:
+                    os.close(out_fd)
+                except OSError:
+                    pass
+        for piece, tmp in enumerate(tmp_paths):
+            os.rename(tmp, _layout_part_path(source_abs, stamp, piece))
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        guard.__exit__(None, None, None)
+        for tmp in (tmp_paths if 'tmp_paths' in dir() else []):
+            _unlink_if_exists(tmp)
+        raise
+    else:
+        if fd is not None:
+            os.close(fd)
+        guard.__exit__(None, None, None)
+
+    piece_bases = [basis] + boundaries
+    roles = {source_abs: {"piece": -1, "pruned": basis}}
+    for piece, abspath in enumerate(dest_abs):
+        roles[abspath] = {"piece": piece, "pruned": piece_bases[piece]}
+    plan = {
+        "v": _LAYOUT_VERSION,
+        "kind": _LAYOUT_KIND_SPLIT,
+        "paths": sorted(all_abs),
+        "roles": roles,
+        "spans": [{"cut": cut} for cut in cuts],
+        "txns": sorted(records),
+        "stamp": stamp,
+    }
+    payload = json.dumps(plan, separators=(",", ":")).encode("utf-8")
+
+    driver = _layout_driver_lock(stamp)
+    try:
+        piece_boundaries = boundaries
+
+        def _piece_of(ordinal):
+            piece = 0
+            while (
+                piece < len(piece_boundaries)
+                and ordinal >= piece_boundaries[piece]
+            ):
+                piece += 1
+            return piece
+
+        piece_abs = {piece: abspath for piece, abspath in enumerate(dest_abs)}
+        # Publish the source marker first (its parts are whole), then each
+        # fresh piece marker, each under the target's log lock.
+        for abspath in all_abs:
+            g, f = _layout_one_log_lock(abspath, create=True, settle=False)
+            try:
+                _layout_publish(abspath, payload)
+            finally:
+                if f is not None:
+                    os.close(f)
+                g.__exit__(None, None, None)
+        coord = _layout_coord_locks(sorted(records))
+        try:
+            for txid in sorted(records):
+                record = _tx_read_coordinator(txid)
+                if record is None or record.get(_LAYOUT_STAMP_KEY) == stamp:
+                    continue
+                if source_abs not in record["logs"]:
+                    continue
+                _tx_write_coordinator(
+                    _layout_remap_split(
+                        record, source_abs, _piece_of, piece_abs, stamp
+                    )
+                )
+        finally:
+            _layout_coord_unlock(coord)
+        _layout_drive(source_abs, plan)
+    finally:
+        _layout_driver_unlock(driver)
+
+    return {
+        "kind": _LAYOUT_KIND_SPLIT,
+        "source": source_abs,
+        "pruned": basis,
+        "count": total,
+        "pieces": [
+            {"path": dest_abs[piece], "piece": piece,
+             "basis": piece_bases[piece], "surviving": written[piece]}
+            for piece in range(len(dest_abs))
+        ],
+    }
+
+
+def merge_metrics(destination, sources):
+    """Merge several independent metric log sets into one, in a fixed order.
+
+    ``sources`` is a non-empty sequence of existing log paths and
+    ``destination`` the target log path, which may already exist: its
+    surviving records become span 0 and keep their write serials and
+    pruned-count basis.  The source spans follow in argument order; each
+    source's pruned gap is compressed and the next span continues at the
+    surviving frontier.  Records move byte for byte with their original
+    newlines (nothing re-rendered, so ``-0.0``, oversized exact decimal
+    counters and key order survive); torn tails and blank lines follow
+    the established read rules.  Afterwards the source sets are gone.
+
+    The copy streams record by record with bounded memory, and ordinary
+    appends, commits, rollbacks, adjudications and replays proceed
+    serialized through per-path operation anchors taken in lexicographic
+    order, so no record is torn, lost or landed in a moving set and no
+    two locks ever cross.  A writer that meets the published plan waits
+    for the driver and finishes it transparently, so a crash leaves
+    either the old sets or the merged one.
+
+    Transaction write intervals are remapped through the returned
+    offsets (a moved record's new serial is its old serial plus its
+    span's offset); decided transactions reproduce their verdict,
+    undecided ones keep smallest-id-first adjudication on the remapped
+    intervals, a rejected batch never takes effect, and an open prepared
+    transaction's staging moves with its records.  A still-preparing
+    begin rejects the merge.  Only transaction records relevant to the
+    involved logs are read.
+
+    Returns ``{"kind", "destination", "pruned", "count", "spans"}`` with
+    each span's ``path``, ``span`` index, old pruned ``basis``,
+    ``surviving`` count and ``offset``; every number is exact.
+
+    Raises:
+        TypeError: ``sources`` is not a sequence.
+        ValueError: no source, a repeated path, destination among
+            sources, corrupt state or a still-preparing transaction.
+        FileNotFoundError: a source is missing.
+        IsADirectoryError: an involved path is a directory.
+        OSError: a non-string path or a locking/writing failure.
+    """
+    _layout_check_sequence(sources, "sources")
+    sources = list(sources)
+    abspaths = [os.path.abspath(destination)] if isinstance(destination, str) else []
+    abspaths += [os.path.abspath(one) for one in sources if isinstance(one, str)]
+    held = _layout_op_acquire_all(abspaths)
+    try:
+        _layout_barrier_paths(abspaths)
+        return _merge_metrics_run(destination, sources)
+    finally:
+        _layout_op_release_all(held)
+
+
+def split_metrics(source, destinations, boundaries):
+    """Split one metric log set at record boundaries into several sets.
+
+    ``destinations`` names one or more target logs (all absent) and
+    ``boundaries`` the one-fewer strictly increasing write-serial cut
+    points.  Piece 0 receives serials from the source's pruned basis up
+    to ``boundaries[0]``, piece i the records between
+    ``boundaries[i-1]`` and ``boundaries[i]``, the last piece the tail;
+    empty pieces are produced as empty sets.  A boundary must name a
+    whole-record boundary inside the settled range, otherwise
+    :class:`ValueError` is raised before anything moves.  Pieces keep
+    global ordinals: piece i's pruned basis is its boundary, so every
+    moved record keeps its exact source serial.  Afterwards the source
+    set is gone.
+
+    Streaming, locking, crash staging and transaction remapping follow
+    :func:`merge_metrics`.  Returns
+    ``{"kind", "source", "pruned", "count", "pieces"}`` with each
+    piece's ``path``, ``piece``, ``basis`` and ``surviving`` count.
+
+    Raises:
+        TypeError: an argument has the wrong type (booleans are not
+            integer boundaries).
+        ValueError: bad counts, negative, non-increasing or out-of-range
+            boundaries, an existing destination, a repeated path,
+            corrupt state or a still-preparing transaction.
+        FileNotFoundError: the source is missing.
+        IsADirectoryError: an involved path is a directory.
+        OSError: a non-string path or a locking/writing failure.
+    """
+    abspaths = [os.path.abspath(source)] if isinstance(source, str) else []
+    if isinstance(destinations, (list, tuple)):
+        abspaths += [os.path.abspath(one) for one in destinations
+                     if isinstance(one, str)]
+    held = _layout_op_acquire_all(abspaths)
+    try:
+        _layout_barrier_paths(abspaths)
+        return _split_metrics_run(source, destinations, boundaries)
+    finally:
+        _layout_op_release_all(held)

@@ -30,6 +30,8 @@
     python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID
     python3 -m weighted_batcher tx-conflicts FILE
     python3 -m weighted_batcher tx-replay FILE [FILE ...]
+    python3 -m weighted_batcher merge OUT IN [IN ...]
+    python3 -m weighted_batcher split SRC OUT BOUNDARY [OUT BOUNDARY ...] OUT
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from . import (
     group_resume_metrics,
     iter_metrics,
     join_group_metrics,
+    merge_metrics,
     parse_metrics,
     prune_metrics,
     recover_metrics,
@@ -61,6 +64,7 @@ from . import (
     rotate_metrics,
     snapshot_diff_metrics,
     snapshot_metrics,
+    split_metrics,
     takeover_group_metrics,
     tx_adjudicate_metrics,
     tx_begin_metrics,
@@ -103,7 +107,9 @@ _USAGE = (
     "  python3 -m weighted_batcher tx-read FILE TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-adjudicate TRANSACTION_ID\n"
     "  python3 -m weighted_batcher tx-conflicts FILE\n"
-    "  python3 -m weighted_batcher tx-replay FILE [FILE ...]"
+    "  python3 -m weighted_batcher tx-replay FILE [FILE ...]\n"
+    "  python3 -m weighted_batcher merge OUT IN [IN ...]\n"
+    "  python3 -m weighted_batcher split SRC OUT BOUNDARY [OUT BOUNDARY ...] OUT"
 )
 
 
@@ -433,6 +439,27 @@ def _tx_replay(paths):
         sys.stdout.write(
             json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
+    return 0
+
+
+def _merge(out, inputs):
+    # The entry point returns the deterministic serial mapping; print it
+    # as one JSON line with every count, offset and serial an exact
+    # decimal integer.
+    mapping = merge_metrics(out, inputs)
+    sys.stdout.write(
+        json.dumps(mapping, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    return 0
+
+
+def _split(src, outputs, boundaries):
+    # Boundaries are already integers (usage error otherwise); the entry
+    # point returns the deterministic per-piece mapping.
+    mapping = split_metrics(src, outputs, boundaries)
+    sys.stdout.write(
+        json.dumps(mapping, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
     return 0
 
 
@@ -776,6 +803,41 @@ def main(argv=None):
             print(_USAGE, file=sys.stderr)
             return 2
         return _dispatch(lambda _path: _tx_replay(args[1:]), args[1])
+    if args and args[0] == "merge":
+        # merge OUT IN [IN ...]: one output and at least one input.
+        if len(args) < 3:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        out = args[1]
+        inputs = args[2:]
+        return _dispatch(lambda _path: _merge(out, inputs), out)
+    if args and args[0] == "split":
+        # split SRC OUT B [OUT B ...] OUT: after SRC an odd tail of
+        # OUT/BOUNDARY pairs closed by one final OUT (one piece minimum,
+        # i.e. ``split SRC OUT`` with no boundary).
+        tail = args[2:]
+        if len(args) < 3 or len(tail) % 2 == 0:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        src = args[1]
+        # Tail layout: OUT0 B0 OUT1 B1 ... Bn-1 OUTn -- outputs at even
+        # positions, boundaries at odd positions, one more output.
+        outputs = [tail[0]]
+        boundaries = []
+        ok = True
+        for index in range(1, len(tail), 2):
+            try:
+                boundaries.append(int(tail[index]))
+            except ValueError:
+                ok = False
+                break
+            outputs.append(tail[index + 1])
+        if not ok:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return _dispatch(
+            lambda _path: _split(src, outputs, boundaries), src
+        )
     print(_USAGE, file=sys.stderr)
     return 2
 
